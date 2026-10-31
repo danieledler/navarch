@@ -12,7 +12,7 @@ macOS desktop planner (Tauri 2 + React) that keeps work across many folders poin
 
 ## Layout
 
-- The repo is a pnpm workspace: `apps/desktop` (this app), `apps/site` (landing page with a live demo, for GitHub Pages), `apps/mobile` (planned, separate work). Root `pnpm dev` / `pnpm tauri` run in `apps/desktop`, `pnpm site` in `apps/site`; `pnpm typecheck` / `pnpm build` run in every app.
+- The repo is a pnpm workspace: `apps/desktop` (this app), `apps/site` (landing page with a live demo, for GitHub Pages), `apps/mobile` (phone web app, served by the desktop app). Root `pnpm dev` / `pnpm tauri` run in `apps/desktop`, `pnpm site` in `apps/site`, `pnpm mobile` in `apps/mobile`; `pnpm typecheck` / `pnpm build` run in every app.
 - `apps/site/` — static Vite multi-page build for GitHub Pages (https://danieledler.github.io/navarch/): `index.html` + `src/landing.ts`/`landing.css` is the landing page; `demo/index.html` + `src/demo.tsx` renders the desktop `App` from `apps/desktop/src` (alias `@desktop`) on the in-memory mock and demo dataset (`apps/desktop/src/api/demo.ts`), shown on the landing page in a scaled iframe. Keep URLs relative (Vite `base: "./"`): it is served under `/navarch/`.
 - `apps/desktop/src/api/types.ts` — the JSON contract with the backend. Change it together with `apps/desktop/src-tauri/src/db.rs`/`commands.rs`.
 - `apps/desktop/src/api/index.ts` — `Api` interface; Tauri `invoke` in the app, `apps/desktop/src/api/mock.ts` (in-memory, localStorage) in a plain browser.
@@ -20,6 +20,8 @@ macOS desktop planner (Tauri 2 + React) that keeps work across many folders poin
 - `apps/desktop/src/lib/model.ts` — trees, rollups, attention counts, week items, the session prompt with the `Navarch task #<id>` marker.
 - `apps/desktop/src/components/` — `SpaceRail`, `ProjectList`, `ProjectView` + `TaskTree` (outliner keys) + `TaskDetail`, `FocusPanel`, `Dashboard` (waiting, week log, discover), `StatusBar`.
 - `apps/desktop/src-tauri/src/` — `db.rs` (SQLite, migrations via `user_version`), `scanner.rs` (session files, incremental transcript parsing), `procs.rs` (process tree + CPU via sysinfo), `usage.rs` (plan limits), `limits.rs` (usage-limit alerts for running sessions), `commands.rs`, `lib.rs` (setup, 3 s scan loop emitting `sessions-updated`, 2 s CPU sampler feeding the CPU popover's 10-min history, 1-min limit watch emitting `limit-alert`).
+- `apps/desktop/src-tauri/src/mobile.rs` + `http.rs` — phone API: an axum server on 127.0.0.1:47820 (installed app) / 47821 (any other build; `NAVARCH_PHONE_PORT` overrides), `POST /api/<cmd>` with bearer token, every other GET serves `apps/mobile/dist` (embedded with rust-embed in release builds, read from disk in debug builds). Settings keys `mobile` (`{enabled, publicUrl}`), `mobile_token`, `mobile_paired_at`; a dev DB copy drops them (`mobile::forget`). Emits `snapshot-changed` (a phone edited data) and `mobile-changed` (pairing/server state) to the desktop UI.
+- `apps/mobile/` — the phone web app (Home Screen, no service worker), its own workspace package. Imports shared code from `apps/desktop/src` through the `@desktop` alias (Vite alias + tsconfig paths, like the site). Served by the Mac app; the phone reaches it via `tailscale serve --bg <port>`, so page and `/api` share one origin.
 
 ## Data sources (read-only — never write to them)
 
@@ -40,6 +42,7 @@ macOS desktop planner (Tauri 2 + React) that keeps work across many folders poin
 - Dev window: `pnpm tauri dev`, on this checkout's DB copy, with the UI hot-reloading from Vite. Its Dock icon (`apps/desktop/src-tauri/icons/icon-dev.png`, rendered from `icon-dev.svg` with `rsvg-convert -w 512 -h 512`) and its status-bar build label are dark red, so it can't pass for the installed app.
 - Installed app: `scripts/install-app.sh` builds committed `main` and installs /Applications/Navarch.app. That is Daniel's everyday Navarch and the only build that opens the real DB.
 - Types: `pnpm typecheck`. Backend: `cargo test` and `target/debug/navarch --dump-sessions` (one scan of this checkout's DB copy, JSON summary, no window) in `apps/desktop/src-tauri/`.
+- Phone UI: `pnpm --filter mobile dev` (or `pnpm mobile`) on http://localhost:1430 (`?mock` for the desktop mock and demo data, dev only; otherwise `/api` proxies to a dev build's 47821). `pnpm --filter mobile build` writes `apps/mobile/dist`, which the app serves; `tauri build` runs it first (`beforeBuildCommand`), so release builds embed it.
 - UX walkthrough: with `pnpm dev` running, `node apps/desktop/scripts/ux-drive.mjs all dark` drives the main flows in headless Chrome and saves screenshots to `apps/desktop/scripts/shots/` (`NAVARCH_URL` points it at another port).
 - The status bar's left end shows which build is running: commit, `+N` uncommitted files, branch when not `main`, and `dev` when the UI is live from Vite (an amber tag if that Vite runs in another checkout). Hover for the checkout, build time and which DB it uses.
 - A running app window keeps the backend it was started with, while its UI hot-reloads from Vite. After Rust changes, restart it (`pnpm tauri dev` does this for you), or the new UI talks to the old backend.
