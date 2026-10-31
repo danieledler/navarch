@@ -17,11 +17,11 @@ const URL: &str = "https://api.anthropic.com/api/oauth/usage";
 pub const CACHE_FILE: &str = "usage-cache.json";
 const MAX_AGE_MS: i64 = 5 * 60_000;
 const FORCE_MIN_AGE_MS: i64 = 30_000;
-/// Backoff after 429s in a row without Retry-After: 5, 10, 20, then 30 minutes.
+/// Backoff after 429s in a row: 5, 10, 20, then 30 minutes. A longer Retry-After wins; a shorter one
+/// doesn't, since the endpoint has kept answering 429 for many minutes while asking for under a minute.
 const BACKOFF_FIRST_MS: i64 = MAX_AGE_MS;
 const BACKOFF_MAX_MS: i64 = 30 * 60_000;
-/// Retry-After is honoured within these bounds, so a garbled value can't stop updates for good.
-const RETRY_AFTER_MIN_MS: i64 = 60_000;
+/// Retry-After is honoured up to this, so a garbled value can't stop updates for good.
 const RETRY_AFTER_MAX_MS: i64 = 60 * 60_000;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -69,7 +69,7 @@ fn should_fetch(s: &Shared, force: bool, now: i64) -> bool {
     age >= MAX_AGE_MS || (force && age >= FORCE_MIN_AGE_MS)
 }
 
-/// Wait after the n-th 429 in a row (n ≥ 1) when the server doesn't say.
+/// Wait after the n-th 429 in a row (n ≥ 1), unless Retry-After asks for longer.
 fn backoff_ms(n: u32) -> i64 {
     (BACKOFF_FIRST_MS << n.saturating_sub(1).min(8)).min(BACKOFF_MAX_MS)
 }
@@ -106,7 +106,7 @@ fn record(prev: Shared, outcome: Outcome, now: i64) -> Shared {
         },
         Outcome::RateLimited(retry_after) => {
             let n = prev.rate_limited + 1;
-            let wait = retry_after.map_or_else(|| backoff_ms(n), |ms| ms.clamp(RETRY_AFTER_MIN_MS, RETRY_AFTER_MAX_MS));
+            let wait = backoff_ms(n).max(retry_after.map_or(0, |ms| ms.min(RETRY_AFTER_MAX_MS)));
             let retry_at = now + wait;
             failed(format!("Usage requests rate-limited (HTTP 429); next try at {}", clock(retry_at)), retry_at, n)
         }
@@ -284,10 +284,9 @@ mod tests {
         assert!(s.usage.error.as_deref().is_some_and(|e| e.contains("HTTP 429")));
         let s = record(s, Outcome::RateLimited(None), now + 5 * MIN);
         assert_eq!((s.rate_limited, s.retry_at), (2, now + 15 * MIN));
-        // Retry-After wins over the backoff, within bounds.
-        assert_eq!(record(s.clone(), Outcome::RateLimited(Some(90_000)), now).retry_at, now + 90_000);
-        assert_eq!(record(s.clone(), Outcome::RateLimited(Some(0)), now).retry_at, now + MIN);
-        assert_eq!(record(s.clone(), Outcome::RateLimited(Some(86_400_000)), now).retry_at, now + 60 * MIN);
+        // The longer of Retry-After (up to an hour) and the backoff wins.
+        let wait = |retry_after| (record(s.clone(), Outcome::RateLimited(retry_after), now).retry_at - now) / MIN;
+        assert_eq!([wait(Some(0)), wait(Some(MIN)), wait(Some(45 * MIN)), wait(Some(86_400_000))], [20, 20, 45, 60]);
         // Other failures keep the numbers and the count but don't hold requests back.
         let f = record(s.clone(), Outcome::Failed("x".into()), now);
         assert_eq!((f.rate_limited, f.retry_at, f.usage.five_hour.is_some()), (2, 0, true));
