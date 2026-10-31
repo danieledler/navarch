@@ -15,6 +15,16 @@ const PAIRED_AT_KEY: &str = "mobile_paired_at";
 /// The installed app's port; every other build uses `DEV_PORT`, so both can run at once.
 pub const PORT: u16 = 47820;
 pub const DEV_PORT: u16 = 47821;
+/// Overrides `DEV_PORT`, so two dev runs can serve at once. The installed app ignores it.
+pub const PORT_ENV: &str = "NAVARCH_PHONE_PORT";
+
+/// The port a build listens on: `PORT` for the installed app, else `PORT_ENV`'s value if it's a port.
+pub fn port_for(installed: bool, env: Option<&str>) -> u16 {
+    if installed {
+        return PORT;
+    }
+    env.and_then(|v| v.trim().parse::<u16>().ok()).filter(|&p| p != 0).unwrap_or(DEV_PORT)
+}
 /// Pairing codes avoid characters that read alike (0/O, 1/I/L).
 const CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 const CODE_LEN: usize = 6;
@@ -402,6 +412,16 @@ pub fn start<C: Ctx>(ctx: C) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_dev_builds_take_the_port_override() {
+        assert_eq!(port_for(true, Some("50000")), PORT);
+        assert_eq!(port_for(false, Some("50000")), 50000);
+        assert_eq!(port_for(false, Some(" 50001 ")), 50001);
+        for bad in [None, Some(""), Some("0"), Some("70000"), Some("port")] {
+            assert_eq!(port_for(false, bad), DEV_PORT, "{bad:?}");
+        }
+    }
 
     fn mobile(enabled: bool) -> Mobile {
         let c = Connection::open_in_memory().unwrap();

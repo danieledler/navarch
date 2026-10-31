@@ -1,13 +1,14 @@
 //! The phone's API: `POST /api/<cmd>` with the Tauri command's camelCase args as a JSON object,
 //! answered by the same functions as the desktop commands. Bound to 127.0.0.1 (mobile.rs); the phone
 //! reaches it through `tailscale serve` or a Cloudflare tunnel, so nothing here knows the transport.
+//! Every other GET is the phone UI (apps/mobile/dist), so the page and its API share one origin.
 
 use crate::commands::core;
 use crate::db::{Res, TaskPatch};
 use crate::mobile::{self, Ctx};
 use crate::scanner::Session;
 use crate::AppState;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
@@ -17,6 +18,7 @@ use chrono::{Datelike, NaiveDate};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 
 pub const BODY_LIMIT: usize = 64 * 1024;
 /// lastPrompt and lastReply are cut to this many characters for the phone.
@@ -117,18 +119,21 @@ fn cut(mut s: String) -> String {
     s
 }
 
-/// What the phone needs of the session list: no archived sessions, short texts, and only this ISO
-/// week's days (Monday to Sunday), which its week view counts.
+/// What the phone needs of the session list: short texts and only this ISO week's days (Monday to
+/// Sunday), which its week view counts. Archived sessions stay if they had activity this week, as the
+/// desktop's week counts them too.
 pub fn slim_sessions(list: Vec<Session>, today: NaiveDate) -> Vec<Session> {
     let monday = today - chrono::Days::new(today.weekday().num_days_from_monday() as u64);
     let (from, to) = (monday.format("%Y-%m-%d").to_string(), (monday + chrono::Days::new(6)).format("%Y-%m-%d").to_string());
     list.into_iter()
-        .filter(|s| !s.archived)
-        .map(|mut s| {
+        .filter_map(|mut s| {
+            s.days.retain(|d| d.day >= from && d.day <= to);
+            if s.archived && s.days.is_empty() {
+                return None;
+            }
             s.last_prompt = s.last_prompt.map(cut);
             s.last_reply = s.last_reply.map(cut);
-            s.days.retain(|d| d.day >= from && d.day <= to);
-            s
+            Some(s)
         })
         .collect()
 }
@@ -146,6 +151,72 @@ fn reply(status: StatusCode, body: &Value) -> Response {
 
 fn fail(status: StatusCode, msg: &str) -> Response {
     reply(status, &json!({ "error": msg }))
+}
+
+/// The phone UI, built by `pnpm mobile:build`, embedded in release builds. Without a build, `/` says so (503).
+#[cfg(not(debug_assertions))]
+#[derive(rust_embed::RustEmbed)]
+#[folder = "../apps/mobile/dist"]
+#[allow_missing = true]
+struct PhoneUi;
+
+#[cfg(not(debug_assertions))]
+fn phone_file(rel: &str) -> Option<Cow<'static, [u8]>> {
+    PhoneUi::get(rel).map(|f| f.data)
+}
+
+/// Debug builds read the phone UI from disk on each request, so a dev window serves the latest
+/// `pnpm mobile:build`. (rust-embed's own debug reader fixes the folder at compile time and refuses
+/// every file if dist didn't exist then.) `static_file` has already refused `..`.
+#[cfg(debug_assertions)]
+fn phone_file(rel: &str) -> Option<Cow<'static, [u8]>> {
+    let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../apps/mobile/dist");
+    std::fs::read(dist.join(rel)).ok().map(Cow::Owned)
+}
+
+fn content_type(file: &str) -> &'static str {
+    let ext = file.rsplit_once('.').map_or("", |(_, e)| e).to_ascii_lowercase();
+    match ext.as_str() {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" => "application/json",
+        "webmanifest" => "application/manifest+json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn text(status: StatusCode, msg: &'static str) -> Response {
+    (status, [(header::CONTENT_TYPE, "text/plain; charset=utf-8")], msg).into_response()
+}
+
+/// Answers a GET outside /api from the built phone UI, looked up by `get` (a path relative to dist).
+/// A path whose last segment has no extension is an app route and gets index.html; a missing file 404s.
+/// Vite's hashed files under assets/ never change; everything else is revalidated.
+fn static_file(path: &str, get: impl Fn(&str) -> Option<Cow<'static, [u8]>>) -> Response {
+    let rel = path.trim_start_matches('/');
+    if rel.split('/').any(|s| s == "..") || rel.contains('\\') {
+        return text(StatusCode::NOT_FOUND, "Not found");
+    }
+    let route = !rel.rsplit('/').next().unwrap_or("").contains('.');
+    let found = if rel.is_empty() { None } else { get(rel).map(|b| (rel, b)) };
+    let Some((file, body)) = found.or_else(|| route.then(|| get("index.html").map(|b| ("index.html", b))).flatten()) else {
+        return if get("index.html").is_none() {
+            text(StatusCode::SERVICE_UNAVAILABLE, "Phone UI not built")
+        } else {
+            text(StatusCode::NOT_FOUND, "Not found")
+        };
+    };
+    let cache = if file.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
+    (StatusCode::OK, [(header::CONTENT_TYPE, content_type(file)), (header::CACHE_CONTROL, cache)], Body::from(body)).into_response()
 }
 
 pub fn router<C: Ctx>(ctx: C) -> Router {
@@ -166,7 +237,12 @@ async fn handle<C: Ctx>(
     }
     let path = uri.path();
     let Some(cmd) = path.strip_prefix("/api/").or((path == "/api").then_some("")) else {
-        return fail(StatusCode::NOT_FOUND, "Not found");
+        if method != Method::GET && method != Method::HEAD {
+            let mut r = text(StatusCode::METHOD_NOT_ALLOWED, "Use GET");
+            r.headers_mut().insert(header::ALLOW, header::HeaderValue::from_static("GET, HEAD"));
+            return r;
+        }
+        return static_file(path, phone_file);
     };
     if method != Method::POST {
         let mut r = fail(StatusCode::METHOD_NOT_ALLOWED, "Use POST");
@@ -319,7 +395,7 @@ mod tests {
         assert_eq!(t.send("GET", "/api/ping", HOST, Some(TOKEN), String::new()).0, 405);
         assert_eq!(t.send("GET", "/api", HOST, None, String::new()).0, 405);
         assert_eq!(t.send("OPTIONS", "/api/get_snapshot", HOST, None, String::new()).0, 405);
-        assert_eq!(t.send("POST", "/other", HOST, Some(TOKEN), "{}".into()).0, 404);
+        assert_eq!(t.send("POST", "/other", HOST, Some(TOKEN), "{}".into()).0, 405);
         assert_eq!(t.call("ping", json!([1])).0, 400);
         assert_eq!(t.send_as("POST", "/api/ping", HOST, Some(TOKEN), Some("application/json; charset=utf-8"), "{}".into()).0, 200);
         for ct in [None, Some("text/plain"), Some("application/x-www-form-urlencoded")] {
@@ -464,12 +540,21 @@ mod tests {
     fn sessions_are_slim() {
         let thursday = NaiveDate::from_ymd_opt(2026, 10, 29).unwrap();
         let days = ["2026-10-25", "2026-10-26", "2026-10-29", "2026-11-01", "2026-11-02"];
-        let got = slim_sessions(vec![session("a", false, &days), session("b", true, &days)], thursday);
-        assert_eq!(got.len(), 1);
-        let s = &got[0];
-        assert_eq!(s.days.iter().map(|d| d.day.as_str()).collect::<Vec<_>>(), ["2026-10-26", "2026-10-29", "2026-11-01"]);
-        assert_eq!(s.last_prompt.as_ref().unwrap().chars().count(), TEXT_LIMIT);
-        assert_eq!(s.last_reply.as_deref(), Some("short"));
+        let list = vec![
+            session("a", false, &days),
+            session("b", true, &days),
+            session("c", true, &["2026-10-25", "2026-11-02"]),
+            session("d", false, &["2026-10-25"]),
+        ];
+        let got = slim_sessions(list, thursday);
+        // Archived sessions stay only with activity this week; live ones always do.
+        assert_eq!(got.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["a", "b", "d"]);
+        for s in &got[..2] {
+            assert_eq!(s.days.iter().map(|d| d.day.as_str()).collect::<Vec<_>>(), ["2026-10-26", "2026-10-29", "2026-11-01"]);
+            assert_eq!(s.last_prompt.as_ref().unwrap().chars().count(), TEXT_LIMIT);
+            assert_eq!(s.last_reply.as_deref(), Some("short"));
+        }
+        assert!(got[2].days.is_empty());
 
         // Over HTTP, against today's week.
         let t = setup(UsageCache::default());
@@ -481,5 +566,51 @@ mod tests {
         assert_eq!(list[0]["days"], json!([{ "day": today, "activeMs": 1, "tokens": 1 }]));
         assert_eq!(list[0]["remoteId"], "session_r");
         assert_eq!(list[0]["lastPrompt"].as_str().unwrap().chars().count(), TEXT_LIMIT);
+    }
+
+    fn parts(r: Response) -> (u16, String, String, String) {
+        let h = |k| r.headers().get(k).map_or(String::new(), |v: &header::HeaderValue| v.to_str().unwrap().to_string());
+        let (ct, cache) = (h(header::CONTENT_TYPE), h(header::CACHE_CONTROL));
+        let status = r.status().as_u16();
+        let bytes = tauri::async_runtime::block_on(axum::body::to_bytes(r.into_body(), usize::MAX)).unwrap();
+        (status, ct, cache, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[test]
+    fn serves_the_phone_ui() {
+        let dir = std::env::temp_dir().join(format!("navarch-dist-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("index.html"), "<!doctype html>phone").unwrap();
+        std::fs::write(dir.join("assets/app-1a2b.js"), "console.log(1)").unwrap();
+        std::fs::write(dir.join("manifest.webmanifest"), "{}").unwrap();
+        let get = |p: &str| std::fs::read(dir.join(p)).ok().map(Cow::Owned);
+        let index = (200, "text/html; charset=utf-8".to_string(), "no-cache".to_string(), "<!doctype html>phone".to_string());
+        for path in ["/", "/index.html", "/week", "/tasks/12"] {
+            assert_eq!(parts(static_file(path, get)), index, "{path}");
+        }
+        let js = parts(static_file("/assets/app-1a2b.js", get));
+        assert_eq!((js.0, js.1.as_str(), js.2.as_str()), (200, "text/javascript; charset=utf-8", "public, max-age=31536000, immutable"));
+        let manifest = parts(static_file("/manifest.webmanifest", get));
+        assert_eq!((manifest.1.as_str(), manifest.2.as_str()), ("application/manifest+json", "no-cache"));
+        for path in ["/assets/gone.js", "/favicon.ico", "/../Cargo.toml", "/assets/../index.html"] {
+            assert_eq!(parts(static_file(path, get)).0, 404, "{path}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Not built yet.
+        let (status, ct, _, body) = parts(static_file("/", |_| None));
+        assert_eq!((status, ct.as_str(), body.as_str()), (503, "text/plain; charset=utf-8", "Phone UI not built"));
+        assert_eq!(parts(static_file("/week", |_| None)).0, 503);
+    }
+
+    #[test]
+    fn the_phone_ui_checks_host_and_method() {
+        let t = setup(UsageCache::default());
+        assert_eq!(t.send("GET", "/", "evil.example.com", None, String::new()).0, 403);
+        // Whether apps/mobile/dist was built decides between the page and the 503; no token either way.
+        let status = t.send("GET", "/", HOST, None, String::new()).0;
+        assert!(status == 200 || status == 503, "{status}");
+        assert_eq!(t.send("POST", "/", HOST, Some(TOKEN), "{}".into()).0, 405);
+        assert_eq!(t.send("DELETE", "/week", HOST, Some(TOKEN), String::new()).0, 405);
     }
 }

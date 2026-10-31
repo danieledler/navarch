@@ -206,7 +206,7 @@ pub fn run() {
                 .unwrap_or_default();
             let watch = limits::Watch::new(limits::Files::new(&dir, dev_name().as_deref()), thresholds);
             let sessions = Arc::new(Mutex::new(Vec::new()));
-            let port = if dev_name().is_none() { mobile::PORT } else { mobile::DEV_PORT };
+            let port = mobile::port_for(dev_name().is_none(), std::env::var(mobile::PORT_ENV).ok().as_deref());
             let handle = app.handle().clone();
             let mobile = mobile::Mobile::new(&conn, port, Box::new(move |event| {
                 let _ = handle.emit(event, ());

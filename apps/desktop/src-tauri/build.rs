@@ -31,5 +31,9 @@ fn main() {
             println!("cargo:rerun-if-changed={path}");
         }
     }
+    // Release builds embed the phone UI (http.rs): rebuild when it changes. Debug builds read it from disk.
+    if std::env::var("PROFILE").as_deref() == Ok("release") {
+        println!("cargo:rerun-if-changed=../apps/mobile/dist");
+    }
     tauri_build::build()
 }
