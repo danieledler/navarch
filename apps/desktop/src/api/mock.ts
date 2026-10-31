@@ -2,7 +2,7 @@
 // Mirrors the Rust commands closely enough to exercise every UI flow, on the demo dataset in ./demo.ts.
 // Add ?reset to the URL to reseed.
 import type { Api } from "./index";
-import type { CpuSample, Id, LimitAlerts, Session, Snapshot, SystemStats, Task, Usage } from "./types";
+import type { CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Session, Snapshot, SystemStats, Task, Usage } from "./types";
 import { DEMO_PICK_FOLDER, demoSessions, demoSnapshot } from "./demo";
 
 const KEY = "navarch-mock-v2";
@@ -64,6 +64,13 @@ export function mockApi(): Api {
   const cpu = cpuSim();
   const db = load();
   let limitAlerts: LimitAlerts = { fiveHour: 95, sevenDay: 98, active: null, hookInstalled: false, live: false };
+  // A pretend phone server: nothing listens, but the popover shows every state. ?mobile=paired starts it on and paired.
+  const pairedMode = new URLSearchParams(location.search).get("mobile") === "paired";
+  let mobile: MobileAccess = {
+    enabled: pairedMode, running: pairedMode, port: 47821, publicUrl: pairedMode ? "https://mac.tail1234.ts.net" : "",
+    error: null, pairedAt: pairedMode ? new Date(Date.now() - 2 * 864e5).toISOString() : null,
+    lastSeenAt: pairedMode ? new Date(Date.now() - 4 * 6e4).toISOString() : null,
+  };
   const save = () => localStorage.setItem(KEY, JSON.stringify(db));
   const snap = (): Snapshot => ({
     spaces: db.spaces, projects: db.projects, tasks: db.tasks, periods: db.periods,
@@ -242,6 +249,21 @@ export function mockApi(): Api {
       listeners.add(cb);
       return () => listeners.delete(cb);
     },
+    onSnapshotChanged: () => () => {},
+    getMobileAccess: async () => ({ ...mobile }),
+    setMobileAccess: async (enabled, publicUrl) => {
+      const url = publicUrl.trim();
+      if (url && !/^https?:\/\/[^/\s]+/.test(url)) throw new Error(`Not a URL: ${url}`);
+      mobile = { ...mobile, enabled, running: enabled, publicUrl: url, error: null };
+      return { ...mobile };
+    },
+    newPairingCode: async (): Promise<PairingCode> => {
+      if (!mobile.enabled) throw new Error("Turn on phone access first");
+      const abc = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+      const code = Array.from({ length: 6 }, () => abc[Math.floor(Math.random() * abc.length)]).join("");
+      return { code, expiresAt: new Date(Date.now() + 10 * 6e4).toISOString() };
+    },
+    resetMobileToken: async () => (mobile = { ...mobile, pairedAt: null, lastSeenAt: null }),
     onUndoRequest: (cb) => {
       // No native menu in a browser: take ⌘Z / Ctrl+Z ourselves, as the app's Edit menu does.
       document.addEventListener("keydown", (e) => {

@@ -120,6 +120,10 @@ export const useStore = create<State>((set, get) => ({
           get().toast(`Claude started “${s.title || "the new session"}” in a temporary folder. Move it to ${baseName(s.launchPath)} in Claude.`);
     };
     api.onSessions(setSessions);
+    // A paired phone changed tasks over the phone API.
+    api.onSnapshotChanged(() => {
+      get().reload().catch(() => {});
+    });
     api.onLimitAlert((summary) => {
       get().toast(`Usage limit close (${summary}): told running sessions to save their work and schedule their resume`);
       get().refreshUsage(false);

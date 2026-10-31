@@ -2,10 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import { useStore } from "../store";
 import { fmtUntil, relTime } from "../lib/format";
 import { usagePaces, type Pace } from "../lib/pace";
-import { api, type BuildInfo, type UsageWindow } from "../api";
+import { api, type BuildInfo, type MobileAccess, type UsageWindow } from "../api";
 import { StatusDot } from "./ui";
 import { UsagePopover } from "./UsagePopover";
 import { CpuPopover, cpuTone } from "./CpuPopover";
+import { PhoneIcon, PhonePopover, phoneTitle } from "./PhonePopover";
 
 export function StatusBar() {
   const sys = useStore((s) => s.sys);
@@ -15,9 +16,13 @@ export function StatusBar() {
   const [usageOpen, setUsageOpen] = useState(false);
   const cpuRef = useRef<HTMLButtonElement>(null);
   const [cpuOpen, setCpuOpen] = useState(false);
+  const phoneRef = useRef<HTMLButtonElement>(null);
+  const [phoneOpen, setPhoneOpen] = useState(false);
+  const [phone, setPhone] = useState<MobileAccess | null>(null);
   const [build, setBuild] = useState<BuildInfo | null>(null);
   useEffect(() => {
     api.getBuildInfo().then(setBuild, () => {});
+    api.getMobileAccess().then(setPhone, () => {});
   }, []);
   const active = sessions.filter((s) => !s.archived);
   const count = (st: string) => active.filter((s) => s.status === st).length;
@@ -76,6 +81,18 @@ export function StatusBar() {
         </button>
       )}
       {cpuOpen && <CpuPopover anchor={cpuRef} onClose={() => setCpuOpen(false)} />}
+      <button
+        ref={phoneRef}
+        type="button"
+        className={`sb-item sb-btn phone ${phoneOpen ? "is-open" : ""}`}
+        title={phoneOpen ? undefined : phoneTitle(phone)}
+        aria-label="Phone access"
+        aria-expanded={phoneOpen}
+        onClick={() => setPhoneOpen((o) => !o)}
+      >
+        <PhoneIcon access={phone} />
+      </button>
+      {phoneOpen && <PhonePopover anchor={phoneRef} onClose={() => setPhoneOpen(false)} access={phone} onChange={setPhone} />}
       <button
         ref={usageRef}
         type="button"

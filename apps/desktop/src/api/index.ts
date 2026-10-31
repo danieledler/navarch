@@ -1,4 +1,4 @@
-import type { BuildInfo, CpuSample, Id, LimitAlerts, Period, Project, Session, Snapshot, Space, SystemStats, Task, TaskPatch, Usage } from "./types";
+import type { BuildInfo, CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Period, Project, Session, Snapshot, Space, SystemStats, Task, TaskPatch, Usage } from "./types";
 import { mockApi } from "./mock";
 
 export * from "./types";
@@ -37,6 +37,15 @@ export interface Api {
   /** A usage-limit alert went out to running sessions; the payload is its summary. */
   onLimitAlert(cb: (summary: string) => void): void;
   onSessions(cb: (s: Session[]) => void): () => void;
+  /** A paired phone changed tasks over the phone API: reload the snapshot. Returns the unsubscribe. */
+  onSnapshotChanged(cb: () => void): () => void;
+  getMobileAccess(): Promise<MobileAccess>;
+  /** Starts or stops the phone API on 127.0.0.1 and saves the setting; the first enable creates the token. */
+  setMobileAccess(enabled: boolean, publicUrl: string): Promise<MobileAccess>;
+  /** A single-use code, valid 10 minutes, that a phone trades for the token. Fails while access is off. */
+  newPairingCode(): Promise<PairingCode>;
+  /** A new token: every paired phone has to pair again. */
+  resetMobileToken(): Promise<MobileAccess>;
   /** Edit › Undo or ⌘Z. The app's menu item owns ⌘Z, so the webview never sees the keystroke. */
   onUndoRequest(cb: () => void): void;
   /** Name what Edit › Undo will undo ("Undo Link “x”"), or grey it out. */
@@ -98,6 +107,22 @@ function tauriApi(): Api {
         un?.();
       };
     },
+    onSnapshotChanged: (cb) => {
+      let un: (() => void) | undefined;
+      let dead = false;
+      event.then((e) => e.listen("snapshot-changed", () => cb())).then((u) => {
+        if (dead) u();
+        else un = u;
+      });
+      return () => {
+        dead = true;
+        un?.();
+      };
+    },
+    getMobileAccess: () => call("get_mobile_access"),
+    setMobileAccess: (enabled, publicUrl) => call("set_mobile_access", { enabled, publicUrl }),
+    newPairingCode: () => call("new_pairing_code"),
+    resetMobileToken: () => call("reset_mobile_token"),
     onUndoRequest: (cb) => {
       event.then((e) => e.listen("menu-undo", cb));
     },
