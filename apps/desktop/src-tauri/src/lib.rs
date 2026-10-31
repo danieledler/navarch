@@ -45,6 +45,7 @@ fn database_path(data_dir: &Path) -> db::Res<PathBuf> {
     let dev = data_dir.join(format!("navarch-dev-{name}.db"));
     if !dev.exists() && real.exists() {
         db::copy_database(&real, &dev)?;
+        mobile::forget(&rusqlite::Connection::open(&dev).map_err(db::err)?)?;
     }
     Ok(dev)
 }
@@ -207,8 +208,8 @@ pub fn run() {
             let sessions = Arc::new(Mutex::new(Vec::new()));
             let port = if dev_name().is_none() { mobile::PORT } else { mobile::DEV_PORT };
             let handle = app.handle().clone();
-            let mobile = mobile::Mobile::new(&conn, port, Box::new(move || {
-                let _ = handle.emit("snapshot-changed", ());
+            let mobile = mobile::Mobile::new(&conn, port, Box::new(move |event| {
+                let _ = handle.emit(event, ());
             }));
             app.manage(AppState {
                 db: Mutex::new(conn),

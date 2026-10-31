@@ -250,10 +250,13 @@ export function mockApi(): Api {
       return () => listeners.delete(cb);
     },
     onSnapshotChanged: () => () => {},
+    onMobileChanged: () => () => {},
     getMobileAccess: async () => ({ ...mobile }),
     setMobileAccess: async (enabled, publicUrl) => {
       const url = publicUrl.trim();
-      if (url && !/^https?:\/\/[^/\s]+/.test(url)) throw new Error(`Not a URL: ${url}`);
+      // As url_host in src-tauri/src/mobile.rs: any scheme or none, then a host.
+      const host = url.replace(/^[^:/?#]*:\/\//, "").split(/[/?#]/)[0].replace(/^.*@/, "").replace(/:\d*$/, "").replace(/\.+$/, "");
+      if (url && (!host || /\s/.test(host))) throw new Error("The public URL needs a host, like https://my-mac.tailnet.ts.net");
       mobile = { ...mobile, enabled, running: enabled, publicUrl: url, error: null };
       return { ...mobile };
     },

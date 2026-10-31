@@ -73,8 +73,12 @@ struct Server {
     error: Option<String>,
 }
 
-/// Tells the desktop UI that the phone changed planner data ("snapshot-changed").
-pub type Emit = Box<dyn Fn() + Send + Sync>;
+/// Sends a Tauri event (no payload) to the desktop UI: `SNAPSHOT_CHANGED` or `MOBILE_CHANGED`.
+pub type Emit = Box<dyn Fn(&'static str) + Send + Sync>;
+/// The phone changed planner data.
+pub const SNAPSHOT_CHANGED: &str = "snapshot-changed";
+/// `MobileAccess` changed, or the pairing code shown ended: a phone paired, the code locked, the server stopped.
+pub const MOBILE_CHANGED: &str = "mobile-changed";
 
 /// The app state as the server's handlers reach it: the app handle in the app, an `Arc` in tests.
 pub trait Ctx: AsRef<AppState> + Clone + Send + Sync + 'static {}
@@ -193,7 +197,11 @@ impl Mobile {
     }
 
     pub fn changed(&self) {
-        (self.emit)()
+        (self.emit)(SNAPSHOT_CHANGED)
+    }
+
+    fn notify(&self) {
+        (self.emit)(MOBILE_CHANGED)
     }
 
     /// The Host header, port dropped, must be this Mac or the public URL's host.
@@ -241,6 +249,8 @@ impl Mobile {
         cur.misses += 1;
         if cur.misses >= MAX_MISSES {
             *p = None;
+            drop(p);
+            self.notify();
         }
         false
     }
@@ -269,9 +279,18 @@ pub fn pair(st: &AppState, code: &str) -> Res<Option<String>> {
         let c = st.db.lock().map_err(db::err)?;
         db::set_setting(&c, PAIRED_AT_KEY, &at)?;
     }
-    let mut cfg = st.mobile.cfg.lock().unwrap();
-    cfg.paired_at = Some(at);
-    Ok(cfg.token.clone())
+    let token = {
+        let mut cfg = st.mobile.cfg.lock().unwrap();
+        cfg.paired_at = Some(at);
+        cfg.token.clone()
+    };
+    st.mobile.notify();
+    Ok(token)
+}
+
+/// A dev build's copy of the real database mustn't serve the installed app's phones: drop phone access.
+pub fn forget(conn: &Connection) -> Res<()> {
+    [SETTING_KEY, TOKEN_KEY, PAIRED_AT_KEY].iter().try_for_each(|k| db::delete_setting(conn, k))
 }
 
 /// A new token: every paired phone has to pair again.
@@ -363,13 +382,19 @@ pub fn start<C: Ctx>(ctx: C) {
                 .map_err(|e| e.to_string()),
             Err(e) => Err(e.to_string()),
         };
-        if let Ok(mut s) = owner.as_ref().mobile.server.lock() {
-            if s.generation == generation {
+        let m = &owner.as_ref().mobile;
+        let ended = m.server.lock().is_ok_and(|mut s| {
+            let current = s.generation == generation;
+            if current {
                 s.running = false;
                 s.stop = None;
                 s.task = None;
                 s.error = res.err().or_else(|| Some("The server stopped".into()));
             }
+            current
+        });
+        if ended {
+            m.notify();
         }
     }));
 }
@@ -383,7 +408,7 @@ mod tests {
         db::migrate(&c).unwrap();
         db::set_setting(&c, SETTING_KEY, &serde_json::json!({ "enabled": enabled }).to_string()).unwrap();
         db::set_setting(&c, TOKEN_KEY, "tok").unwrap();
-        Mobile::new(&c, 0, Box::new(|| {}))
+        Mobile::new(&c, 0, Box::new(|_| {}))
     }
 
     #[test]
@@ -405,6 +430,19 @@ mod tests {
         let p = m.new_pairing_code_at(now).unwrap();
         assert!(m.take_code(&p.code.to_ascii_lowercase(), now + 1));
         assert!(!m.take_code(&p.code, now + 2), "single use");
+    }
+
+    #[test]
+    fn dev_copies_forget_phone_access() {
+        let c = Connection::open_in_memory().unwrap();
+        db::migrate(&c).unwrap();
+        for k in [SETTING_KEY, TOKEN_KEY, PAIRED_AT_KEY] {
+            db::set_setting(&c, k, "x").unwrap();
+        }
+        forget(&c).unwrap();
+        for k in [SETTING_KEY, TOKEN_KEY, PAIRED_AT_KEY] {
+            assert_eq!(db::get_setting(&c, k).unwrap(), None);
+        }
     }
 
     #[test]

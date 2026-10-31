@@ -75,6 +75,9 @@ function loadPrefs(): UIPrefs {
 
 let toastSeq = 0;
 let started = false;
+// Reloads can overlap (a phone's write and the desktop's own): only a newer one may replace the snapshot.
+let reloadSeq = 0;
+let appliedReload = 0;
 
 // Undoable actions, newest last, keyed by the toast that announced them.
 const undoStack: ({ id: number; text: string } & Undoable)[] = [];
@@ -152,7 +155,13 @@ export const useStore = create<State>((set, get) => ({
     window.addEventListener("focus", () => get().refreshUsage(false));
   },
 
-  reload: async () => set({ snap: await api.getSnapshot() }),
+  reload: async () => {
+    const n = ++reloadSeq;
+    const snap = await api.getSnapshot();
+    if (n < appliedReload) return;
+    appliedReload = n;
+    set({ snap });
+  },
 
   run: async (p) => {
     try {

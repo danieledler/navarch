@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Smartphone } from "lucide-react";
 import { api, type MobileAccess, type PairingCode } from "../api";
 import { useStore } from "../store";
@@ -32,11 +32,24 @@ export function PhonePopover({
   const [url, setUrl] = useState(access?.publicUrl ?? "");
   const [code, setCode] = useState<PairingCode | null>(null);
   const [now, setNow] = useState(Date.now());
+  // Read by the event listener below, which outlives a render.
+  const shown = useRef({ code, pairedAt: access?.pairedAt ?? null });
+  shown.current = { code, pairedAt: access?.pairedAt ?? null };
   useEffect(() => {
     api.getMobileAccess().then((a) => {
       onChange(a);
       setUrl(a.publicUrl);
     }, () => {});
+    // The code on screen is dead once this fires: a phone used it, wrong tries locked it, or the server stopped.
+    return api.onMobileChanged(async () => {
+      const before = shown.current;
+      const n = await api.getMobileAccess().catch(() => null);
+      if (n) onChange(n);
+      if (!before.code) return;
+      setCode(null);
+      if (n?.pairedAt && n.pairedAt !== before.pairedAt) toast("Phone paired");
+      else if (n?.running) toast("Too many wrong tries ended the pairing code. Pair again for a new one.", undefined, "error");
+    });
   }, []);
   // A second tick for the code's countdown; a slow one otherwise for "last seen".
   useEffect(() => {
@@ -108,6 +121,9 @@ export function PhonePopover({
         <button
           type="button" role="switch" aria-checked={a.enabled} aria-label="Phone access" disabled={busy}
           className={`switch ${a.enabled ? "is-on" : ""}`} onClick={toggle}
+          // Keep focus in the URL field: its blur would save on its own and disable this switch before the click lands.
+          // toggle saves the URL too.
+          onMouseDown={(e) => e.preventDefault()}
         >
           <span />
         </button>

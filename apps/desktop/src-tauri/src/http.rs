@@ -133,6 +133,13 @@ pub fn slim_sessions(list: Vec<Session>, today: NaiveDate) -> Vec<Session> {
         .collect()
 }
 
+/// A browser can't send `application/json` to another origin without a preflight, which gets 405 and no
+/// CORS headers, so a web page open on the Mac can't reach any route, `/api/pair` included.
+fn is_json(headers: &HeaderMap) -> bool {
+    let ct = headers.get(header::CONTENT_TYPE).and_then(|h| h.to_str().ok()).unwrap_or("");
+    ct.split(';').next().is_some_and(|m| m.trim().eq_ignore_ascii_case("application/json"))
+}
+
 fn reply(status: StatusCode, body: &Value) -> Response {
     (status, [(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
 }
@@ -166,6 +173,9 @@ async fn handle<C: Ctx>(
         r.headers_mut().insert(header::ALLOW, header::HeaderValue::from_static("POST"));
         return r;
     }
+    if !is_json(&headers) {
+        return fail(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Send Content-Type: application/json");
+    }
     let body = match body {
         Ok(b) => b,
         Err(e) => return fail(e.status(), &e.body_text()),
@@ -179,11 +189,14 @@ async fn handle<C: Ctx>(
         }
     };
     if cmd == "pair" {
-        let code = a.get("code").and_then(Value::as_str).unwrap_or("");
-        return match mobile::pair(st, code) {
-            Ok(Some(token)) => reply(StatusCode::OK, &json!({ "token": token })),
-            Ok(None) => fail(StatusCode::UNAUTHORIZED, "Wrong or expired pairing code"),
-            Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        let code = a.get("code").and_then(Value::as_str).unwrap_or("").to_string();
+        let worker = ctx.clone();
+        // Writes the database, like the commands below: off the async workers.
+        return match tauri::async_runtime::spawn_blocking(move || mobile::pair(worker.as_ref(), &code)).await {
+            Ok(Ok(Some(token))) => reply(StatusCode::OK, &json!({ "token": token })),
+            Ok(Ok(None)) => fail(StatusCode::UNAUTHORIZED, "Wrong or expired pairing code"),
+            Ok(Err(e)) => fail(StatusCode::INTERNAL_SERVER_ERROR, &e),
+            Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         };
     }
     let auth = headers.get(header::AUTHORIZATION).and_then(|h| h.to_str().ok());
@@ -219,6 +232,7 @@ mod tests {
     struct T {
         st: Arc<AppState>,
         changes: Arc<AtomicUsize>,
+        mobile_changes: Arc<AtomicUsize>,
     }
 
     fn setup(usage: UsageCache) -> T {
@@ -231,10 +245,11 @@ mod tests {
         let setting = json!({ "enabled": true, "publicUrl": format!("https://{HOST}") });
         db::set_setting(&c, mobile::SETTING_KEY, &setting.to_string()).unwrap();
         db::set_setting(&c, "mobile_token", TOKEN).unwrap();
-        let changes = Arc::new(AtomicUsize::new(0));
-        let n = changes.clone();
-        let mobile = mobile::Mobile::new(&c, port, Box::new(move || {
-            n.fetch_add(1, Ordering::SeqCst);
+        let (changes, mobile_changes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (n, m) = (changes.clone(), mobile_changes.clone());
+        let mobile = mobile::Mobile::new(&c, port, Box::new(move |event| {
+            let count = if event == mobile::SNAPSHOT_CHANGED { &n } else { &m };
+            count.fetch_add(1, Ordering::SeqCst);
         }));
         let dir = std::env::temp_dir().join(format!("navarch-http-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -247,12 +262,19 @@ mod tests {
             limits: Mutex::new(crate::limits::Watch::new(crate::limits::Files::new(&dir, Some("test")), Default::default())),
             mobile,
         };
-        T { st: Arc::new(st), changes }
+        T { st: Arc::new(st), changes, mobile_changes }
     }
 
     impl T {
         fn send(&self, method: &str, path: &str, host: &str, token: Option<&str>, body: String) -> (u16, Value) {
+            self.send_as(method, path, host, token, Some("application/json"), body)
+        }
+
+        fn send_as(&self, method: &str, path: &str, host: &str, token: Option<&str>, ct: Option<&str>, body: String) -> (u16, Value) {
             let mut req = Request::builder().method(method).uri(path).header("host", host);
+            if let Some(ct) = ct {
+                req = req.header("content-type", ct);
+            }
             if let Some(t) = token {
                 req = req.header("authorization", format!("Bearer {t}"));
             }
@@ -299,6 +321,10 @@ mod tests {
         assert_eq!(t.send("OPTIONS", "/api/get_snapshot", HOST, None, String::new()).0, 405);
         assert_eq!(t.send("POST", "/other", HOST, Some(TOKEN), "{}".into()).0, 404);
         assert_eq!(t.call("ping", json!([1])).0, 400);
+        assert_eq!(t.send_as("POST", "/api/ping", HOST, Some(TOKEN), Some("application/json; charset=utf-8"), "{}".into()).0, 200);
+        for ct in [None, Some("text/plain"), Some("application/x-www-form-urlencoded")] {
+            assert_eq!(t.send_as("POST", "/api/ping", HOST, Some(TOKEN), ct, "{}".into()).0, 415, "{ct:?}");
+        }
         let big = json!({ "x": "a".repeat(BODY_LIMIT) }).to_string();
         let (status, body) = t.send("POST", "/api/ping", HOST, Some(TOKEN), big);
         assert_eq!(status, 413);
@@ -322,15 +348,23 @@ mod tests {
         let pair = |code: &str| t.send("POST", "/api/pair", HOST, None, json!({ "code": code }).to_string());
         assert_eq!(pair("ABCDEF").0, 401, "no code yet");
         let code = t.st.mobile.new_pairing_code().unwrap().code;
+        // What a web page could send without a preflight is refused before it counts as a miss.
+        for _ in 0..5 {
+            let plain = t.send_as("POST", "/api/pair", "127.0.0.1", None, Some("text/plain"), json!({ "code": "WRONG2" }).to_string());
+            assert_eq!(plain.0, 415);
+        }
         assert_eq!(pair("WRONG2").0, 401);
+        assert_eq!(t.mobile_changes.load(Ordering::SeqCst), 0);
         assert_eq!(pair(&code), (200, json!({ "token": TOKEN })));
         assert!(t.st.mobile.access().paired_at.is_some());
+        assert_eq!(t.mobile_changes.load(Ordering::SeqCst), 1, "the desktop hears of the pairing");
         assert_eq!(pair(&code).0, 401, "single use");
 
         let code = t.st.mobile.new_pairing_code().unwrap().code;
         for _ in 0..5 {
             assert_eq!(pair("WRONG2").0, 401);
         }
+        assert_eq!(t.mobile_changes.load(Ordering::SeqCst), 2, "and of the locked code");
         assert_eq!(pair(&code).0, 401, "five misses end the code");
 
         // A new token unpairs: the old one stops working.
@@ -385,7 +419,7 @@ mod tests {
         };
         assert!(eventually(&|| on(true).unwrap().running), "{:?}", t.st.mobile.access());
         let mut conn = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        write!(conn, "POST /api/ping HTTP/1.1\r\nHost: {HOST}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").unwrap();
+        write!(conn, "POST /api/ping HTTP/1.1\r\nHost: {HOST}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").unwrap();
         let mut resp = String::new();
         conn.read_to_string(&mut resp).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200") && resp.ends_with(r#"{"ok":true}"#), "{resp}");

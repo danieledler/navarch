@@ -22,7 +22,9 @@ export function StatusBar() {
   const [build, setBuild] = useState<BuildInfo | null>(null);
   useEffect(() => {
     api.getBuildInfo().then(setBuild, () => {});
-    api.getMobileAccess().then(setPhone, () => {});
+    const fetchPhone = () => api.getMobileAccess().then(setPhone, () => {});
+    fetchPhone();
+    return api.onMobileChanged(fetchPhone);
   }, []);
   const active = sessions.filter((s) => !s.archived);
   const count = (st: string) => active.filter((s) => s.status === st).length;

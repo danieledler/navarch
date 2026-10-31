@@ -39,6 +39,8 @@ export interface Api {
   onSessions(cb: (s: Session[]) => void): () => void;
   /** A paired phone changed tasks over the phone API: reload the snapshot. Returns the unsubscribe. */
   onSnapshotChanged(cb: () => void): () => void;
+  /** Phone access changed behind the UI's back: a phone paired, the pairing code locked, the server stopped. */
+  onMobileChanged(cb: () => void): () => void;
   getMobileAccess(): Promise<MobileAccess>;
   /** Starts or stops the phone API on 127.0.0.1 and saves the setting; the first enable creates the token. */
   setMobileAccess(enabled: boolean, publicUrl: string): Promise<MobileAccess>;
@@ -62,6 +64,19 @@ function tauriApi(): Api {
   const event = import("@tauri-apps/api/event");
   const dialog = import("@tauri-apps/plugin-dialog");
   const call = async <T>(cmd: string, args?: Record<string, unknown>) => (await core).invoke<T>(cmd, args);
+  /** Listens to an event without a payload; the returned function stops listening, even before it started. */
+  const listenBare = (name: string, cb: () => void) => {
+    let un: (() => void) | undefined;
+    let dead = false;
+    event.then((e) => e.listen(name, () => cb())).then((u) => {
+      if (dead) u();
+      else un = u;
+    });
+    return () => {
+      dead = true;
+      un?.();
+    };
+  };
   return {
     getSnapshot: () => call("get_snapshot"),
     createSpace: (name, color) => call("create_space", { name, color }),
@@ -107,18 +122,8 @@ function tauriApi(): Api {
         un?.();
       };
     },
-    onSnapshotChanged: (cb) => {
-      let un: (() => void) | undefined;
-      let dead = false;
-      event.then((e) => e.listen("snapshot-changed", () => cb())).then((u) => {
-        if (dead) u();
-        else un = u;
-      });
-      return () => {
-        dead = true;
-        un?.();
-      };
-    },
+    onSnapshotChanged: (cb) => listenBare("snapshot-changed", cb),
+    onMobileChanged: (cb) => listenBare("mobile-changed", cb),
     getMobileAccess: () => call("get_mobile_access"),
     setMobileAccess: (enabled, publicUrl) => call("set_mobile_access", { enabled, publicUrl }),
     newPairingCode: () => call("new_pairing_code"),
