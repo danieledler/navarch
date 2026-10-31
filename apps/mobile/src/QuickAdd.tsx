@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ChevronsUpDown } from "lucide-react";
-import type { Id } from "../../../src/api/types";
-import type { Model } from "../../../src/lib/model";
+import type { Id } from "@desktop/api/types";
+import type { Model } from "@desktop/lib/model";
 import { api } from "./api";
 import { useStore } from "./store";
 

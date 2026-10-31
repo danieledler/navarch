@@ -1,7 +1,7 @@
 import { Check, CalendarCheck } from "lucide-react";
-import type { Id, Task } from "../../../src/api/types";
-import { deadlineInfo, fmtDuration } from "../../../src/lib/format";
-import { weekItems, type Model, type WeekReason } from "../../../src/lib/model";
+import type { Id, Task } from "@desktop/api/types";
+import { deadlineInfo, fmtDuration } from "@desktop/lib/format";
+import { weekItems, type Model, type WeekReason } from "@desktop/lib/model";
 import { useStore } from "./store";
 
 type Item = { task: Task; reasons: WeekReason[]; ms: number };

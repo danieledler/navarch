@@ -1,8 +1,8 @@
 import { Check, Target } from "lucide-react";
-import type { Task } from "../../../src/api/types";
-import { daysBetween, shortDate, today } from "../../../src/lib/dates";
-import { deadlineInfo } from "../../../src/lib/format";
-import type { Model } from "../../../src/lib/model";
+import type { Task } from "@desktop/api/types";
+import { daysBetween, shortDate, today } from "@desktop/lib/dates";
+import { deadlineInfo } from "@desktop/lib/format";
+import type { Model } from "@desktop/lib/model";
 import { useStore } from "./store";
 
 /** "12 days left" / "ends today" / "ended", for the header and the period card. */

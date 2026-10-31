@@ -1,7 +1,7 @@
 import { CheckCircle2, ExternalLink } from "lucide-react";
-import type { Session, SessionStatus } from "../../../src/api/types";
-import { baseName, relTime } from "../../../src/lib/format";
-import { isLive, needsAttention, type Model } from "../../../src/lib/model";
+import type { Session, SessionStatus } from "@desktop/api/types";
+import { baseName, relTime } from "@desktop/lib/format";
+import { isLive, needsAttention, type Model } from "@desktop/lib/model";
 import { useNow } from "./time";
 
 export const STATUS_LABEL: Record<SessionStatus, string> = {

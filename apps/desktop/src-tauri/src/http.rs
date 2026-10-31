@@ -153,10 +153,10 @@ fn fail(status: StatusCode, msg: &str) -> Response {
     reply(status, &json!({ "error": msg }))
 }
 
-/// The phone UI, built by `pnpm mobile:build`, embedded in release builds. Without a build, `/` says so (503).
+/// The phone UI, built by `pnpm --filter mobile build`, embedded in release builds. Without a build, `/` says so (503).
 #[cfg(not(debug_assertions))]
 #[derive(rust_embed::RustEmbed)]
-#[folder = "../apps/mobile/dist"]
+#[folder = "../../mobile/dist"]
 #[allow_missing = true]
 struct PhoneUi;
 
@@ -166,11 +166,11 @@ fn phone_file(rel: &str) -> Option<Cow<'static, [u8]>> {
 }
 
 /// Debug builds read the phone UI from disk on each request, so a dev window serves the latest
-/// `pnpm mobile:build`. (rust-embed's own debug reader fixes the folder at compile time and refuses
+/// `pnpm --filter mobile build`. (rust-embed's own debug reader fixes the folder at compile time and refuses
 /// every file if dist didn't exist then.) `static_file` has already refused `..`.
 #[cfg(debug_assertions)]
 fn phone_file(rel: &str) -> Option<Cow<'static, [u8]>> {
-    let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../apps/mobile/dist");
+    let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../mobile/dist");
     std::fs::read(dist.join(rel)).ok().map(Cow::Owned)
 }
 

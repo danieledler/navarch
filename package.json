@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "pnpm --filter desktop dev",
     "site": "pnpm --filter site dev",
+    "mobile": "pnpm --filter mobile dev",
     "tauri": "pnpm --filter desktop tauri",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",

@@ -1,6 +1,6 @@
 // The phone's backend: POST /api/<cmd> on the same origin (tailscale serve → Navarch's phone server).
 // With ?mock in the URL, the desktop's in-memory mock stands in, so the UI runs without a Mac.
-import type { Id, LimitAlerts, Session, Snapshot, Task, TaskPatch, Usage } from "../../../src/api/types";
+import type { Id, LimitAlerts, Session, Snapshot, Task, TaskPatch, Usage } from "@desktop/api/types";
 
 /** The Mac can't be reached: network error, timeout, tunnel error page (530, 502…), or anything that isn't our JSON. */
 export class Offline extends Error {
@@ -32,7 +32,7 @@ export interface PhoneApi {
   pair(code: string): Promise<string>;
 }
 
-/** Dev builds only (pnpm mobile:dev): production drops the mock and its chunk. */
+/** Dev builds only (pnpm --filter mobile dev): production drops the mock and its chunk. */
 export const isMock = import.meta.env.DEV && new URLSearchParams(location.search).has("mock");
 
 /** A sleeping Mac behind tailscale serve can leave a request hanging for a minute or more. */
@@ -105,7 +105,7 @@ const httpApi: PhoneApi = {
 };
 
 async function mock(): Promise<PhoneApi> {
-  const { mockApi } = await import("../../../src/api/mock");
+  const { mockApi } = await import("@desktop/api/mock");
   const m = mockApi();
   return {
     ping: async () => ({ ok: true }),

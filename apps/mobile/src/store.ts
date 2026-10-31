@@ -2,8 +2,8 @@
 // cached in localStorage so a sleeping Mac still leaves something to read.
 import { useMemo } from "react";
 import { create } from "zustand";
-import type { Session, Snapshot, Task, TaskPatch, Usage } from "../../../src/api/types";
-import { buildModel, type Model } from "../../../src/lib/model";
+import type { Session, Snapshot, Task, TaskPatch, Usage } from "@desktop/api/types";
+import { buildModel, type Model } from "@desktop/lib/model";
 import { api, getToken, isMock, Offline, setToken, Unauthorized } from "./api";
 
 export interface Toast {

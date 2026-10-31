@@ -1,7 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { ago, useNow } from "./time";
 import { CalendarDays, CloudOff, Gauge, TriangleAlert, Inbox, Plus, RefreshCw, Settings, Target } from "lucide-react";
-import { weekLabel, weekNumber } from "../../../src/lib/dates";
+import { weekLabel, weekNumber } from "@desktop/lib/dates";
 import { isMock } from "./api";
 import { startPolling, useModel, useStore } from "./store";
 import { Pair } from "./Pair";

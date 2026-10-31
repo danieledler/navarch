@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import { AlertTriangle, CloudOff, Gauge } from "lucide-react";
-import type { LimitAlerts, UsageWindow } from "../../../src/api/types";
-import { fmtUntil } from "../../../src/lib/format";
-import { usagePaces, type Pace } from "../../../src/lib/pace";
+import type { LimitAlerts, UsageWindow } from "@desktop/api/types";
+import { fmtUntil } from "@desktop/lib/format";
+import { usagePaces, type Pace } from "@desktop/lib/pace";
 import { api } from "./api";
 import { useStore } from "./store";
 import { ago, useNow } from "./time";
