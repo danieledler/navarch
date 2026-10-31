@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn needs_the_token() {
-        let t = setup(UsageCache::default());
+        let t = setup(UsageCache::new(None));
         let ping = |tok| t.send("POST", "/api/ping", "localhost:47821", tok, "{}".into());
         assert_eq!(ping(None).0, 401);
         assert_eq!(ping(Some("test-tokem")).0, 401);
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn checks_host_method_allowlist_and_size() {
-        let t = setup(UsageCache::default());
+        let t = setup(UsageCache::new(None));
         for host in ["evil.example.com", "mac.tail1.ts.net.evil.com", "", "[::1]:47821"] {
             assert_eq!(t.send("POST", "/api/ping", host, Some(TOKEN), "{}".into()).0, 403, "{host}");
         }
@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn pairs_once_with_a_fresh_code() {
-        let t = setup(UsageCache::default());
+        let t = setup(UsageCache::new(None));
         let pair = |code: &str| t.send("POST", "/api/pair", HOST, None, json!({ "code": code }).to_string());
         assert_eq!(pair("ABCDEF").0, 401, "no code yet");
         let code = t.st.mobile.new_pairing_code().unwrap().code;
@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn writes_tell_the_desktop() {
-        let t = setup(UsageCache::default());
+        let t = setup(UsageCache::new(None));
         let (status, snap) = t.call("get_snapshot", json!({}));
         assert_eq!(status, 200);
         let space = snap["spaces"][0]["id"].as_i64().unwrap();
@@ -513,7 +513,7 @@ mod tests {
         use std::io::{Read, Write};
         let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = taken.local_addr().unwrap().port();
-        let t = setup_on(port, UsageCache::default());
+        let t = setup_on(port, UsageCache::new(None));
         mobile::start(t.st.clone());
         let a = t.st.mobile.access();
         assert!(!a.running && a.error.unwrap().contains("Can't listen"));
@@ -591,7 +591,7 @@ mod tests {
         assert!(got[2].days.is_empty());
 
         // Over HTTP, against today's week.
-        let t = setup(UsageCache::default());
+        let t = setup(UsageCache::new(None));
         let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
         *t.st.sessions.lock().unwrap() = vec![session("a", false, &["2000-01-03", &today]), session("b", true, &[])];
         let (status, list) = t.call("get_sessions", json!({}));
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn the_phone_ui_checks_host_and_method() {
-        let t = setup(UsageCache::default());
+        let t = setup(UsageCache::new(None));
         assert_eq!(t.send("GET", "/", "evil.example.com", None, String::new()).0, 403);
         let (status, ct, cache, page) = parts(unknown_host("Mac.tail1234.ts.net:443", false));
         assert_eq!((status, ct.as_str(), cache.as_str()), (403, "text/html; charset=utf-8", "no-store"));
