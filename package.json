@@ -1,0 +1,14 @@
+{
+  "name": "navarch",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "dev": "pnpm --filter desktop dev",
+    "site": "pnpm --filter site dev",
+    "tauri": "pnpm --filter desktop tauri",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test:e2e": "pnpm --filter site test:e2e"
+  }
+}

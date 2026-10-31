@@ -1,0 +1,12 @@
+node_modules
+dist
+apps/*/src-tauri/target
+apps/desktop/src-tauri/gen
+.DS_Store
+*.local
+apps/desktop/scripts/shots
+.claude/worktrees
+.vscode/
+test-results/
+playwright-report/
+blob-report/
