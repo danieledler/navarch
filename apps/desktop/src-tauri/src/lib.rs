@@ -5,6 +5,7 @@ pub mod limits;
 pub mod mobile;
 pub mod procs;
 pub mod scanner;
+pub mod tailscale;
 pub mod usage;
 
 use std::path::{Path, PathBuf};
@@ -261,6 +262,7 @@ pub fn run() {
             commands::set_mobile_access,
             commands::new_pairing_code,
             commands::reset_mobile_token,
+            commands::detect_tailscale,
             set_undo_menu,
         ])
         .build(tauri::generate_context!())

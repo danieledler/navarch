@@ -2,7 +2,7 @@
 // Mirrors the Rust commands closely enough to exercise every UI flow, on the demo dataset in ./demo.ts.
 // Add ?reset to the URL to reseed.
 import type { Api } from "./index";
-import type { CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Session, Snapshot, SystemStats, Task, Usage } from "./types";
+import type { CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Tailscale, Session, Snapshot, SystemStats, Task, Usage } from "./types";
 import { DEMO_PICK_FOLDER, demoSessions, demoSnapshot } from "./demo";
 
 const KEY = "navarch-mock-v2";
@@ -267,6 +267,7 @@ export function mockApi(): Api {
       return { code, expiresAt: new Date(Date.now() + 10 * 6e4).toISOString() };
     },
     resetMobileToken: async () => (mobile = { ...mobile, pairedAt: null, lastSeenAt: null }),
+    detectTailscale: async (): Promise<Tailscale | null> => ({ running: true, dnsName: "mac.tail1234.ts.net" }),
     onUndoRequest: (cb) => {
       // No native menu in a browser: take ⌘Z / Ctrl+Z ourselves, as the app's Edit menu does.
       document.addEventListener("keydown", (e) => {

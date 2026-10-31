@@ -165,6 +165,12 @@ export interface MobileAccess {
   lastSeenAt: string | null; // RFC 3339, last request with the token since launch
 }
 
+/** This Mac on Tailscale, from `tailscale status --json`; detectTailscale returns null without the CLI. */
+export interface Tailscale {
+  running: boolean; // connected to the tailnet
+  dnsName: string | null; // MagicDNS name, e.g. "mac.tail1234.ts.net"; null while logged out
+}
+
 /** A single-use code the phone trades for its token at POST /api/pair. */
 export interface PairingCode {
   code: string; // 6 characters, no 0/O/1/I/L

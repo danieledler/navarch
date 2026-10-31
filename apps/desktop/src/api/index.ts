@@ -1,4 +1,4 @@
-import type { BuildInfo, CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Period, Project, Session, Snapshot, Space, SystemStats, Task, TaskPatch, Usage } from "./types";
+import type { BuildInfo, CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Tailscale, Period, Project, Session, Snapshot, Space, SystemStats, Task, TaskPatch, Usage } from "./types";
 import { mockApi } from "./mock";
 
 export * from "./types";
@@ -48,6 +48,8 @@ export interface Api {
   newPairingCode(): Promise<PairingCode>;
   /** A new token: every paired phone has to pair again. */
   resetMobileToken(): Promise<MobileAccess>;
+  /** This Mac's Tailscale name, for the public URL; null when the Tailscale CLI isn't installed. Takes up to 2 s. */
+  detectTailscale(): Promise<Tailscale | null>;
   /** Edit › Undo or ⌘Z. The app's menu item owns ⌘Z, so the webview never sees the keystroke. */
   onUndoRequest(cb: () => void): void;
   /** Name what Edit › Undo will undo ("Undo Link “x”"), or grey it out. */
@@ -128,6 +130,7 @@ function tauriApi(): Api {
     setMobileAccess: (enabled, publicUrl) => call("set_mobile_access", { enabled, publicUrl }),
     newPairingCode: () => call("new_pairing_code"),
     resetMobileToken: () => call("reset_mobile_token"),
+    detectTailscale: () => call("detect_tailscale"),
     onUndoRequest: (cb) => {
       event.then((e) => e.listen("menu-undo", cb));
     },

@@ -613,6 +613,7 @@ kbd {
 .ph-url .pace-label { margin-bottom: 4px; }
 .ph-url .field { width: 100%; font: 12px var(--mono); }
 .ph-setup { margin: 0; }
+.ph-use { align-self: flex-start; margin-top: -6px; font: 12px var(--mono); overflow-wrap: anywhere; text-align: left; }
 .ph-setup code { font: 11px var(--mono); color: var(--text); background: var(--hover); padding: 1px 4px; border-radius: 4px; user-select: text; -webkit-user-select: text; }
 .ph-pair { align-self: flex-start; }
 .ph-code { text-align: center; padding: 8px 0 2px; border-radius: var(--radius); background: var(--panel-2); border: 1px solid var(--border); }

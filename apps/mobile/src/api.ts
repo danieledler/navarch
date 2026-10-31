@@ -74,6 +74,8 @@ async function post<T>(cmd: string, args: Record<string, unknown> = {}, auth = t
     if (!(res.headers.get("content-type") ?? "").includes("application/json")) throw new Error();
     body = await res.json();
   } catch {
+    // Not the Mac's answer (its Host check sends JSON): something in between, such as a proxy, blocked it.
+    if (res.status === 403) throw new Error("Request blocked (403)");
     throw new Offline();
   }
   if (res.status === 401 && auth) throw new Unauthorized();

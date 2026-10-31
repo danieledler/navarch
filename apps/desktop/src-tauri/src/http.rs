@@ -219,6 +219,40 @@ fn static_file(path: &str, get: impl Fn(&str) -> Option<Cow<'static, [u8]>>) -> 
     (StatusCode::OK, [(header::CONTENT_TYPE, content_type(file)), (header::CACHE_CONTROL, cache)], Body::from(body)).into_response()
 }
 
+/// A 403 for a Host that passes neither localhost nor the public URL: JSON for /api, else a small self-contained
+/// page. The host is echoed only if it's plain [a-z0-9.-] (`mobile::plain_host`), and offered as the Public URL
+/// only if it's a Tailscale name: any other host may be a rebinding page's, which mustn't be one click from allowed.
+fn unknown_host(host: &str, api: bool) -> Response {
+    let shown = mobile::plain_host(host);
+    let ts = shown.as_deref().filter(|h| h.ends_with(".ts.net"));
+    if api {
+        let msg = match (&shown, ts) {
+            (_, Some(h)) => format!("Your Mac doesn't recognise {h}. In Navarch › Phone access, set Public URL to https://{h}"),
+            (Some(h), None) => format!("Your Mac doesn't recognise {h}. Check Public URL in Navarch › Phone access"),
+            (None, None) => "Your Mac doesn't recognise this address. Check Public URL in Navarch › Phone access".into(),
+        };
+        return fail(StatusCode::FORBIDDEN, &msg);
+    }
+    let addr = shown.as_ref().map_or("this address".into(), |h| format!("the address <b>{h}</b>"));
+    let fix = match ts {
+        Some(h) => format!("set <b>Public URL</b> to <b>https://{h}</b>"),
+        None => "check <b>Public URL</b>".into(),
+    };
+    let page = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Navarch: unknown address</title>\
+<style>body{{font:16px/1.5 -apple-system,system-ui,sans-serif;margin:0;padding:24px;color:#222;background:#fafafa}}\
+main{{max-width:28rem;margin:10vh auto}}h1{{font-size:20px}}b{{word-break:break-all}}\
+@media(prefers-color-scheme:dark){{body{{color:#eee;background:#161616}}}}</style></head>\
+<body><main><h1>Navarch doesn't recognise this address</h1>\
+<p>The Mac running Navarch doesn't recognise {addr}, so it turned the request away.</p>\
+<p>On the Mac, open Navarch › Phone access (the phone icon in the status bar) and {fix}. Then reload this page.</p>\
+</main></body></html>"
+    );
+    (StatusCode::FORBIDDEN, [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], page)
+        .into_response()
+}
+
 pub fn router<C: Ctx>(ctx: C) -> Router {
     Router::new().fallback(handle::<C>).layer(DefaultBodyLimit::max(BODY_LIMIT)).with_state(ctx)
 }
@@ -232,10 +266,10 @@ async fn handle<C: Ctx>(
 ) -> Response {
     let st = ctx.as_ref();
     let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
-    if !st.mobile.host_allowed(host) {
-        return fail(StatusCode::FORBIDDEN, "Unknown host");
-    }
     let path = uri.path();
+    if !st.mobile.host_allowed(host) {
+        return unknown_host(host, path == "/api" || path.starts_with("/api/"));
+    }
     let Some(cmd) = path.strip_prefix("/api/").or((path == "/api").then_some("")) else {
         if method != Method::GET && method != Method::HEAD {
             let mut r = text(StatusCode::METHOD_NOT_ALLOWED, "Use GET");
@@ -607,6 +641,20 @@ mod tests {
     fn the_phone_ui_checks_host_and_method() {
         let t = setup(UsageCache::default());
         assert_eq!(t.send("GET", "/", "evil.example.com", None, String::new()).0, 403);
+        let (status, ct, cache, page) = parts(unknown_host("Mac.tail1234.ts.net:443", false));
+        assert_eq!((status, ct.as_str(), cache.as_str()), (403, "text/html; charset=utf-8", "no-store"));
+        assert!(page.contains("<b>https://mac.tail1234.ts.net</b>"), "{page}");
+        // Any other host is named but never offered as the fix (it may be a rebinding page's).
+        let (_, _, _, page) = parts(unknown_host("Other.example.com:443", false));
+        assert!(page.contains("<b>other.example.com</b>") && !page.contains("https://other"), "{page}");
+        let (_, _, _, page) = parts(unknown_host("<script>x</script>", false));
+        assert!(!page.contains("<script") && page.contains("this address"), "{page}");
+        let (status, body) = t.send("POST", "/api/ping", "other.example.com", Some(TOKEN), "{}".into());
+        assert_eq!(status, 403);
+        let msg = body["error"].as_str().unwrap();
+        assert!(msg.contains("other.example.com") && !msg.contains("https://"), "{body}");
+        let (_, body) = t.send("POST", "/api/ping", "mac.tail1234.ts.net", Some(TOKEN), "{}".into());
+        assert!(body["error"].as_str().unwrap().contains("https://mac.tail1234.ts.net"), "{body}");
         // Whether apps/mobile/dist was built decides between the page and the 503; no token either way.
         let status = t.send("GET", "/", HOST, None, String::new()).0;
         assert!(status == 200 || status == 503, "{status}");

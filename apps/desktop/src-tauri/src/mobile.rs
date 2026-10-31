@@ -160,6 +160,29 @@ pub fn url_host(url: &str) -> Option<String> {
     (!host.is_empty() && !host.contains(char::is_whitespace)).then_some(host)
 }
 
+/// A host passes as the configured public host itself or a name under it, so a tailnet domain alone
+/// (`tail1234.ts.net`, typed without the Mac's name) still lets `mac.tail1234.ts.net` in. Names under it count
+/// only for a `.ts.net` host or one of 3+ labels, so a shared suffix (`duckdns.org`, `mac`) doesn't let in
+/// names anyone can register and point at 127.0.0.1.
+pub fn host_matches(host: &str, public: &str) -> bool {
+    if public.is_empty() {
+        return false;
+    }
+    let under = public.ends_with(".ts.net") || public.split('.').filter(|l| !l.is_empty()).count() >= 3;
+    host == public
+        || under
+            && host.strip_suffix(public).and_then(|s| s.strip_suffix('.')).is_some_and(|sub| {
+                !sub.is_empty() && sub.split('.').all(|l| !l.is_empty())
+            })
+}
+
+/// The Host header, port dropped, lowercased, if it's only [a-z0-9.-] (safe to show back); else `None`.
+pub fn plain_host(host: &str) -> Option<String> {
+    let h = strip_port(host).trim_end_matches('.').to_ascii_lowercase();
+    (!h.is_empty() && h.len() <= 253 && h.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-'))
+        .then_some(h)
+}
+
 fn strip_port(h: &str) -> &str {
     match h.rsplit_once(':') {
         Some((host, port)) if !host.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => host,
@@ -214,10 +237,12 @@ impl Mobile {
         (self.emit)(MOBILE_CHANGED)
     }
 
-    /// The Host header, port dropped, must be this Mac or the public URL's host.
+    /// The Host header, port dropped, must be this Mac or match the public URL's host (`host_matches`).
     pub fn host_allowed(&self, host: &str) -> bool {
         let h = strip_port(host).trim_end_matches('.').to_ascii_lowercase();
-        h == "localhost" || h == "127.0.0.1" || self.cfg.lock().is_ok_and(|c| c.public_host.as_deref() == Some(h.as_str()))
+        h == "localhost"
+            || h == "127.0.0.1"
+            || self.cfg.lock().is_ok_and(|c| c.public_host.as_deref().is_some_and(|p| host_matches(&h, p)))
     }
 
     /// Checks an `Authorization` header against the token and notes when the phone was last seen.
@@ -487,5 +512,42 @@ mod tests {
         assert_eq!(url_host("https://"), None);
         assert_eq!(strip_port("localhost:47820"), "localhost");
         assert_eq!(strip_port("[::1]:80"), "[::1]:80");
+    }
+
+    #[test]
+    fn public_hosts_match_themselves_and_names_under_them() {
+        let net = "tail1234.ts.net";
+        assert!(host_matches(net, net));
+        assert!(host_matches("mac.tail1234.ts.net", net));
+        for bad in ["eviltail1234.ts.net", "tail1234.ts.net.evil.com", ".tail1234.ts.net", "ts.net", "il1234.ts.net", ""] {
+            assert!(!host_matches(bad, net), "{bad}");
+        }
+        assert!(!host_matches("anything", ""));
+        assert!(!host_matches("..tail1234.ts.net", net) && !host_matches("a..tail1234.ts.net", net));
+        // No names under a shared suffix or a single label.
+        for (host, public) in [("evil.duckdns.org", "duckdns.org"), ("x.ngrok-free.app", "ngrok-free.app"), ("evil.mac", "mac")] {
+            assert!(!host_matches(host, public), "{host}");
+            assert!(host_matches(public, public));
+        }
+        assert!(host_matches("a.navarch.example.com", "navarch.example.com"));
+
+        let m = mobile(true);
+        m.cfg.lock().unwrap().public_host = url_host(net);
+        for ok in ["mac.tail1234.ts.net:443", "TAIL1234.ts.net", "localhost:47821", "127.0.0.1"] {
+            assert!(m.host_allowed(ok), "{ok}");
+        }
+        for bad in ["eviltail1234.ts.net", "tail1234.ts.net.evil.com", "evil.com"] {
+            assert!(!m.host_allowed(bad), "{bad}");
+        }
+        m.cfg.lock().unwrap().public_host = None;
+        assert!(!m.host_allowed("mac.tail1234.ts.net"));
+    }
+
+    #[test]
+    fn only_plain_hosts_are_shown_back() {
+        assert_eq!(plain_host("Mac.Tail1.ts.net:443").as_deref(), Some("mac.tail1.ts.net"));
+        for bad in ["", "<script>.ts.net", "a b", "x\"y", "[::1]:80", "h\u{e9}.com"] {
+            assert_eq!(plain_host(bad), None, "{bad}");
+        }
     }
 }

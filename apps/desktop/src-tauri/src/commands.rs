@@ -306,6 +306,12 @@ pub async fn reset_mobile_token(state: S<'_>) -> Res<MobileAccess> {
     mobile::reset_token(&state)
 }
 
+/// This Mac's Tailscale name and state; null when the Tailscale CLI isn't installed or doesn't answer.
+#[tauri::command]
+pub async fn detect_tailscale() -> Res<Option<crate::tailscale::Tailscale>> {
+    tauri::async_runtime::spawn_blocking(crate::tailscale::detect).await.map_err(db::err)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

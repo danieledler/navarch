@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Smartphone } from "lucide-react";
-import { api, type MobileAccess, type PairingCode } from "../api";
+import { api, type MobileAccess, type PairingCode, type Tailscale } from "../api";
 import { useStore } from "../store";
 import { relTime } from "../lib/format";
 import { Popover } from "./ui";
@@ -18,6 +18,11 @@ export function phoneTitle(a: MobileAccess | null): string {
   return `Phone access on 127.0.0.1:${a.port}` + (a.lastSeenAt ? `\nPhone last seen ${relTime(Date.parse(a.lastSeenAt))}` : "");
 }
 
+/** A URL's host, lowercased, as url_host in src-tauri/src/mobile.rs: any scheme or none, no user, port or path. */
+function urlHost(url: string): string {
+  return url.trim().replace(/^[^:/?#]*:\/\//, "").split(/[/?#]/)[0].replace(/^.*@/, "").replace(/:\d*$/, "").replace(/\.+$/, "").toLowerCase();
+}
+
 /** Phone companion: serve the phone API on a local port that tailscale serve or a Cloudflare tunnel exposes, and pair phones. */
 export function PhonePopover({
   anchor, onClose, access, onChange,
@@ -32,6 +37,13 @@ export function PhonePopover({
   const [url, setUrl] = useState(access?.publicUrl ?? "");
   const [code, setCode] = useState<PairingCode | null>(null);
   const [now, setNow] = useState(Date.now());
+  // This Mac's Tailscale name, asked once per opening (the CLI can take a moment); null without Tailscale.
+  const tailscale = useRef<Promise<Tailscale | null>>(null);
+  tailscale.current ??= api.detectTailscale().catch(() => null);
+  const [ts, setTs] = useState<Tailscale | null>(null);
+  useEffect(() => {
+    tailscale.current?.then(setTs);
+  }, []);
   // Read by the event listener below, which outlives a render.
   const shown = useRef({ code, pairedAt: access?.pairedAt ?? null });
   shown.current = { code, pairedAt: access?.pairedAt ?? null };
@@ -76,8 +88,26 @@ export function PhonePopover({
       setBusy(false);
     }
   };
-  const toggle = () =>
-    apply(!a.enabled, url.trim(), (n) => (n.enabled ? `Phone access on: serving 127.0.0.1:${n.port}` : "Phone access off"));
+  const toggle = async () => {
+    // Busy before the Tailscale wait, so a second click can't send a second enable.
+    setBusy(true);
+    // Turning on with no URL: use this Mac's Tailscale name, which `tailscale serve` answers on.
+    const t = !a.enabled && !url.trim() ? await tailscale.current : null;
+    const name = t?.dnsName;
+    const publicUrl = name ? `https://${name}` : url.trim();
+    if (name) setUrl(publicUrl);
+    apply(!a.enabled, publicUrl, (n) =>
+      !n.enabled
+        ? "Phone access off"
+        : `Phone access on: serving 127.0.0.1:${n.port}` +
+          (name ? ` at https://${name}` + (t?.running ? "" : " (Tailscale isn't connected)") : ""),
+    );
+  };
+  const applyTailscale = (name: string) => {
+    setUrl(`https://${name}`);
+    apply(a.enabled, `https://${name}`, (n) => `Phone URL set to ${n.publicUrl}`);
+  };
+  const suggest = ts?.dnsName && urlHost(url) !== ts.dnsName ? ts.dnsName : null;
   const saveUrl = () => {
     if (url.trim() !== a.publicUrl) apply(a.enabled, url.trim(), (n) => (n.publicUrl ? `Phone URL set to ${n.publicUrl}` : "Phone URL cleared"));
   };
@@ -141,6 +171,16 @@ export function PhonePopover({
           onBlur={saveUrl}
         />
       </label>
+      {suggest && (
+        <button
+          type="button" className="link ph-use" disabled={busy} onClick={() => applyTailscale(suggest)}
+          // As the switch: the URL field's blur would save first.
+          onMouseDown={(e) => e.preventDefault()}
+          title={ts?.running ? "This Mac's Tailscale name" : "This Mac's Tailscale name (Tailscale isn't connected right now)"}
+        >
+          Use {suggest}
+        </button>
+      )}
       <p className="hint ph-setup">
         Expose it with <code>tailscale serve --bg {a.port}</code>, or point a Cloudflare tunnel at <code>http://localhost:{a.port}</code>
       </p>
