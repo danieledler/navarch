@@ -91,6 +91,7 @@ export interface Session {
   taskId: Id | null; // linked Navarch task
   tempFolder: boolean; // Claude started it in a temporary folder of its own ("This computer")
   launchPath: string | null; // while it's there: the folder Navarch launched it for
+  remoteId?: string; // the app's latest bridgeSessionIds entry: the session's id for remote control
 }
 
 export interface SystemStats {
@@ -151,4 +152,21 @@ export interface TaskPatch {
   deadline?: string;
   parentId?: Id;
   sort?: number;
+}
+
+/** Phone access: a local server on 127.0.0.1 that tailscale serve or a Cloudflare tunnel exposes. */
+export interface MobileAccess {
+  enabled: boolean;
+  running: boolean; // listening on 127.0.0.1:port
+  port: number; // 47820 in the installed app, 47821 in every other build
+  publicUrl: string; // the URL the phone opens; its host passes the server's Host check
+  error: string | null; // e.g. the port is taken
+  pairedAt: string | null; // RFC 3339, last successful pairing
+  lastSeenAt: string | null; // RFC 3339, last request with the token since launch
+}
+
+/** A single-use code the phone trades for its token at POST /api/pair. */
+export interface PairingCode {
+  code: string; // 6 characters, no 0/O/1/I/L
+  expiresAt: string; // RFC 3339, 10 minutes after it was made
 }

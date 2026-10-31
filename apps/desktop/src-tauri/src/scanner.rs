@@ -59,6 +59,9 @@ pub struct Session {
     pub temp_folder: bool,
     /// While it sits in that temporary folder: the folder Navarch launched it for.
     pub launch_path: Option<String>,
+    /// The last of the app's `bridgeSessionIds`: the session's id for remote control (claude.ai, phone).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_id: Option<String>,
 }
 
 /// Claude's own folders for sessions started without one ("This computer" in the Code tab).
@@ -360,6 +363,7 @@ struct Meta {
     last_turn_edge_at: Option<i64>,
     last_focused_at: Option<i64>,
     archived: bool,
+    remote_id: Option<String>,
 }
 
 fn read_meta(path: &Path) -> Option<Meta> {
@@ -378,6 +382,12 @@ fn read_meta(path: &Path) -> Option<Meta> {
         last_turn_edge_at: n("lastTurnEdgeAt"),
         last_focused_at: n("lastFocusedAt"),
         archived: v.get("isArchived").and_then(|x| x.as_bool()).unwrap_or(false),
+        remote_id: v
+            .get("bridgeSessionIds")
+            .and_then(|x| x.as_array())
+            .and_then(|a| a.iter().rev().find_map(|x| x.as_str()))
+            .filter(|x| !x.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -744,6 +754,7 @@ impl Scanner {
                 task_id: links.get(&m.session_id).copied().flatten(),
                 temp_folder,
                 launch_path: if temp_folder { folders.get(&m.session_id).cloned() } else { None },
+                remote_id: m.remote_id.clone(),
             });
         }
         out.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at).then_with(|| a.id.cmp(&b.id)));
@@ -782,6 +793,21 @@ pub fn task_marker(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_remote_id_from_the_session_file() {
+        let dir = std::env::temp_dir().join(format!("navarch-meta-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("local_x.json");
+        let mut v = serde_json::json!({"sessionId": "local_x", "cwd": "/tmp", "title": "t", "createdAt": 1,
+            "bridgeSessionIds": ["session_old", "session_new"]});
+        fs::write(&p, v.to_string()).unwrap();
+        assert_eq!(read_meta(&p).unwrap().remote_id.as_deref(), Some("session_new"));
+        v.as_object_mut().unwrap().remove("bridgeSessionIds");
+        fs::write(&p, v.to_string()).unwrap();
+        assert_eq!(read_meta(&p).unwrap().remote_id, None);
+        fs::remove_dir_all(&dir).ok();
+    }
 
     fn line(v: serde_json::Value) -> String {
         format!("{}\n", v)
@@ -912,7 +938,7 @@ mod tests {
             let m = Meta {
                 session_id: id.into(), cli_id: None, cwd: temp.into(), title: id.into(), model: None,
                 created_at: now + at, last_activity_at: now, last_turn_edge_at: None,
-                last_focused_at: None, archived: false,
+                last_focused_at: None, archived: false, remote_id: None,
             };
             sc.metas.insert(PathBuf::from(id), (SystemTime::now(), Some(m)));
         }
@@ -945,7 +971,7 @@ mod tests {
         let meta = |cwd: &str| Meta {
             session_id: "local_s".into(), cli_id: Some("cli_s".into()), cwd: cwd.into(), title: "s".into(),
             model: None, created_at: now, last_activity_at: now, last_turn_edge_at: None,
-            last_focused_at: None, archived: false,
+            last_focused_at: None, archived: false, remote_id: None,
         };
         let spawns = |sc: &Scanner| -> Vec<i64> {
             let mut st = sc.conn.prepare("SELECT task_id FROM pending_spawns ORDER BY id").unwrap();

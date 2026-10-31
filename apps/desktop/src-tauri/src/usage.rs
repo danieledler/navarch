@@ -126,6 +126,14 @@ impl UsageCache {
         UsageCache { file, mem: Mutex::new(Shared::default()) }
     }
 
+    /// A cache holding `u` from a minute ago: fresh for `get(false)`, stale enough that
+    /// `get(true)` would ask the server, so tests can tell the two apart without the network.
+    #[cfg(test)]
+    pub fn holding(u: Usage) -> Self {
+        let shared = Shared { usage: u, asked_at: now_ms() - 60_000, ..Shared::default() };
+        UsageCache { file: None, mem: Mutex::new(shared) }
+    }
+
     pub fn get(&self, force: bool) -> Usage {
         self.get_with(force, now_ms(), request)
     }

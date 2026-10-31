@@ -4,6 +4,7 @@ use crate::db::{self, Period, Project, Res, Snapshot, Space, Task, TaskPatch};
 use crate::procs::{CpuSample, SystemStats};
 use crate::scanner::Session;
 use crate::limits::{self, Thresholds};
+use crate::mobile::{self, MobileAccess, PairingCode};
 use crate::usage::Usage;
 use crate::AppState;
 use tauri::State;
@@ -20,9 +21,50 @@ macro_rules! with_db {
     }};
 }
 
+/// The commands the phone API shares (http.rs), as plain functions over the app state.
+pub(crate) mod core {
+    use super::*;
+
+    pub fn get_snapshot(st: &AppState) -> Res<Snapshot> {
+        with_db!(st, |c| db::snapshot(c))
+    }
+
+    pub fn create_task(st: &AppState, project_id: i64, parent_id: Option<i64>, title: &str, after_id: Option<i64>) -> Res<Task> {
+        with_db!(st, |c| db::create_task(c, project_id, parent_id, title, after_id))
+    }
+
+    pub fn update_task(st: &AppState, id: i64, patch: TaskPatch) -> Res<Task> {
+        with_db!(st, |c| db::update_task(c, id, patch))
+    }
+
+    pub fn delete_task(st: &AppState, id: i64) -> Res<()> {
+        with_db!(st, |c| db::delete_task(c, id))
+    }
+
+    pub fn restore_task(st: &AppState, id: i64) -> Res<()> {
+        with_db!(st, |c| db::restore_task(c, id))
+    }
+
+    pub fn set_period_task(st: &AppState, period_id: i64, task_id: i64, on: bool) -> Res<()> {
+        with_db!(st, |c| db::set_period_task(c, period_id, task_id, on))
+    }
+
+    pub fn set_week_task(st: &AppState, week: &str, task_id: i64, on: bool) -> Res<()> {
+        with_db!(st, |c| db::set_week_task(c, week, task_id, on))
+    }
+
+    pub fn get_sessions(st: &AppState) -> Res<Vec<Session>> {
+        Ok(st.sessions.lock().map_err(db::err)?.clone())
+    }
+
+    pub fn get_limit_alerts(st: &AppState) -> Res<limits::Status> {
+        Ok(st.limits.lock().map_err(db::err)?.status())
+    }
+}
+
 #[tauri::command]
 pub async fn get_snapshot(state: S<'_>) -> Res<Snapshot> {
-    with_db!(state, |c| db::snapshot(c))
+    core::get_snapshot(&state)
 }
 
 #[tauri::command]
@@ -68,22 +110,22 @@ pub async fn create_task(
     title: String,
     after_id: Option<i64>,
 ) -> Res<Task> {
-    with_db!(state, |c| db::create_task(c, project_id, parent_id, &title, after_id))
+    core::create_task(&state, project_id, parent_id, &title, after_id)
 }
 
 #[tauri::command]
 pub async fn update_task(state: S<'_>, id: i64, patch: TaskPatch) -> Res<Task> {
-    with_db!(state, |c| db::update_task(c, id, patch))
+    core::update_task(&state, id, patch)
 }
 
 #[tauri::command]
 pub async fn delete_task(state: S<'_>, id: i64) -> Res<()> {
-    with_db!(state, |c| db::delete_task(c, id))
+    core::delete_task(&state, id)
 }
 
 #[tauri::command]
 pub async fn restore_task(state: S<'_>, id: i64) -> Res<()> {
-    with_db!(state, |c| db::restore_task(c, id))
+    core::restore_task(&state, id)
 }
 
 #[tauri::command]
@@ -103,12 +145,12 @@ pub async fn delete_period(state: S<'_>, id: i64) -> Res<()> {
 
 #[tauri::command]
 pub async fn set_period_task(state: S<'_>, period_id: i64, task_id: i64, on: bool) -> Res<()> {
-    with_db!(state, |c| db::set_period_task(c, period_id, task_id, on))
+    core::set_period_task(&state, period_id, task_id, on)
 }
 
 #[tauri::command]
 pub async fn set_week_task(state: S<'_>, week: String, task_id: i64, on: bool) -> Res<()> {
-    with_db!(state, |c| db::set_week_task(c, &week, task_id, on))
+    core::set_week_task(&state, &week, task_id, on)
 }
 
 #[tauri::command]
@@ -169,7 +211,7 @@ pub async fn reveal_path(path: String) -> Res<()> {
 
 #[tauri::command]
 pub async fn get_sessions(state: S<'_>) -> Res<Vec<Session>> {
-    Ok(state.sessions.lock().map_err(db::err)?.clone())
+    core::get_sessions(&state)
 }
 
 #[tauri::command]
@@ -222,7 +264,7 @@ pub async fn get_usage(state: S<'_>, force: bool) -> Res<Usage> {
 
 #[tauri::command]
 pub async fn get_limit_alerts(state: S<'_>) -> Res<limits::Status> {
-    Ok(state.limits.lock().map_err(db::err)?.status())
+    core::get_limit_alerts(&state)
 }
 
 /// Saves new thresholds and applies them to the usage at hand right away.
@@ -241,6 +283,27 @@ pub async fn set_limit_thresholds(state: S<'_>, thresholds: Thresholds) -> Res<l
         w.update(&usage);
     }
     Ok(w.status())
+}
+
+#[tauri::command]
+pub async fn get_mobile_access(state: S<'_>) -> Res<MobileAccess> {
+    Ok(state.mobile.access())
+}
+
+/// Turns phone access on or off and sets the URL the phone uses (its host passes the Host check).
+#[tauri::command]
+pub async fn set_mobile_access(app: tauri::AppHandle, enabled: bool, public_url: String) -> Res<MobileAccess> {
+    mobile::set_access(crate::AppRef(app), enabled, public_url).await
+}
+
+#[tauri::command]
+pub async fn new_pairing_code(state: S<'_>) -> Res<PairingCode> {
+    state.mobile.new_pairing_code()
+}
+
+#[tauri::command]
+pub async fn reset_mobile_token(state: S<'_>) -> Res<MobileAccess> {
+    mobile::reset_token(&state)
 }
 
 #[cfg(test)]

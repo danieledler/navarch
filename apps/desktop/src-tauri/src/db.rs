@@ -184,6 +184,11 @@ pub fn set_setting(c: &Connection, key: &str, value: &str) -> Res<()> {
     Ok(())
 }
 
+pub fn delete_setting(c: &Connection, key: &str) -> Res<()> {
+    c.execute("DELETE FROM settings WHERE key=?1", [key]).map_err(err)?;
+    Ok(())
+}
+
 // ---------- row mappers ----------
 
 const SPACE_COLS: &str = "id,name,color,sort";

@@ -25,6 +25,11 @@ ureq = "3.5"
 chrono = "0.4"
 dirs = "6"
 memchr = "2"
+# Phone companion API (mobile.rs, http.rs), served on 127.0.0.1 behind tailscale serve or a Cloudflare tunnel.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# Already in the tree through Tauri.
+tokio = { version = "1", features = ["net", "sync", "time"] }
+getrandom = "0.3"
 
 # Already in the tree through sysinfo and Tauri.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -34,6 +39,9 @@ libc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 # Optimize dependencies in dev builds: the first transcript parse is serde-heavy.
 [profile.dev.package."*"]

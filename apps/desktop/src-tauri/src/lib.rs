@@ -1,6 +1,8 @@
 mod commands;
 pub mod db;
+pub mod http;
 pub mod limits;
+pub mod mobile;
 pub mod procs;
 pub mod scanner;
 pub mod usage;
@@ -17,6 +19,17 @@ pub struct AppState {
     pub cpu: Mutex<procs::CpuMeter>,
     pub usage: Arc<usage::UsageCache>,
     pub limits: Mutex<limits::Watch>,
+    pub mobile: mobile::Mobile,
+}
+
+/// The managed state reached through the app handle, for the phone server (mobile.rs).
+#[derive(Clone)]
+pub struct AppRef(pub tauri::AppHandle);
+
+impl AsRef<AppState> for AppRef {
+    fn as_ref(&self) -> &AppState {
+        self.0.state::<AppState>().inner()
+    }
 }
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(3);
@@ -192,6 +205,11 @@ pub fn run() {
                 .unwrap_or_default();
             let watch = limits::Watch::new(limits::Files::new(&dir, dev_name().as_deref()), thresholds);
             let sessions = Arc::new(Mutex::new(Vec::new()));
+            let port = if dev_name().is_none() { mobile::PORT } else { mobile::DEV_PORT };
+            let handle = app.handle().clone();
+            let mobile = mobile::Mobile::new(&conn, port, Box::new(move || {
+                let _ = handle.emit("snapshot-changed", ());
+            }));
             app.manage(AppState {
                 db: Mutex::new(conn),
                 db_file: db_path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
@@ -199,10 +217,14 @@ pub fn run() {
                 cpu: Mutex::new(procs::CpuMeter::new()),
                 usage: Arc::new(usage::UsageCache::new(Some(dir.join(usage::CACHE_FILE)))),
                 limits: Mutex::new(watch),
+                mobile,
             });
             start_scanner(app.handle().clone(), db_path, sessions);
             start_cpu_sampler(app.handle().clone());
             start_limit_watch(app.handle().clone());
+            if app.state::<AppState>().mobile.enabled() {
+                mobile::start(AppRef(app.handle().clone()));
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -234,6 +256,10 @@ pub fn run() {
             commands::get_usage,
             commands::get_limit_alerts,
             commands::set_limit_thresholds,
+            commands::get_mobile_access,
+            commands::set_mobile_access,
+            commands::new_pairing_code,
+            commands::reset_mobile_token,
             set_undo_menu,
         ])
         .build(tauri::generate_context!())
