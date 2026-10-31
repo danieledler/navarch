@@ -4,6 +4,9 @@ import { useStore } from "./store";
 
 const ALPHABET = /[^A-Z0-9]/g;
 
+/** iOS Safari outside the Home Screen app: only iOS has navigator.standalone. */
+const inSafari = (navigator as { standalone?: boolean }).standalone === false;
+
 export function Pair() {
   const pair = useStore((s) => s.pair);
   const note = useStore((s) => s.pairNote);
@@ -60,6 +63,12 @@ export function Pair() {
       <button type="submit" className="btn" disabled={code.length !== 6 || busy}>
         {busy ? "Pairing…" : "Pair"}
       </button>
+      {inSafari && (
+        <div className="note">
+          Add Navarch to your Home Screen first (Share › Add to Home Screen) and pair from there: the Home Screen app keeps its own key,
+          so a pairing made here doesn't carry over.
+        </div>
+      )}
       <p className="muted" style={{ fontSize: 14 }}>
         A code works once, for 10 minutes. The phone keeps its own key afterwards; you can unpair it any time in settings.
       </p>

@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { ago, useNow } from "./time";
-import { CalendarDays, CloudOff, Gauge, Inbox, Plus, RefreshCw, Settings, Target } from "lucide-react";
+import { CalendarDays, CloudOff, Gauge, TriangleAlert, Inbox, Plus, RefreshCw, Settings, Target } from "lucide-react";
 import { weekLabel, weekNumber } from "../../../src/lib/dates";
 import { isMock } from "./api";
 import { startPolling, useModel, useStore } from "./store";
@@ -129,24 +129,38 @@ function Header({ title, sub, onSettings, onAdd }: { title: string; sub?: string
   );
 }
 
+/** Says when what's on screen isn't live: Mac offline, its error, or the launch cache while the first poll is slow. */
 function OfflineBanner() {
   const offline = useStore((s) => s.offline);
+  const pollError = useStore((s) => s.pollError);
+  const fresh = useStore((s) => s.fresh);
   const updatedAt = useStore((s) => s.updatedAt);
   const now = useNow();
-  if (!offline) return null;
+  // A quick first poll shouldn't flash the banner on every launch.
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setSlow(true), 2000);
+    return () => clearTimeout(t);
+  }, []);
+  const what = offline ? "Mac offline" : pollError ? pollError : !fresh && slow && updatedAt ? "Checking your Mac" : null;
+  if (!what) return null;
   return (
     <div className="banner" role="status">
-      <CloudOff size={18} />
-      <span>Mac offline{updatedAt ? ` · updated ${ago(updatedAt, now)}` : ""}</span>
+      {pollError && !offline ? <TriangleAlert size={18} /> : <CloudOff size={18} />}
+      <span>
+        {what}
+        {updatedAt ? ` · updated ${ago(updatedAt, now)}` : ""}
+      </span>
     </div>
   );
 }
 
 function Loading() {
   const offline = useStore((s) => s.offline);
+  const pollError = useStore((s) => s.pollError);
   return (
     <div className="placeholder">
-      {offline ? "Can't reach Navarch on your Mac. Is it awake, with Phone access on?" : "Connecting to your Mac…"}
+      {offline ? "Can't reach Navarch on your Mac. Is it awake, with Phone access on?" : (pollError ?? "Connecting to your Mac…")}
     </div>
   );
 }

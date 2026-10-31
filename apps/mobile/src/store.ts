@@ -24,6 +24,10 @@ export interface PhoneState {
   /** When the Mac last answered (ms); with `offline`, the age of what's on screen. */
   updatedAt: number | null;
   offline: boolean;
+  /** False until the Mac answers once after launch: until then the screen shows the cache. */
+  fresh: boolean;
+  /** Why the last poll failed, when the Mac answered with an error; cleared by the next good poll. */
+  pollError: string | null;
   loading: boolean;
   toasts: Toast[];
   refresh: () => Promise<void>;
@@ -95,6 +99,8 @@ export const useStore = create<PhoneState>((set, get) => {
     usage: cached?.usage ?? null,
     updatedAt: cached?.at ?? null,
     offline: false,
+    fresh: false,
+    pollError: null,
     loading: false,
     toasts: [],
 
@@ -102,6 +108,7 @@ export const useStore = create<PhoneState>((set, get) => {
       if (!get().token || pending) return Promise.resolve();
       inflight ??= (async () => {
         const startEdits = edits;
+        const token = get().token;
         set({ loading: true });
         try {
           const [snap, sessions, usage] = await Promise.all([
@@ -112,12 +119,16 @@ export const useStore = create<PhoneState>((set, get) => {
               return get().usage; // usage is extra: its failure mustn't hide the rest
             }),
           ]);
+          if (get().token !== token) return; // unpaired (or paired again) meanwhile: this answer is stale
           if (edits !== startEdits) return; // an edit's own refresh follows
           const at = Date.now();
-          set({ snap, sessions, usage, updatedAt: at, offline: false });
+          set({ snap, sessions, usage, updatedAt: at, offline: false, fresh: true, pollError: null });
           saveCache({ snap, sessions, usage, at });
         } catch (e) {
-          fail(e);
+          if (get().token !== token) return;
+          // A poll's error is a state shown in the banner, not a toast every 15 s.
+          if (e instanceof Unauthorized || e instanceof Offline) fail(e);
+          else set({ pollError: e instanceof Error ? e.message : String(e) });
         } finally {
           set({ loading: false });
           inflight = null;
@@ -136,7 +147,7 @@ export const useStore = create<PhoneState>((set, get) => {
     unpair: () => {
       setToken(null);
       saveCache(null);
-      set({ token: null, pairNote: null, snap: null, sessions: [], usage: null, updatedAt: null, offline: false });
+      set({ token: null, pairNote: null, snap: null, sessions: [], usage: null, updatedAt: null, offline: false, fresh: false, pollError: null });
     },
 
     run: async (p) => {
@@ -159,20 +170,21 @@ export const useStore = create<PhoneState>((set, get) => {
     setStatus: async (t, status) => {
       const prev = t.status;
       if (prev === status) return;
-      const patchLocal = (s: Task["status"]) =>
+      const patchLocal = (s: Task["status"], doneAt: number | null) =>
         set((st) =>
-          st.snap
-            ? { snap: { ...st.snap, tasks: st.snap.tasks.map((x) => (x.id === t.id ? { ...x, status: s, doneAt: s === "done" ? Date.now() : null } : x)) } }
-            : {},
+          st.snap ? { snap: { ...st.snap, tasks: st.snap.tasks.map((x) => (x.id === t.id ? { ...x, status: s, doneAt } : x)) } } : {},
         );
-      const apply = async (s: Task["status"]) => {
-        patchLocal(s);
+      // On screen at once; put back if the Mac didn't take it (offline, the refresh can't correct it).
+      const apply = async (s: Task["status"], back: Pick<Task, "status" | "doneAt">) => {
+        patchLocal(s, s === "done" ? Date.now() : null);
         const patch: TaskPatch = { status: s };
-        return get().run(() => api.updateTask(t.id, patch));
+        const r = await get().run(() => api.updateTask(t.id, patch));
+        if (r === undefined) patchLocal(back.status, back.doneAt);
+        return r;
       };
-      const ok = await apply(status);
+      const ok = await apply(status, { status: prev, doneAt: t.doneAt });
       if (ok === undefined) return;
-      get().toast(status === "done" ? `Done: ${t.title}` : `Reopened: ${t.title}`, () => apply(prev));
+      get().toast(status === "done" ? `Done: ${t.title}` : `Reopened: ${t.title}`, () => apply(prev, ok));
     },
 
     toast: (text, undo, tone) => {

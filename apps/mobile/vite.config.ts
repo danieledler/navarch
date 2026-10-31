@@ -8,13 +8,13 @@ const here = fileURLToPath(new URL(".", import.meta.url));
 const repo = fileURLToPath(new URL("../..", import.meta.url)).replace(/\/$/, "");
 const phonePort = process.env.NAVARCH_PHONE_PORT || "47821";
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
   root: here,
   base: "/",
   plugins: [react()],
   clearScreen: false,
-  // The mock backend (?mock) reads this; the phone never shows it.
-  define: { __UI_CHECKOUT__: JSON.stringify(repo) },
+  // The mock backend (?mock, dev only) reads this; a build carries no checkout path.
+  define: { __UI_CHECKOUT__: JSON.stringify(command === "serve" ? repo : "") },
   build: { outDir: "dist", emptyOutDir: true },
   server: {
     port: 1430,
@@ -23,4 +23,4 @@ export default defineConfig({
     fs: { allow: [repo] },
     proxy: { "/api": { target: `http://127.0.0.1:${phonePort}`, changeOrigin: true } },
   },
-});
+}));

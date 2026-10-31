@@ -347,7 +347,7 @@ a { color: var(--accent); }
   left: calc(var(--safe-left) + 12px);
   right: calc(var(--safe-right) + 12px);
   bottom: calc(var(--tabbar-h) + var(--safe-bottom) + 10px);
-  z-index: 15;
+  z-index: 30; /* above the sheet and its scrim, so a failed Quick add still says why */
   display: flex;
   flex-direction: column;
   gap: 8px;

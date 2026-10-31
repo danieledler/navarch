@@ -73,16 +73,19 @@ export function QuickAdd({ m, close }: { m: Model; close: () => void }) {
     setBusy(true);
     saveLast(projectId);
     const week = m.week;
+    let pinned = false;
     const task = await run(async () => {
       const created = await api.createTask(projectId, null, t);
-      if (pin) await api.setWeekTask(week, created.id, true);
+      // Once created, the task exists: a failed pin must not keep the sheet open for a duplicate retry.
+      if (pin) pinned = await api.setWeekTask(week, created.id, true).then(() => true, () => false);
       return created;
     });
     setBusy(false);
     if (!task) return; // run already showed why
     close();
-    const where = m.project.get(projectId)?.name;
-    toast(pin ? `Added to this week: ${t}` : `Added to ${where ?? "project"}: ${t}`, () => run(() => api.deleteTask(task.id)));
+    const where = m.project.get(projectId)?.name ?? "project";
+    const text = pinned ? `Added to this week: ${t}` : pin ? `Added to ${where}, but not pinned to this week: ${t}` : `Added to ${where}: ${t}`;
+    toast(text, () => run(() => api.deleteTask(task.id)), pin && !pinned ? "error" : undefined);
   };
 
   if (!bySpace.length)

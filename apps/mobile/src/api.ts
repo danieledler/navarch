@@ -2,7 +2,7 @@
 // With ?mock in the URL, the desktop's in-memory mock stands in, so the UI runs without a Mac.
 import type { Id, LimitAlerts, Session, Snapshot, Task, TaskPatch, Usage } from "../../../src/api/types";
 
-/** The Mac can't be reached: network error, tunnel error page (530, 502…), or anything that isn't our JSON. */
+/** The Mac can't be reached: network error, timeout, tunnel error page (530, 502…), or anything that isn't our JSON. */
 export class Offline extends Error {
   constructor(msg = "Can't reach your Mac") {
     super(msg);
@@ -32,7 +32,11 @@ export interface PhoneApi {
   pair(code: string): Promise<string>;
 }
 
-export const isMock = new URLSearchParams(location.search).has("mock");
+/** Dev builds only (pnpm mobile:dev): production drops the mock and its chunk. */
+export const isMock = import.meta.env.DEV && new URLSearchParams(location.search).has("mock");
+
+/** A sleeping Mac behind tailscale serve can leave a request hanging for a minute or more. */
+const TIMEOUT_MS = 10_000;
 
 const TOKEN = "navarch-phone-token";
 
@@ -60,7 +64,7 @@ async function post<T>(cmd: string, args: Record<string, unknown> = {}, auth = t
   if (auth && token) headers.Authorization = `Bearer ${token}`;
   let res: Response;
   try {
-    res = await fetch(`/api/${cmd}`, { method: "POST", headers, body: JSON.stringify(args), cache: "no-store" });
+    res = await fetch(`/api/${cmd}`, { method: "POST", headers, body: JSON.stringify(args), cache: "no-store", signal: AbortSignal.timeout(TIMEOUT_MS) });
   } catch {
     throw new Offline();
   }
@@ -120,7 +124,7 @@ async function mock(): Promise<PhoneApi> {
 }
 
 /** Resolved once: the mock is only loaded (and bundled into its own chunk) for ?mock. */
-const ready: Promise<PhoneApi> = isMock ? mock() : Promise.resolve(httpApi);
+const ready: Promise<PhoneApi> = import.meta.env.DEV && isMock ? mock() : Promise.resolve(httpApi);
 
 /** Every call goes through here, so callers don't care which backend answered. */
 export const api: PhoneApi = new Proxy({} as PhoneApi, {
