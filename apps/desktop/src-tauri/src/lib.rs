@@ -46,15 +46,17 @@ fn dev_name() -> Option<String> {
 }
 
 /// Keeps the usage-limit alert file in step with plan usage: refetched every 5 minutes, or every
-/// minute near a threshold. Tells the UI when a new alert goes out to sessions.
+/// minute near a threshold. Tells the UI when a new alert goes out to sessions. Dev builds skip the
+/// 1-minute refetch: their alerts go to a file no hook reads.
 fn start_limit_watch(app: tauri::AppHandle) {
+    let installed = dev_name().is_none();
     std::thread::Builder::new()
         .name("navarch-limits".into())
         .spawn(move || {
             let mut near = false;
             loop {
                 let st = app.state::<AppState>();
-                let usage = st.usage.get(near);
+                let usage = st.usage.get(near && installed);
                 // A failed fetch says nothing about usage: keep the alert as it is.
                 if usage.error.is_none() {
                     if let Ok(mut w) = st.limits.lock() {
@@ -195,7 +197,7 @@ pub fn run() {
                 db_file: db_path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
                 sessions: sessions.clone(),
                 cpu: Mutex::new(procs::CpuMeter::new()),
-                usage: Arc::new(usage::UsageCache::default()),
+                usage: Arc::new(usage::UsageCache::new(Some(dir.join(usage::CACHE_FILE)))),
                 limits: Mutex::new(watch),
             });
             start_scanner(app.handle().clone(), db_path, sessions);

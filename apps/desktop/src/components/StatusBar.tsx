@@ -36,10 +36,13 @@ export function StatusBar() {
       <span className="usage-win muted">{label} –</span>
     );
 
-  const usageTitle = usage?.error
+  // After a failed request the last good numbers stay, dimmed, with the error on hover.
+  const stale = !!usage?.error && !!(usage.fiveHour || usage.sevenDay);
+  const usageTitle = usage?.error && !stale
     ? `Claude usage unavailable: ${usage.error}`
     : usage
       ? [
+          stale && `Numbers from ${relTime(usage.fetchedAt)}: ${usage.error}`,
           usage.fiveHour && `5-hour window: ${Math.round(usage.fiveHour.percent)}% used, resets in ${fmtUntil(usage.fiveHour.resetsAt, true)}`,
           usage.sevenDay && `Weekly: ${Math.round(usage.sevenDay.percent)}% used, resets in ${fmtUntil(usage.sevenDay.resetsAt, true)}`,
           "Click for pacing details",
@@ -76,13 +79,13 @@ export function StatusBar() {
       <button
         ref={usageRef}
         type="button"
-        className={`sb-item sb-btn usage ${usageOpen ? "is-open" : ""}`}
+        className={`sb-item sb-btn usage ${usageOpen ? "is-open" : ""} ${stale ? "is-stale" : ""}`}
         title={usageOpen ? undefined : usageTitle}
         aria-expanded={usageOpen}
         onClick={() => setUsageOpen((o) => !o)}
       >
         <span className="muted">Claude</span>
-        {usage?.error ? (
+        {usage?.error && !stale ? (
           <span className="muted">unavailable</span>
         ) : (
           <>

@@ -565,6 +565,8 @@ kbd {
 .usage-win.tone-good .uw-pct { color: var(--green); }
 .usage-win.tone-warn .uw-pct { color: var(--amber); }
 .usage-win.tone-hot .uw-pct { color: var(--red); }
+.usage.is-stale .usage-win, .up-body.is-stale { opacity: 0.55; }
+.up-body { display: flex; flex-direction: column; gap: 12px; }
 
 /* ---------- usage popover ---------- */
 .usage-pop { width: 300px; padding: 12px 16px 12px; display: flex; flex-direction: column; gap: 12px; }

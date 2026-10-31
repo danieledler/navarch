@@ -18,6 +18,7 @@ export function UsagePopover({ anchor, onClose }: { anchor: React.RefObject<HTML
   }, []);
 
   const paces = usagePaces(usage);
+  const stale = !!usage?.error && !!(usage.fiveHour || usage.sevenDay);
   const refresh = async () => {
     setBusy(true);
     await refreshUsage(true);
@@ -32,17 +33,16 @@ export function UsagePopover({ anchor, onClose }: { anchor: React.RefObject<HTML
           <RefreshCw size={14} />
         </button>
       </div>
-      {usage?.error ? (
-        <p className="hint up-error">{usage.error}</p>
-      ) : (
-        <>
+      {usage?.error && <p className="hint up-error">{usage.error}</p>}
+      {(!usage?.error || stale) && (
+        <div className={`up-body ${stale ? "is-stale" : ""}`}>
           <div className="up-rings">
             <Ring label="5h" pace={paces.fiveHour} window={usage?.fiveHour ?? null} />
             <Ring label="Weekly" pace={paces.sevenDay} window={usage?.sevenDay ?? null} />
           </div>
           <PaceBar label="Session pacing" pace={paces.fiveHour} window="5-hour window" />
           <PaceBar label="Weekly pacing" pace={paces.sevenDay} window="week" />
-        </>
+        </div>
       )}
       <LimitAlertsRow />
       <div className="up-foot">{usage ? `Updated ${relTime(usage.fetchedAt)}` : "Loading…"}</div>

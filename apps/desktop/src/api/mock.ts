@@ -216,10 +216,18 @@ export function mockApi(): Api {
     setLimitThresholds: async (fiveHour, sevenDay) => (limitAlerts = { ...limitAlerts, fiveHour, sevenDay }),
     onLimitAlert: () => {},
     getUsage: async (): Promise<Usage> => {
-      // ?usage=hot shows over-pace tones, ?usage=zero a fresh window, ?usage=error the unavailable state.
+      // ?usage=hot shows over-pace tones, ?usage=zero a fresh window, ?usage=error the unavailable state,
+      // ?usage=stale the last good numbers after a 429.
       const mode = new URLSearchParams(location.search).get("usage");
       const at = (ms: number) => new Date(Date.now() + ms).toISOString();
       if (mode === "error") return { fiveHour: null, sevenDay: null, error: "Claude Code login expired", fetchedAt: Date.now() };
+      if (mode === "stale")
+        return {
+          fiveHour: { percent: 37, resetsAt: at(200 * 6e4) },
+          sevenDay: { percent: 52, resetsAt: at(60 * 36e5) },
+          error: `Usage requests rate-limited (HTTP 429); next try at ${new Date(Date.now() + 9 * 6e4).toTimeString().slice(0, 5)}`,
+          fetchedAt: Date.now() - 12 * 6e4,
+        };
       const hot = mode === "hot";
       if (mode === "zero")
         return { fiveHour: { percent: 0, resetsAt: at(299 * 6e4) }, sevenDay: { percent: 0.4, resetsAt: at(167 * 36e5) }, error: null, fetchedAt: Date.now() };
