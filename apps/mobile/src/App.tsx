@@ -1,12 +1,15 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { ago, useNow } from "./time";
-import { CalendarDays, CloudOff, Gauge, Inbox, RefreshCw, Settings, Target } from "lucide-react";
+import { CalendarDays, CloudOff, Gauge, Inbox, Plus, RefreshCw, Settings, Target } from "lucide-react";
 import { weekLabel, weekNumber } from "../../../src/lib/dates";
 import { isMock } from "./api";
 import { startPolling, useModel, useStore } from "./store";
 import { Pair } from "./Pair";
 import { Waiting } from "./Waiting";
 import { Week } from "./Week";
+import { Goals, periodLeft } from "./Goals";
+import { Usage } from "./Usage";
+import { QuickAdd } from "./QuickAdd";
 import { Toasts } from "./Toasts";
 
 type Tab = "waiting" | "week" | "goals" | "usage";
@@ -39,6 +42,7 @@ function Shell() {
   const m = useModel();
   const [tab, setTabState] = useState<Tab>(loadTab);
   const [settings, setSettings] = useState(false);
+  const [adding, setAdding] = useState(false);
   const setTab = (t: Tab) => {
     setTabState(t);
     window.scrollTo(0, 0);
@@ -53,13 +57,13 @@ function Shell() {
   const head: Record<Tab, { title: string; sub?: string }> = {
     waiting: { title: "Waiting", sub: m ? (waiting ? `${waiting} session${waiting === 1 ? "" : "s"} need${waiting === 1 ? "s" : ""} you` : "Nothing needs you") : undefined },
     week: { title: "This week", sub: m ? `Week ${weekNumber(m.week)} · ${weekLabel(m.weekStart)}` : undefined },
-    goals: { title: "Goals", sub: m?.period?.name },
-    usage: { title: "Usage" },
+    goals: { title: "Goals", sub: m?.period ? `${m.period.name} · ${periodLeft(m)}` : undefined },
+    usage: { title: "Usage", sub: "Claude plan limits" },
   };
 
   return (
     <div className="app">
-      <Header title={head[tab].title} sub={head[tab].sub} onSettings={() => setSettings(true)} />
+      <Header title={head[tab].title} sub={head[tab].sub} onSettings={() => setSettings(true)} onAdd={tab === "week" && m ? () => setAdding(true) : undefined} />
       <OfflineBanner />
       {!m ? (
         <Loading />
@@ -68,17 +72,23 @@ function Shell() {
       ) : tab === "week" ? (
         <Week m={m} />
       ) : tab === "goals" ? (
-        <Placeholder icon={<Target size={32} />} text="Goals for the period come here." />
+        <Goals m={m} />
       ) : (
-        <Placeholder icon={<Gauge size={32} />} text="Plan usage comes here." />
+        <Usage />
       )}
       <nav className="tabbar" aria-label="Sections">
         <TabButton id="waiting" tab={tab} setTab={setTab} label="Waiting" icon={<Inbox size={24} />} badge={waiting} />
         <TabButton id="week" tab={tab} setTab={setTab} label="Week" icon={<CalendarDays size={24} />} />
+        <button type="button" className="tab tab-add" aria-label="New task" disabled={!m} onClick={() => setAdding(true)}>
+          <span className="tab-add-circle">
+            <Plus size={22} strokeWidth={2.5} />
+          </span>
+        </button>
         <TabButton id="goals" tab={tab} setTab={setTab} label="Goals" icon={<Target size={24} />} />
         <TabButton id="usage" tab={tab} setTab={setTab} label="Usage" icon={<Gauge size={24} />} />
       </nav>
       {settings && <SettingsSheet close={() => setSettings(false)} />}
+      {adding && m && <QuickAdd m={m} close={() => setAdding(false)} />}
     </div>
   );
 }
@@ -95,7 +105,7 @@ function TabButton(p: { id: Tab; tab: Tab; setTab: (t: Tab) => void; label: stri
   );
 }
 
-function Header({ title, sub, onSettings }: { title: string; sub?: string; onSettings: () => void }) {
+function Header({ title, sub, onSettings, onAdd }: { title: string; sub?: string; onSettings: () => void; onAdd?: () => void }) {
   const loading = useStore((s) => s.loading);
   const refresh = useStore((s) => s.refresh);
   return (
@@ -104,6 +114,11 @@ function Header({ title, sub, onSettings }: { title: string; sub?: string; onSet
         <h1>{title}</h1>
         {sub && <div className="sub">{sub}</div>}
       </div>
+      {onAdd && (
+        <button type="button" className="icon-btn" aria-label="New task" onClick={onAdd}>
+          <Plus size={23} />
+        </button>
+      )}
       <button type="button" className="icon-btn" aria-label="Refresh" onClick={() => refresh()}>
         <RefreshCw size={20} className={loading ? "spin" : undefined} />
       </button>
@@ -132,15 +147,6 @@ function Loading() {
   return (
     <div className="placeholder">
       {offline ? "Can't reach Navarch on your Mac. Is it awake, with Phone access on?" : "Connecting to your Mac…"}
-    </div>
-  );
-}
-
-function Placeholder({ icon, text }: { icon: ReactNode; text: string }) {
-  return (
-    <div className="placeholder">
-      {icon}
-      <div>{text}</div>
     </div>
   );
 }

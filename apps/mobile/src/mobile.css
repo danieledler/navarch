@@ -376,3 +376,124 @@ a { color: var(--accent); }
 
 .placeholder { margin: 64px 32px; text-align: center; color: var(--muted); }
 .placeholder svg { margin-bottom: 8px; }
+
+.small { font-size: 13px; }
+.foot { margin: 6px 16px 0; font-size: 13px; line-height: 1.4; }
+
+/* bars: period progress, goal progress, usage */
+.meter { position: relative; display: block; height: 8px; border-radius: 4px; background: var(--hover); overflow: visible; }
+.meter > span { position: absolute; inset: 0 auto 0 0; border-radius: inherit; background: var(--accent); max-width: 100%; }
+.meter-thin { height: 5px; flex: 1; min-width: 40px; max-width: 140px; }
+.meter-thin > span { background: var(--green); }
+
+/* Goals */
+.period-card { padding: 14px; }
+.group.period-card > * + * { border-top: 0; }
+.period-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 10px; font-size: 15px; }
+.period-name { font-size: 17px; font-weight: 600; }
+.period-dates { display: flex; justify-content: space-between; margin-top: 6px; font-size: 12.5px; }
+.goal-progress { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 13px; }
+
+/* Usage */
+.usage-row { padding: 14px; }
+.usage-top { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 8px; }
+.usage-title { font-size: 16px; font-weight: 600; }
+.usage-pct { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.meter-usage { height: 10px; border-radius: 5px; }
+.meter-usage.tone-good > span { background: var(--green); }
+.meter-usage.tone-warn > span { background: var(--amber); }
+.meter-usage.tone-hot > span { background: var(--red); }
+.pace-mark { position: absolute; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; border-radius: 1px; background: var(--text); }
+.usage-meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 12px; margin-top: 8px; font-size: 13px; }
+.usage-pct.tone-good, .usage-meta .tone-good { color: var(--green); }
+.usage-pct.tone-warn, .usage-meta .tone-warn { color: var(--amber); }
+.usage-pct.tone-hot, .usage-meta .tone-hot { color: var(--red); }
+.alert-card {
+  margin: 0 16px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--red) 14%, var(--panel));
+  display: flex;
+  gap: 10px;
+  font-size: 15px;
+}
+.alert-card svg { color: var(--red); flex: none; margin-top: 1px; }
+.alert-card .small { margin-top: 4px; }
+
+/* tab bar's add button */
+.tab-add { color: var(--accent); }
+.tab-add:disabled { opacity: 0.4; }
+.tab-add-circle {
+  width: 40px;
+  height: 32px;
+  border-radius: 16px;
+  display: grid;
+  place-items: center;
+  background: var(--accent);
+  color: var(--accent-text);
+}
+.tab-add:active .tab-add-circle { opacity: 0.8; }
+
+/* Quick add sheet */
+.sheet-bar { display: flex; align-items: center; justify-content: space-between; margin: -4px -4px 10px; }
+.sheet-bar h2 { margin: 0; font-size: 17px; }
+.sheet-bar .btn-plain { width: auto; margin: 0; padding: 0 6px; }
+.btn-plain:disabled { color: var(--muted); }
+.btn-strong { font-weight: 600; }
+.field {
+  width: 100%;
+  min-height: 50px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: var(--radius);
+  background: var(--panel);
+  font-size: 17px;
+  outline: none;
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.field:focus { box-shadow: inset 0 0 0 1.5px var(--accent); }
+.form-group { margin: 12px 0 4px; }
+.form-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 50px; padding: 0 14px; font-size: 16px; }
+.form-row select {
+  margin-left: auto;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 60%;
+  min-height: 44px;
+  border: 0;
+  background: none;
+  color: var(--text-2);
+  font: inherit;
+  text-align: right;
+  text-overflow: ellipsis;
+  -webkit-appearance: none;
+  appearance: none;
+  outline: none;
+}
+.switch {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: none;
+  width: 51px;
+  height: 31px;
+  margin: 0;
+  border-radius: 16px;
+  background: var(--border-strong);
+  position: relative;
+  transition: background 0.2s;
+}
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 27px;
+  height: 27px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  transition: transform 0.2s;
+}
+.switch:checked { background: var(--green); }
+.switch:checked::after { transform: translateX(20px); }
+.select-chev { flex: none; margin-left: -8px; }
