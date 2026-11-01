@@ -94,16 +94,27 @@ const showAlerts = (v: LimitAlerts) => {
   alertRows.forEach((f) => f(v));
 };
 
-/** Saves one threshold and toasts it with Undo; an Undo saves the old value against the saved state. */
+// Saves run one at a time, in order: the backend applies each after a usage read that can take a
+// while, so two at once could finish in the wrong order. While any is on its way, `latestAlerts`
+// already holds its values and is what a reopened row shows.
+let saving = 0;
+let queue: Promise<unknown> = Promise.resolve();
+
+/** Saves one threshold and toasts it with Undo, which saves the old value back. */
 async function setThreshold(key: "fiveHour" | "sevenDay", v: number, isUndo = false) {
   const toast = useStore.getState().toast;
-  const prev = isUndo ? await api.getLimitAlerts().catch(() => latestAlerts) : latestAlerts;
+  const prev = latestAlerts;
   if (!prev || prev[key] === v) return;
   const next = { ...prev, [key]: v };
   latestAlerts = next; // so a second edit before this save returns builds on it
+  const save = queue.then(() => api.setLimitThresholds(next.fiveHour, next.sevenDay));
+  queue = save.catch(() => {});
+  saving++;
   try {
-    showAlerts(await api.setLimitThresholds(next.fiveHour, next.sevenDay));
+    const saved = await save;
+    if (--saving === 0) showAlerts(saved); // an earlier answer lacks the later edits
   } catch (e) {
+    saving--;
     if (latestAlerts === next) latestAlerts = prev;
     toast(String(e), undefined, "error");
     return;
@@ -117,7 +128,9 @@ function LimitAlertsRow() {
   const [la, setLa] = useState<LimitAlerts | null>(null);
   useEffect(() => {
     alertRows.add(setLa);
-    api.getLimitAlerts().then(showAlerts, () => {});
+    // A save from the last close may still be on its way: the backend would answer with the old values.
+    if (saving && latestAlerts) setLa(latestAlerts);
+    else api.getLimitAlerts().then((v) => saving || showAlerts(v), () => {});
     return () => void alertRows.delete(setLa);
   }, []);
   if (!la) return null;
