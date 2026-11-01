@@ -10,6 +10,9 @@
   --needle: #b47606;
   --needle-soft: #f2b84b;
   --app-bg: #f6f6f7;
+  --app-panel: #ffffff;
+  --app-ink: #1c1d21;
+  --phone-body: linear-gradient(160deg, #3a4656, #1a2230 45%, #10161f);
   --frame-ring: rgb(19 36 58 / 0.14);
   --frame-shadow: 0 40px 90px -30px rgb(19 36 58 / 0.42), 0 14px 30px -18px rgb(19 36 58 / 0.3);
   --serif: "Newsreader Variable", "Iowan Old Style", Georgia, serif;
@@ -30,6 +33,9 @@
     --needle: #f2b84b;
     --needle-soft: #f2b84b;
     --app-bg: #17181b;
+    --app-panel: #1d1e22;
+    --app-ink: #e7e7ea;
+    --phone-body: linear-gradient(160deg, #46566c, #222d3d 45%, #161e2a);
     --frame-ring: rgb(160 190 225 / 0.16);
     --frame-shadow: 0 40px 100px -30px rgb(0 0 0 / 0.75), 0 14px 30px -18px rgb(0 0 0 / 0.6);
     color-scheme: dark;
@@ -137,9 +143,50 @@ h1 {
 .demo-note p { margin: 0; font-size: 15px; color: var(--ink-2); max-width: 46em; }
 .demo-tools { display: flex; align-items: center; gap: 18px; flex-shrink: 0; }
 
+/* ---------- phone ---------- */
+.pocket {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 40px 88px;
+  padding-top: 120px; scroll-margin-top: 24px;
+}
+.pocket-copy { max-width: 34em; }
+.pocket-lede { margin: 18px 0 0; font-size: 19px; line-height: 1.5; color: var(--ink-2); text-wrap: pretty; }
+.pocket-points { margin-top: 28px; }
+.pocket-points > div { padding: 14px 0; border-top: 1px solid var(--rule); }
+.pocket-points > div:last-child { border-bottom: 1px solid var(--rule); }
+.pocket-points dt { font: 600 18px/1.3 var(--serif); font-variation-settings: "opsz" 18; }
+.pocket-points dd { margin-top: 2px; color: var(--ink-2); font-size: 16px; }
+.pocket-hint {
+  position: relative; margin: 24px 0 0; padding-left: 18px;
+  font: italic 400 19px/1.4 var(--serif); color: var(--ink); text-wrap: pretty;
+}
+.pocket-hint::before { content: ""; position: absolute; left: 0; top: 0.55em; width: 7px; height: 7px; border: 2px solid var(--needle); border-radius: 50%; }
+.pocket .demo-tools { margin: 16px 0 0; }
+
+/* A 390 × 844 phone, scaled down to fit (landing.ts). The status bar and home bar stand in for the iPhone's safe areas. */
+.phone {
+  width: 352px; max-width: 100%; padding: 11px; border-radius: 58px;
+  background: var(--phone-body);
+  box-shadow: 0 0 0 1px var(--frame-ring), inset 0 0 0 1px rgb(255 255 255 / 0.12), inset 0 0 0 3px rgb(0 0 0 / 0.35), var(--frame-shadow);
+}
+.phone-screen { position: relative; aspect-ratio: 390 / 844; overflow: hidden; border-radius: 47px; background: var(--app-bg); }
+.phone-stage { position: absolute; top: 0; left: 0; display: flex; flex-direction: column; width: 390px; height: 844px; transform-origin: 0 0; }
+.phone-stage iframe { display: block; flex: 1; width: 100%; min-height: 0; border: 0; background: var(--app-bg); }
+.phone-status {
+  position: relative; flex: none; display: flex; align-items: center; justify-content: space-between;
+  height: 50px; padding: 4px 34px 0 48px;
+  background: var(--app-bg); color: var(--app-ink);
+  font: 600 16px/1 var(--sans); letter-spacing: -0.01em;
+}
+.phone-island { position: absolute; top: 11px; left: 50%; width: 122px; height: 35px; margin-left: -61px; border-radius: 18px; background: #000; }
+.phone-battery { position: relative; width: 25px; height: 12px; border: 1px solid color-mix(in srgb, var(--app-ink) 45%, transparent); border-radius: 4px; padding: 1.5px; }
+.phone-battery::after { content: ""; position: absolute; top: 3.5px; right: -3px; width: 1.5px; height: 4px; border-radius: 0 1px 1px 0; background: color-mix(in srgb, var(--app-ink) 45%, transparent); }
+.phone-battery i { display: block; width: 72%; height: 100%; border-radius: 2px; background: var(--app-ink); }
+.phone-home { flex: none; display: flex; justify-content: center; align-items: center; height: 26px; background: var(--app-panel); }
+.phone-home i { width: 134px; height: 5px; border-radius: 3px; background: var(--app-ink); }
+
 /* ---------- sections ---------- */
 .band { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2.2fr); gap: 24px 56px; padding-top: 88px; padding-bottom: 8px; }
-.demo + .band { margin-top: 64px; }
+.pocket + .band { margin-top: 48px; }
 h2 { margin: 0; font: 500 34px/1.1 var(--serif); font-variation-settings: "opsz" 36; letter-spacing: -0.01em; }
 
 dl { margin: 0; }
@@ -176,6 +223,9 @@ dd { margin: 0; }
 /* ---------- narrow ---------- */
 @media (max-width: 860px) {
   .band { grid-template-columns: minmax(0, 1fr); padding-top: 64px; }
+  .pocket { grid-template-columns: minmax(0, 1fr); justify-items: center; padding-top: 88px; }
+  .pocket-copy { justify-self: stretch; }
+  .pocket + .band { margin-top: 24px; }
   .legend { grid-template-columns: minmax(0, 1fr); gap: 28px; }
 }
 @media (max-width: 600px) {
@@ -187,6 +237,10 @@ dd { margin: 0; }
   .chart { height: 760px; }
   .course { display: none; }
   .window { border-radius: 8px; }
+  .pocket { padding-top: 64px; }
+  .pocket-lede { font-size: 17px; }
+  .phone { padding: 9px; border-radius: 52px; }
+  .phone-screen { border-radius: 43px; }
   .demo-note { padding: 0; }
   .ledger > div { grid-template-columns: minmax(0, 1fr); gap: 4px; }
   .get pre { font-size: 13px; padding: 16px; }

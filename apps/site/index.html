@@ -52,7 +52,7 @@
         </svg>
         <div class="wrap hero-text">
           <h1>Keep every project on course.</h1>
-          <p class="lede">Navarch is a macOS planner that keeps work across many folders pointed at 3–6 month goals, while Claude Code sessions in the Claude desktop app do the work.</p>
+          <p class="lede">Navarch is a macOS planner that keeps work across many folders pointed at 3–6 month goals, while Claude Code sessions in the Claude desktop app do the work. Its phone app keeps watch while you&rsquo;re away.</p>
           <p class="actions">
             <a class="btn primary" href="#demo">Try the live demo</a>
             <a class="btn" href="https://github.com/danieledler/navarch">View on GitHub</a>
@@ -69,11 +69,47 @@
           <a class="open-full btn primary" href="./demo/">Open the live demo</a>
         </div>
         <div class="demo-note">
-          <p>The real Navarch interface, running in your browser on made-up projects and sessions. Click around and edit freely: changes stay in this browser.</p>
+          <p>The real Navarch interface, running in your browser on made-up projects and sessions. Click around and edit freely: changes stay in this browser. Reset demo puts both the desktop and the phone back.</p>
           <p class="demo-tools">
             <button type="button" class="btn small" data-reset>Reset demo</button>
             <a class="quiet-link" href="./demo/">Open full page</a>
           </p>
+        </div>
+      </section>
+
+      <section id="phone" class="pocket wrap" aria-labelledby="phone-title">
+        <div class="pocket-copy">
+          <h2 id="phone-title">On your phone</h2>
+          <p class="pocket-lede">Away from your Mac, the phone app shows the sessions waiting for you, the week, your goals and your plan limits. Tap + to add a task: it lands in Navarch on your Mac right away.</p>
+          <dl class="pocket-points">
+            <div>
+              <dt>Off until you turn it on</dt>
+              <dd>Switch on phone access from the Mac&rsquo;s status bar, and Navarch serves the phone app from your Mac.</dd>
+            </div>
+            <div>
+              <dt>Inside your tailnet</dt>
+              <dd>Navarch points Tailscale Serve at it, so your phone reaches your Mac over your own tailnet, not the public internet.</dd>
+            </div>
+            <div>
+              <dt>Paired with a QR code</dt>
+              <dd>Scan it, pair with a single-use code that lasts ten minutes, and add the app to your Home Screen. Resetting the token unpairs every phone.</dd>
+            </div>
+          </dl>
+          <p class="pocket-hint">This phone shares its demo data with the desktop above. Tap + to add a task, then watch it land on the Mac.</p>
+          <p class="demo-tools"><a class="quiet-link" href="./phone/">Open the phone demo on its own</a></p>
+        </div>
+        <div class="phone" data-phone>
+          <div class="phone-screen" data-phone-screen>
+            <div class="phone-stage" data-phone-stage>
+              <div class="phone-status" aria-hidden="true">
+                <span class="phone-time">9:41</span>
+                <span class="phone-island"></span>
+                <span class="phone-battery"><i></i></span>
+              </div>
+              <iframe src="./phone/" title="Navarch phone app demo" loading="lazy" data-phone-frame></iframe>
+              <div class="phone-home" aria-hidden="true"><i></i></div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -104,6 +140,10 @@
             <dt>Plan limits</dt>
             <dd>The status bar shows your 5-hour and weekly Claude plan usage. As a limit gets close, Navarch can tell running sessions, through a Claude Code hook, to save their work and schedule a resume before they are cut off.</dd>
           </div>
+          <div>
+            <dt>A phone app</dt>
+            <dd>Check what&rsquo;s waiting for you, the week, your goals and your plan limits from your phone, and add tasks that show up on your Mac at once. It reaches your Mac over Tailscale, and only once you turn it on.</dd>
+          </div>
         </dl>
       </section>
 
@@ -120,7 +160,11 @@
           </div>
           <div>
             <dt>Sends</dt>
-            <dd>One request: your plan usage, fetched from Anthropic with the Claude Code login already in your Keychain. Nothing else leaves your Mac.</dd>
+            <dd>One request: your plan usage, fetched from Anthropic with the Claude Code login already in your Keychain.</dd>
+          </div>
+          <div>
+            <dt>Serves</dt>
+            <dd>Nothing, unless you turn on phone access. Then it serves the phone app only inside your tailnet, through Tailscale Serve, and only to phones paired with its token. Nothing else leaves your Mac.</dd>
           </div>
         </dl>
       </section>
@@ -128,7 +172,7 @@
       <section class="band wrap" aria-labelledby="get">
         <h2 id="get">Build it</h2>
         <div class="get">
-          <p>Navarch runs on macOS and is built from source. You need the <a href="https://claude.ai/download">Claude desktop app</a>, <a href="https://rustup.rs">Rust</a>, Node and <a href="https://pnpm.io">pnpm</a>.</p>
+          <p>Navarch runs on macOS and is built from source. You need the <a href="https://claude.ai/download">Claude desktop app</a>, <a href="https://rustup.rs">Rust</a>, Node and <a href="https://pnpm.io">pnpm</a>. Phone access is optional and needs <a href="https://tailscale.com">Tailscale</a> on your Mac and your phone.</p>
           <pre><code><span class="c"># get the code</span>
 git clone https://github.com/danieledler/navarch.git
 cd navarch

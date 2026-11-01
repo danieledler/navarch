@@ -23,7 +23,22 @@ function fit() {
 new ResizeObserver(fit).observe(win);
 fit();
 
-// The demo's mock reseeds its data whenever its URL mentions "reset".
+/** The phone demo renders at an iPhone's size (390 × 844 points) and is scaled down to fit its frame. */
+const PHONE_WIDTH = 390;
+const phoneScreen = document.querySelector<HTMLElement>("[data-phone-screen]")!;
+const phoneStage = document.querySelector<HTMLElement>("[data-phone-stage]")!;
+const phoneFrame = document.querySelector<HTMLIFrameElement>("[data-phone-frame]")!;
+
+const fitPhone = () => {
+  phoneStage.style.transform = `scale(${phoneScreen.clientWidth / PHONE_WIDTH})`;
+};
+new ResizeObserver(fitPhone).observe(phoneScreen);
+fitPhone();
+
+// Each demo's mock reseeds its data whenever its URL mentions "reset", and neither saves until something is edited,
+// so reloading both at once can't bring old data back: both start from the same seed.
 document.querySelector("[data-reset]")!.addEventListener("click", () => {
-  frame.src = `./demo/?reset=${Date.now()}`;
+  const stamp = Date.now();
+  frame.src = `./demo/?reset=${stamp}`;
+  phoneFrame.src = `./phone/?reset=${stamp}`;
 });

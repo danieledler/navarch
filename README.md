@@ -8,6 +8,7 @@ Website and live demo: https://danieledler.github.io/navarch/
 - **Sessions.** Every Claude Code session shows up under its project with status, your last message, processes/CPU, time and tokens. Start a session from a task and it links automatically; time and tokens roll up to parent tasks, projects and spaces.
 - **Badges** show sessions that need your input or have a reply you haven't read.
 - **Status bar.** CPU load and your Claude plan limits: `2% 4h10 · 41% 1d21h` = 5-hour window used / resets in, weekly used / resets in.
+- **Phone app.** Turn on phone access in the status bar and a Home Screen web app on your phone shows waiting sessions, the week, goals and plan limits, and adds tasks. It reaches your Mac over your tailnet through Tailscale Serve, paired by QR code.
 
 ```bash
 pnpm install

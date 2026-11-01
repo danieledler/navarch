@@ -1,6 +1,7 @@
 import { defineConfig, devices } from "@playwright/test";
 
-const PORT = 4318;
+// E2E_PORT moves it when another checkout's tests hold the default.
+const PORT = Number(process.env.E2E_PORT) || 4318;
 
 // Smoke tests of the built site: the landing page and the real UI on the demo data.
 // CI runs them before every GitHub Pages deploy and uploads the dist/ this server built.

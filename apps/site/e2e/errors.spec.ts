@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { spaces } from "./demo-data";
+import { needsInput, spaces } from "./demo-data";
 
 function collectErrors(page: Page) {
   const errors: string[] = [];
@@ -10,11 +10,13 @@ function collectErrors(page: Page) {
   return errors;
 }
 
-test("the landing page and its demo frame load without errors", async ({ page }) => {
+test("the landing page and its demo frames load without errors", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("./");
   await page.locator("[data-frame]").scrollIntoViewIfNeeded();
   await expect(page.frameLocator("[data-frame]").getByRole("button", { name: spaces[0].name, exact: true })).toBeVisible();
+  await page.locator("[data-phone-frame]").scrollIntoViewIfNeeded();
+  await expect(page.frameLocator("[data-phone-frame]").getByText(needsInput.title, { exact: true }).first()).toBeVisible();
   await page.waitForLoadState("networkidle");
   expect(errors).toEqual([]);
 });
@@ -23,6 +25,14 @@ test("the full-page demo loads without errors", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("demo/");
   await expect(page.getByRole("navigation").getByRole("button", { name: spaces[0].name, exact: true })).toBeVisible();
+  await page.waitForLoadState("networkidle");
+  expect(errors).toEqual([]);
+});
+
+test("the full-page phone demo loads without errors", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("phone/");
+  await expect(page.getByText(needsInput.title, { exact: true }).first()).toBeVisible();
   await page.waitForLoadState("networkidle");
   expect(errors).toEqual([]);
 });
