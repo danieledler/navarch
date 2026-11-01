@@ -1,6 +1,6 @@
 import { CheckCircle2, ExternalLink } from "lucide-react";
 import type { Session, SessionStatus } from "@desktop/api/types";
-import { baseName, relTime } from "@desktop/lib/format";
+import { baseName, plainText, relTime } from "@desktop/lib/format";
 import { isLive, needsAttention, type Model } from "@desktop/lib/model";
 import { useNow } from "./time";
 
@@ -72,7 +72,7 @@ function WaitingCard({ s, project }: { s: Session; project?: string }) {
         <span className={`status status-${s.status}`}>{STATUS_LABEL[s.status]}</span>
         <span>{relTime(s.lastActivityAt)}</span>
       </div>
-      {s.lastReply && <p className="reply">{s.lastReply}</p>}
+      {s.lastReply && <p className="reply">{plainText(s.lastReply)}</p>}
       {s.lastPrompt && <p className="prompt">You: {s.lastPrompt}</p>}
       {s.remoteId && (
         <a className="open-link" href={`https://claude.ai/code/${encodeURIComponent(s.remoteId)}`}>
