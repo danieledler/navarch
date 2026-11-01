@@ -13,7 +13,8 @@ export default defineConfig(({ command }) => ({
   plugins: [react()],
   clearScreen: false,
   // The desktop mock (?mock, dev only) reads this; a build carries no checkout path.
-  define: { __UI_CHECKOUT__: JSON.stringify(command === "serve" ? repo : "") },
+  // __PHONE_DEMO__ is true only in apps/site, which runs this app on the mock; here it keeps the mock out of the build.
+  define: { __UI_CHECKOUT__: JSON.stringify(command === "serve" ? repo : ""), __PHONE_DEMO__: "false" },
   resolve: {
     // Shared code comes from the desktop app, as in apps/site.
     alias: { "@desktop": here("../desktop/src") },

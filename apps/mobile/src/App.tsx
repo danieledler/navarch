@@ -176,7 +176,7 @@ function SettingsSheet({ close }: { close: () => void }) {
         <div className="sheet-grip" />
         <h2>Navarch on your phone</h2>
         <p>
-          {isMock ? "Mock data: no Mac involved." : `Paired with Navarch on your Mac${updatedAt ? `, last heard from ${ago(updatedAt, now)}` : ""}.`} To
+          {isMock ? `${__PHONE_DEMO__ ? "Demo" : "Mock"} data: no Mac involved.` : `Paired with Navarch on your Mac${updatedAt ? `, last heard from ${ago(updatedAt, now)}` : ""}.`} To
           cut off every phone at once, reset the token under Phone access on the Mac.
         </p>
         <button

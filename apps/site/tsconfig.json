@@ -12,7 +12,7 @@
     "isolatedModules": true,
     "noEmit": true,
     "types": ["vite/client"],
-    "paths": { "@desktop/*": ["../desktop/src/*"] }
+    "paths": { "@desktop/*": ["../desktop/src/*"], "@mobile/*": ["../mobile/src/*"] }
   },
-  "include": ["src", "../desktop/src/env.d.ts"]
+  "include": ["src", "../desktop/src/env.d.ts", "../mobile/src/env.d.ts"]
 }

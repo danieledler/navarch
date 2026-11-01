@@ -1,5 +1,6 @@
 // The phone's backend: POST /api/<cmd> on the same origin (tailscale serve → Navarch's phone server).
-// With ?mock in the URL, the desktop's in-memory mock stands in, so the UI runs without a Mac.
+// With ?mock in the URL (dev builds), or always in the site's demo build, the desktop's in-memory mock stands in,
+// so the UI runs without a Mac.
 import type { Id, LimitAlerts, Session, Snapshot, Task, TaskPatch, Usage } from "@desktop/api/types";
 
 /** The Mac can't be reached: network error, timeout, tunnel error page (530, 502…), or anything that isn't our JSON. */
@@ -32,8 +33,9 @@ export interface PhoneApi {
   pair(code: string): Promise<string>;
 }
 
-/** Dev builds only (pnpm --filter mobile dev): production drops the mock and its chunk. */
-export const isMock = import.meta.env.DEV && new URLSearchParams(location.search).has("mock");
+/** Dev builds (pnpm --filter mobile dev) and the site's demo only: the phone app's own build drops the mock and its chunk. */
+const mockable = __PHONE_DEMO__ || import.meta.env.DEV;
+export const isMock = __PHONE_DEMO__ || (import.meta.env.DEV && new URLSearchParams(location.search).has("mock"));
 
 /** A sleeping Mac behind tailscale serve can leave a request hanging for a minute or more. */
 const TIMEOUT_MS = 10_000;
@@ -109,6 +111,8 @@ const httpApi: PhoneApi = {
 async function mock(): Promise<PhoneApi> {
   const { mockApi } = await import("@desktop/api/mock");
   const m = mockApi();
+  // Another page on the same mock data (the site's desktop demo) changed it: refresh now, as the Mac's edits would on the next poll.
+  m.onSnapshotChanged(() => window.dispatchEvent(new Event(MOCK_CHANGED)));
   return {
     ping: async () => ({ ok: true }),
     getSnapshot: () => m.getSnapshot(),
@@ -125,8 +129,11 @@ async function mock(): Promise<PhoneApi> {
   };
 }
 
-/** Resolved once: the mock is only loaded (and bundled into its own chunk) for ?mock. */
-const ready: Promise<PhoneApi> = import.meta.env.DEV && isMock ? mock() : Promise.resolve(httpApi);
+/** Fired on window when the mock's data changed in another page. */
+export const MOCK_CHANGED = "mock-data-changed";
+
+/** Resolved once: the mock is only loaded (and bundled into its own chunk) for ?mock or the demo. */
+const ready: Promise<PhoneApi> = mockable && isMock ? mock() : Promise.resolve(httpApi);
 
 /** Every call goes through here, so callers don't care which backend answered. */
 export const api: PhoneApi = new Proxy({} as PhoneApi, {

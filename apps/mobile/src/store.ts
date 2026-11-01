@@ -4,7 +4,7 @@ import { useMemo } from "react";
 import { create } from "zustand";
 import type { Session, Snapshot, Task, TaskPatch, Usage } from "@desktop/api/types";
 import { buildModel, type Model } from "@desktop/lib/model";
-import { api, getToken, isMock, Offline, setToken, Unauthorized } from "./api";
+import { api, getToken, isMock, MOCK_CHANGED, Offline, setToken, Unauthorized } from "./api";
 
 export interface Toast {
   id: number;
@@ -212,6 +212,7 @@ export function startPolling() {
   document.addEventListener("visibilitychange", tick);
   window.addEventListener("focus", tick);
   window.addEventListener("online", tick);
+  if (isMock) window.addEventListener(MOCK_CHANGED, tick);
 }
 
 /** The derived model, rebuilt only when the snapshot or the sessions change. */

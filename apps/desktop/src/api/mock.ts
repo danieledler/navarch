@@ -85,6 +85,19 @@ export function mockApi(): Api {
   });
   const listeners = new Set<(s: Session[]) => void>();
   const emit = () => listeners.forEach((cb) => cb(mockSessions(db)));
+  // Other pages on this origin share the data (the site shows the desktop and phone demos side by side):
+  // take their saves, as the app takes a phone's edits, without saving them back.
+  const changed = new Set<() => void>();
+  window.addEventListener("storage", (e) => {
+    if (e.key !== KEY || !e.newValue) return;
+    try {
+      Object.assign(db, JSON.parse(e.newValue));
+    } catch {
+      return;
+    }
+    changed.forEach((cb) => cb());
+    emit();
+  });
   const nid = () => db.nextId++;
   const ok = async () => save();
   const kids = (id: Id): Task[] => db.tasks.filter((t) => t.parentId === id).flatMap((t) => [t, ...kids(t.id)]);
@@ -257,7 +270,10 @@ export function mockApi(): Api {
       listeners.add(cb);
       return () => listeners.delete(cb);
     },
-    onSnapshotChanged: () => () => {},
+    onSnapshotChanged: (cb) => {
+      changed.add(cb);
+      return () => changed.delete(cb);
+    },
     onMobileChanged: () => () => {},
     getMobileAccess: async () => ({ ...mobile }),
     setMobileAccess: async (on, publicUrl) => {
