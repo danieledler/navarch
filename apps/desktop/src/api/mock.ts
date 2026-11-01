@@ -63,7 +63,7 @@ function cpuSim() {
 export function mockApi(): Api {
   const cpu = cpuSim();
   const db = load();
-  let limitAlerts: LimitAlerts = { fiveHour: 95, sevenDay: 98, active: null, hookInstalled: false, live: false };
+  let limitAlerts: LimitAlerts = { fiveHour: 95, sevenDay: 99, active: null, hookInstalled: false, live: false };
   // A pretend phone server: nothing listens, but the popover shows every state. ?mobile=paired starts it on and paired.
   const pairedMode = new URLSearchParams(location.search).get("mobile") === "paired";
   let mobile: MobileAccess = {

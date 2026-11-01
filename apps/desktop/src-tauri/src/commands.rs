@@ -274,7 +274,7 @@ pub async fn set_limit_thresholds(state: S<'_>, thresholds: Thresholds) -> Res<l
     if !ok(thresholds.five_hour) || !ok(thresholds.seven_day) {
         return Err("Thresholds go from 1 to 100%".into());
     }
-    with_db!(state, |c| db::set_setting(c, limits::SETTING_KEY, &serde_json::to_string(&thresholds).map_err(db::err)?))?;
+    with_db!(state, |c| limits::save(c, &thresholds))?;
     let cache = state.usage.clone();
     let usage = tauri::async_runtime::spawn_blocking(move || cache.get(false)).await.map_err(db::err)?;
     let mut w = state.limits.lock().map_err(db::err)?;

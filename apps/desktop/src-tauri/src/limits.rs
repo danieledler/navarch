@@ -23,8 +23,17 @@ pub struct Thresholds {
 
 impl Default for Thresholds {
     fn default() -> Self {
-        Thresholds { five_hour: 95.0, seven_day: 98.0 }
+        Thresholds { five_hour: 95.0, seven_day: 99.0 }
     }
+}
+
+/// The saved thresholds, or the defaults when none are saved (or the row doesn't parse).
+pub fn load(c: &rusqlite::Connection) -> crate::db::Res<Thresholds> {
+    Ok(crate::db::get_setting(c, SETTING_KEY)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default())
+}
+
+pub fn save(c: &rusqlite::Connection, t: &Thresholds) -> crate::db::Res<()> {
+    crate::db::set_setting(c, SETTING_KEY, &serde_json::to_string(t).map_err(crate::db::err)?)
 }
 
 #[derive(Debug)]
@@ -266,8 +275,8 @@ mod tests {
     fn alerts_only_over_a_threshold() {
         let now = Local.with_ymd_and_hms(2026, 10, 30, 12, 0, 0).unwrap();
         let t = Thresholds::default();
-        assert!(alert_for(&usage(94.9, 97.9), &t, now).is_none());
-        assert!(near(&usage(85.0, 0.0), &t) && !near(&usage(84.0, 87.0), &t));
+        assert!(alert_for(&usage(94.9, 98.9), &t, now).is_none());
+        assert!(near(&usage(85.0, 0.0), &t) && !near(&usage(84.0, 88.0), &t));
 
         let a = alert_for(&usage(95.4, 50.0), &t, now).unwrap();
         let reset = DateTime::parse_from_rfc3339("2026-10-30T14:30:00+00:00").unwrap();
@@ -279,10 +288,23 @@ mod tests {
         assert!(a.sub.contains("return to your caller"));
 
         // Both over: listed together, resume after the later reset, expire at the first.
-        let both = alert_for(&usage(99.0, 98.0), &t, now).unwrap();
+        let both = alert_for(&usage(99.0, 99.0), &t, now).unwrap();
         assert!(both.id.starts_with("5h") && both.id.contains("-7d"));
         assert_eq!(both.expires, reset.timestamp());
-        assert!(both.summary.starts_with("5h at 99%") && both.summary.contains("Weekly at 98%"));
+        assert!(both.summary.starts_with("5h at 99%") && both.summary.contains("Weekly at 99%"));
+    }
+
+    #[test]
+    fn thresholds_persist_through_the_settings_table() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&c).unwrap();
+        assert_eq!(load(&c).unwrap(), Thresholds { five_hour: 95.0, seven_day: 99.0 });
+        let t = Thresholds { five_hour: 90.0, seven_day: 97.0 };
+        save(&c, &t).unwrap();
+        assert!(crate::db::get_setting(&c, SETTING_KEY).unwrap().is_some());
+        assert_eq!(load(&c).unwrap(), t);
+        crate::db::set_setting(&c, SETTING_KEY, "not json").unwrap();
+        assert_eq!(load(&c).unwrap(), Thresholds::default());
     }
 
     #[test]

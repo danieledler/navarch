@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { api, type LimitAlerts, type UsageWindow } from "../api";
 import { useStore } from "../store";
@@ -85,42 +85,48 @@ function Ring({ label, pace, window: w }: { label: string; pace: Pace | null; wi
   );
 }
 
+// The thresholds last seen, and the rows showing them: a save on close or an Undo can land after
+// the popover closed or reopened, and the open row should still show it.
+let latestAlerts: LimitAlerts | null = null;
+const alertRows = new Set<(v: LimitAlerts) => void>();
+const showAlerts = (v: LimitAlerts) => {
+  latestAlerts = v;
+  alertRows.forEach((f) => f(v));
+};
+
+/** Saves one threshold and toasts it with Undo; an Undo saves the old value against the saved state. */
+async function setThreshold(key: "fiveHour" | "sevenDay", v: number, isUndo = false) {
+  const toast = useStore.getState().toast;
+  const prev = isUndo ? await api.getLimitAlerts().catch(() => latestAlerts) : latestAlerts;
+  if (!prev || prev[key] === v) return;
+  const next = { ...prev, [key]: v };
+  latestAlerts = next; // so a second edit before this save returns builds on it
+  try {
+    showAlerts(await api.setLimitThresholds(next.fiveHour, next.sevenDay));
+  } catch (e) {
+    if (latestAlerts === next) latestAlerts = prev;
+    toast(String(e), undefined, "error");
+    return;
+  }
+  const name = key === "fiveHour" ? "5h" : "Weekly";
+  if (!isUndo) toast(`${name} warning at ${v}%`, { label: `${name} Warning`, run: () => setThreshold(key, prev[key], true) });
+}
+
 /** The thresholds at which running sessions are told to save their work, and whether they can be told. */
 function LimitAlertsRow() {
-  const toast = useStore((s) => s.toast);
   const [la, setLa] = useState<LimitAlerts | null>(null);
   useEffect(() => {
-    api.getLimitAlerts().then(setLa, () => {});
+    alertRows.add(setLa);
+    api.getLimitAlerts().then(showAlerts, () => {});
+    return () => void alertRows.delete(setLa);
   }, []);
   if (!la) return null;
-  const save = async (fiveHour: number, sevenDay: number) => {
-    try {
-      setLa(await api.setLimitThresholds(fiveHour, sevenDay));
-    } catch (e) {
-      toast(String(e), undefined, "error");
-    }
-  };
-  const pct = (label: string, value: number, set: (v: number) => void) => (
-    <label>
-      {label}
-      <input
-        type="number" className="field" min={1} max={100} defaultValue={value} aria-label={`${label} threshold`}
-        onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
-        onBlur={(e) => {
-          const v = Number(e.target.value);
-          if (!(v >= 1 && v <= 100)) e.target.value = String(value);
-          else if (v !== value) set(v);
-        }}
-      />
-      %
-    </label>
-  );
   return (
     <div className="up-alerts" title="At these levels Navarch asks every running session to save its work and schedule its resume for after the reset.">
       <div className="pace-label">Warn running sessions at</div>
       <div className="up-alerts-row">
-        {pct("5h", la.fiveHour, (v) => save(v, la.sevenDay))}
-        {pct("Weekly", la.sevenDay, (v) => save(la.fiveHour, v))}
+        <ThresholdField label="5h" value={la.fiveHour} onCommit={(v) => setThreshold("fiveHour", v)} />
+        <ThresholdField label="Weekly" value={la.sevenDay} onCommit={(v) => setThreshold("sevenDay", v)} />
       </div>
       {la.active && <p className="hint">Told: {la.active}</p>}
       {!la.live ? (
@@ -129,6 +135,43 @@ function LimitAlertsRow() {
         !la.hookInstalled && <p className="hint">The hook isn’t in ~/.claude/settings.json, so sessions aren’t told.</p>
       )}
     </div>
+  );
+}
+
+/**
+ * A percentage that commits on blur, Enter, and when it unmounts: closing the popover removes the
+ * input without a blur (WKWebView), which used to drop the edit. Invalid input reverts.
+ */
+function ThresholdField({ label, value, onCommit }: { label: string; value: number; onCommit: (v: number) => void }) {
+  const input = useRef<HTMLInputElement>(null);
+  const draft = useRef<string | null>(null); // the edit not yet committed, if any
+  const commit = () => {
+    const text = draft.current;
+    if (text === null) return;
+    draft.current = null;
+    const v = Number(text);
+    if (text.trim() === "" || !(v >= 1 && v <= 100)) {
+      if (input.current) input.current.value = String(value);
+    } else if (v !== value) onCommit(v);
+  };
+  const flush = useRef(commit);
+  flush.current = commit;
+  useEffect(() => () => flush.current(), []);
+  // Show a value that changed elsewhere (a save, an Undo) unless an edit is pending.
+  useEffect(() => {
+    if (draft.current === null && input.current) input.current.value = String(value);
+  }, [value]);
+  return (
+    <label>
+      {label}
+      <input
+        ref={input} type="number" className="field" min={1} max={100} defaultValue={value} aria-label={`${label} threshold`}
+        onChange={(e) => (draft.current = e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+        onBlur={commit}
+      />
+      %
+    </label>
   );
 }
 

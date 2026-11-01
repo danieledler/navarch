@@ -202,9 +202,7 @@ pub fn run() {
             let dir = app.path().app_data_dir()?;
             let db_path = database_path(&dir)?;
             let conn = db::open(&db_path)?;
-            let thresholds = db::get_setting(&conn, limits::SETTING_KEY)?
-                .and_then(|v| serde_json::from_str(&v).ok())
-                .unwrap_or_default();
+            let thresholds = limits::load(&conn)?;
             let watch = limits::Watch::new(limits::Files::new(&dir, dev_name().as_deref()), thresholds);
             let sessions = Arc::new(Mutex::new(Vec::new()));
             let port = mobile::port_for(dev_name().is_none(), std::env::var(mobile::PORT_ENV).ok().as_deref());
