@@ -2,7 +2,7 @@
 // Mirrors the Rust commands closely enough to exercise every UI flow, on the demo dataset in ./demo.ts.
 // Add ?reset to the URL to reseed.
 import type { Api } from "./index";
-import type { CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Tailscale, Session, Snapshot, SystemStats, Task, Usage } from "./types";
+import type { CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Tailscale, TailscaleServe, Session, Snapshot, SystemStats, Task, Usage } from "./types";
 import { DEMO_PICK_FOLDER, demoSessions, demoSnapshot } from "./demo";
 
 const KEY = "navarch-mock-v2";
@@ -70,6 +70,13 @@ export function mockApi(): Api {
     enabled: pairedMode, running: pairedMode, port: 47821, publicUrl: pairedMode ? "https://mac.tail1234.ts.net" : "",
     error: null, pairedAt: pairedMode ? new Date(Date.now() - 2 * 864e5).toISOString() : null,
     lastSeenAt: pairedMode ? new Date(Date.now() - 4 * 6e4).toISOString() : null,
+  };
+  // Tailscale Serve as a dev build sees it. ?serve=other: something else holds /; ?serve=login: HTTPS isn't enabled.
+  const serveMode = new URLSearchParams(location.search).get("serve");
+  let serve: TailscaleServe = {
+    cli: true, running: true, dnsName: "mac.tail1234.ts.net", auto: false, loginUrl: null, changed: null, error: null,
+    route: pairedMode ? "ours" : serveMode === "other" ? "other" : "none",
+    target: pairedMode ? "http://127.0.0.1:47821" : serveMode === "other" ? "http://127.0.0.1:3000" : null,
   };
   const save = () => localStorage.setItem(KEY, JSON.stringify(db));
   const snap = (): Snapshot => ({
@@ -252,7 +259,8 @@ export function mockApi(): Api {
     onSnapshotChanged: () => () => {},
     onMobileChanged: () => () => {},
     getMobileAccess: async () => ({ ...mobile }),
-    setMobileAccess: async (enabled, publicUrl) => {
+    setMobileAccess: async (on, publicUrl) => {
+      const enabled = on ?? mobile.enabled;
       const url = publicUrl.trim();
       // As url_host in src-tauri/src/mobile.rs: any scheme or none, then a host.
       const host = url.replace(/^[^:/?#]*:\/\//, "").split(/[/?#]/)[0].replace(/^.*@/, "").replace(/:\d*$/, "").replace(/\.+$/, "");
@@ -268,6 +276,18 @@ export function mockApi(): Api {
     },
     resetMobileToken: async () => (mobile = { ...mobile, pairedAt: null, lastSeenAt: null }),
     detectTailscale: async (): Promise<Tailscale | null> => ({ running: true, dnsName: "mac.tail1234.ts.net" }),
+    tailscaleServeStatus: async () => ({ ...serve, changed: null }),
+    tailscaleServe: async (on, replace) => {
+      await new Promise((r) => setTimeout(r, 400));
+      if (on && serveMode === "login") return { ...serve, loginUrl: "https://login.tailscale.com/f/serve?node=nMock123", error: "Tailscale Serve needs HTTPS enabled for your tailnet" };
+      const take = on && (serve.route === "none" || replace);
+      const drop = !on && serve.route === "ours";
+      if (take) serve = { ...serve, route: "ours", target: "http://127.0.0.1:47821" };
+      if (drop) serve = { ...serve, route: "none", target: null };
+      const changed = take ? "Tailscale now serves https://mac.tail1234.ts.net from this Mac" : drop ? "Tailscale no longer serves https://mac.tail1234.ts.net" : null;
+      return { ...serve, changed };
+    },
+    openTailscaleLogin: async (url) => void window.open(url, "_blank", "noopener"),
     onUndoRequest: (cb) => {
       // No native menu in a browser: take ⌘Z / Ctrl+Z ourselves, as the app's Edit menu does.
       document.addEventListener("keydown", (e) => {

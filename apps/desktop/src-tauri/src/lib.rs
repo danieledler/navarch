@@ -52,7 +52,7 @@ fn database_path(data_dir: &Path) -> db::Res<PathBuf> {
 }
 
 /// None for the app installed in /Applications; otherwise this checkout's name, for its own copies.
-fn dev_name() -> Option<String> {
+pub(crate) fn dev_name() -> Option<String> {
     if std::env::current_exe().is_ok_and(|p| p.starts_with("/Applications")) {
         return None;
     }
@@ -225,7 +225,16 @@ pub fn run() {
             start_cpu_sampler(app.handle().clone());
             start_limit_watch(app.handle().clone());
             if app.state::<AppState>().mobile.enabled() {
-                mobile::start(AppRef(app.handle().clone()));
+                let app = AppRef(app.handle().clone());
+                std::thread::spawn(move || {
+                    if mobile::start_if_enabled(app.clone(), 10) && dev_name().is_none() {
+                        // The installed app takes https://<this Mac>/ back from a dev build, or sets it up.
+                        let s = tailscale::serve(port, true, true, false);
+                        if let Some(msg) = s.changed.or(s.error) {
+                            eprintln!("phone access: {msg}");
+                        }
+                    }
+                });
             }
             Ok(())
         })
@@ -263,6 +272,9 @@ pub fn run() {
             commands::new_pairing_code,
             commands::reset_mobile_token,
             commands::detect_tailscale,
+            commands::tailscale_serve_status,
+            commands::tailscale_serve,
+            commands::open_tailscale_login,
             set_undo_menu,
         ])
         .build(tauri::generate_context!())

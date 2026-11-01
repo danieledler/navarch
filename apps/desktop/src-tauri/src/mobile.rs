@@ -233,7 +233,7 @@ impl Mobile {
         (self.emit)(SNAPSHOT_CHANGED)
     }
 
-    fn notify(&self) {
+    pub fn notify(&self) {
         (self.emit)(MOBILE_CHANGED)
     }
 
@@ -379,6 +379,29 @@ pub async fn set_access<C: Ctx>(ctx: C, enabled: bool, public_url: String) -> Re
         let _ = tokio::time::timeout(STOP_WAIT, task).await;
     }
     Ok(st.mobile.access())
+}
+
+/// At launch: starts the server if phone access is on. An update's relaunch can overlap the old app, which
+/// holds the port for a moment, so a taken port is retried for a few seconds (blocking: call it off the
+/// async runtime). Returns whether the server runs.
+pub fn start_if_enabled<C: Ctx>(ctx: C, retries: u32) -> bool {
+    let m = &ctx.as_ref().mobile;
+    for i in 0..=retries {
+        if !m.enabled() {
+            return false;
+        }
+        if i > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        start(ctx.clone());
+        if m.server.lock().unwrap().running {
+            if i > 0 {
+                m.notify();
+            }
+            return true;
+        }
+    }
+    false
 }
 
 /// Starts the server unless it runs. A port that's taken shows up as `error`, never a panic.

@@ -171,6 +171,22 @@ export interface Tailscale {
   dnsName: string | null; // MagicDNS name, e.g. "mac.tail1234.ts.net"; null while logged out
 }
 
+/** Where Tailscale Serve sends https://<this Mac>/: nothing, this build's phone server, another Navarch build's, or anything else. */
+export type ServeRoute = "none" | "ours" | "navarch" | "other";
+
+/** Tailscale Serve against this build's phone port, from `tailscale serve status --json`. */
+export interface TailscaleServe {
+  cli: boolean; // the Tailscale CLI answered
+  running: boolean; // connected to the tailnet
+  dnsName: string | null; // e.g. "mac.tail1234.ts.net"
+  route: ServeRoute | null; // null without the CLI, while disconnected, or when serve status can't be read
+  target: string | null; // the route's target as Tailscale shows it, e.g. "http://127.0.0.1:47820"
+  auto: boolean; // the installed app points Serve at itself when phone access is on; dev builds only on request
+  loginUrl: string | null; // Serve needs HTTPS enabled for the tailnet: this login.tailscale.com page does it
+  changed: string | null; // what this call changed, for a toast
+  error: string | null;
+}
+
 /** A single-use code the phone trades for its token at POST /api/pair. */
 export interface PairingCode {
   code: string; // 6 characters, no 0/O/1/I/L

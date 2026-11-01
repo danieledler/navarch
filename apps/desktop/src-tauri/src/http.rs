@@ -355,6 +355,11 @@ mod tests {
         let setting = json!({ "enabled": true, "publicUrl": format!("https://{HOST}") });
         db::set_setting(&c, mobile::SETTING_KEY, &setting.to_string()).unwrap();
         db::set_setting(&c, "mobile_token", TOKEN).unwrap();
+        state_on(c, port, usage)
+    }
+
+    /// The app state over a database, as the app's setup builds it.
+    fn state_on(c: rusqlite::Connection, port: u16, usage: UsageCache) -> T {
         let (changes, mobile_changes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let (n, m) = (changes.clone(), mobile_changes.clone());
         let mobile = mobile::Mobile::new(&c, port, Box::new(move |event| {
@@ -506,6 +511,48 @@ mod tests {
         assert_eq!(t.call("create_task", json!({ "title": "no project" })).0, 400);
         assert_eq!(t.call("get_limit_alerts", json!({})).0, 200);
         assert_eq!(t.changes.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn phone_access_stays_on_across_restarts() {
+        let path = std::env::temp_dir().join(format!("navarch-restart-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let open = || state_on(db::open(&path).unwrap(), 0, UsageCache::new(None));
+        let url = "https://mac.tail1234.ts.net";
+        let before = open();
+        assert!(!before.st.mobile.enabled());
+        let a = tauri::async_runtime::block_on(mobile::set_access(before.st.clone(), true, url.into())).unwrap();
+        assert!(a.enabled && a.running, "{a:?}");
+        let token = db::get_setting(&before.st.db.lock().unwrap(), "mobile_token").unwrap().unwrap();
+
+        // Relaunch (an update does the same): a fresh state from the same file.
+        let after = open();
+        let m = &after.st.mobile;
+        assert!(m.enabled());
+        assert_eq!(m.access().public_url, url);
+        assert!(m.authorize(Some(&format!("Bearer {token}"))), "same token");
+        assert!(!m.access().running);
+        assert!(mobile::start_if_enabled(after.st.clone(), 0), "setup starts the server");
+        assert!(m.access().running);
+        drop((before, after));
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    #[test]
+    fn launch_retries_a_port_the_old_app_still_holds() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let t = setup_on(port, UsageCache::new(None));
+        assert!(!mobile::start_if_enabled(t.st.clone(), 1));
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(taken);
+        });
+        assert!(mobile::start_if_enabled(t.st.clone(), 8), "{:?}", t.st.mobile.access());
+        release.join().unwrap();
+        assert!(t.mobile_changes.load(Ordering::SeqCst) > 0, "the UI hears it started");
     }
 
     #[test]

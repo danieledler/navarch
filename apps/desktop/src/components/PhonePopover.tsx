@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Smartphone } from "lucide-react";
-import { api, type MobileAccess, type PairingCode, type Tailscale } from "../api";
+import { api, type MobileAccess, type PairingCode, type TailscaleServe } from "../api";
 import { useStore } from "../store";
 import { relTime } from "../lib/format";
 import { Popover } from "./ui";
+import { QrCode } from "./QrCode";
 
 /** The status-bar button's look: green while serving, red on an error, muted when off. */
 export function PhoneIcon({ access }: { access: MobileAccess | null }) {
@@ -23,6 +24,16 @@ function urlHost(url: string): string {
   return url.trim().replace(/^[^:/?#]*:\/\//, "").split(/[/?#]/)[0].replace(/^.*@/, "").replace(/:\d*$/, "").replace(/\.+$/, "").toLowerCase();
 }
 
+/** The address for the QR code: the public URL, with https:// if it was typed without a scheme. Never a token. */
+function phoneUrl(url: string): string {
+  const u = url.trim();
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(u) ? u : `https://${u}`;
+}
+
+const noServe = (error: string | null): TailscaleServe => ({
+  cli: false, running: false, dnsName: null, route: null, target: null, auto: false, loginUrl: null, changed: null, error,
+});
+
 /** Phone companion: serve the phone API on a local port that tailscale serve or a Cloudflare tunnel exposes, and pair phones. */
 export function PhonePopover({
   anchor, onClose, access, onChange,
@@ -37,13 +48,15 @@ export function PhonePopover({
   const [url, setUrl] = useState(access?.publicUrl ?? "");
   const [code, setCode] = useState<PairingCode | null>(null);
   const [now, setNow] = useState(Date.now());
-  // This Mac's Tailscale name, asked once per opening (the CLI can take a moment); null without Tailscale.
-  const tailscale = useRef<Promise<Tailscale | null>>(null);
-  tailscale.current ??= api.detectTailscale().catch(() => null);
-  const [ts, setTs] = useState<Tailscale | null>(null);
+  // Tailscale Serve and this Mac's Tailscale name, asked once per opening (the CLI can take a moment).
+  const tailscale = useRef<Promise<TailscaleServe>>(null);
+  tailscale.current ??= api.tailscaleServeStatus().catch((e) => noServe(String(e)));
+  const [serve, setServe] = useState<TailscaleServe | null>(null);
+  const [serveBusy, setServeBusy] = useState(false);
   useEffect(() => {
-    tailscale.current?.then(setTs);
+    tailscale.current?.then(setServe);
   }, []);
+  const ts = serve?.cli ? serve : null;
   // Read by the event listener below, which outlives a render.
   const shown = useRef({ code, pairedAt: access?.pairedAt ?? null });
   shown.current = { code, pairedAt: access?.pairedAt ?? null };
@@ -72,7 +85,8 @@ export function PhonePopover({
   if (!access) return null;
   const a = access;
 
-  const apply = async (enabled: boolean, publicUrl: string, done: (n: MobileAccess) => string) => {
+  // enabled null keeps it as the backend has it: only the switch turns access on or off, never a stale view.
+  const apply = async (enabled: boolean | null, publicUrl: string, done: (n: MobileAccess) => string) => {
     setBusy(true);
     try {
       const n = await api.setMobileAccess(enabled, publicUrl);
@@ -81,12 +95,32 @@ export function PhonePopover({
       if (!n.enabled) setCode(null);
       if (n.enabled && n.error) toast(`Phone access: ${n.error}`, undefined, "error");
       else toast(done(n));
+      return n;
     } catch (e) {
       toast(String(e), undefined, "error");
       setUrl(a.publicUrl);
+      return null;
     } finally {
       setBusy(false);
     }
+  };
+  const runServe = async (on: boolean, replace: boolean) => {
+    setServeBusy(true);
+    try {
+      const s = await api.tailscaleServe(on, replace);
+      setServe(s);
+      if (s.loginUrl) toast("Tailscale Serve needs HTTPS for your tailnet: Enable HTTPS in the phone popover, then try again", undefined, "error");
+      else if (s.error) toast(`Tailscale: ${s.error}`, undefined, "error");
+      else if (s.changed) toast(s.changed);
+    } catch (e) {
+      toast(String(e), undefined, "error");
+    } finally {
+      setServeBusy(false);
+    }
+  };
+  const pointHere = async () => {
+    if (serve?.route === "other" && !(await api.confirm(`Tailscale serves ${serve.target ?? "something else"} at https://${serve.dnsName ?? "this Mac"}/. Replace it with Navarch's phone server?`))) return;
+    runServe(true, true);
   };
   const toggle = async () => {
     // Busy before the Tailscale wait, so a second click can't send a second enable.
@@ -96,20 +130,23 @@ export function PhonePopover({
     const name = t?.dnsName;
     const publicUrl = name ? `https://${name}` : url.trim();
     if (name) setUrl(publicUrl);
-    apply(!a.enabled, publicUrl, (n) =>
+    const n = await apply(!a.enabled, publicUrl, (n) =>
       !n.enabled
         ? "Phone access off"
         : `Phone access on: serving 127.0.0.1:${n.port}` +
           (name ? ` at https://${name}` + (t?.running ? "" : " (Tailscale isn't connected)") : ""),
     );
+    // The installed app points Tailscale Serve at itself, and lets go of it when switched off (only if it's ours).
+    const s = await tailscale.current;
+    if (n && n.enabled !== a.enabled && s?.auto && s.running) await runServe(n.enabled, false);
   };
   const applyTailscale = (name: string) => {
     setUrl(`https://${name}`);
-    apply(a.enabled, `https://${name}`, (n) => `Phone URL set to ${n.publicUrl}`);
+    apply(null, `https://${name}`, (n) => `Phone URL set to ${n.publicUrl}`);
   };
   const suggest = ts?.dnsName && urlHost(url) !== ts.dnsName ? ts.dnsName : null;
   const saveUrl = () => {
-    if (url.trim() !== a.publicUrl) apply(a.enabled, url.trim(), (n) => (n.publicUrl ? `Phone URL set to ${n.publicUrl}` : "Phone URL cleared"));
+    if (url.trim() !== a.publicUrl) apply(null, url.trim(), (n) => (n.publicUrl ? `Phone URL set to ${n.publicUrl}` : "Phone URL cleared"));
   };
   const pair = async () => {
     try {
@@ -143,6 +180,49 @@ export function PhonePopover({
   ) : (
     <span className="muted">Starting…</span>
   );
+
+  const name = serve?.dnsName ? `https://${serve.dnsName}` : "This Mac";
+  const point = (label: string) => (
+    <button type="button" className="link" disabled={serveBusy || busy} onClick={pointHere}>
+      {serveBusy ? "Pointing Tailscale here…" : label}
+    </button>
+  );
+  const tailscaleLine = !serve ? (
+    <span className="muted">Checking…</span>
+  ) : !serve.cli ? (
+    <span className="muted">not installed</span>
+  ) : !serve.running ? (
+    <span className="muted">not connected</span>
+  ) : serve.loginUrl ? (
+    <>
+      <button type="button" className="link" onClick={() => api.openTailscaleLogin(serve.loginUrl!).catch((e) => toast(String(e), undefined, "error"))}>
+        Enable HTTPS for your tailnet
+      </button>
+      <span className="muted">, then </span>
+      {point("try again")}
+    </>
+  ) : serve.error || !serve.route ? (
+    <span className="ph-error">{serve.error ?? "Can't read tailscale serve status"}</span>
+  ) : serve.route === "ours" ? (
+    <span><span className="ph-on">{name}</span> → this Mac</span>
+  ) : serve.route === "navarch" ? (
+    <>
+      <span>{name} → another Navarch build</span>
+      {a.enabled && point("Point Tailscale here")}
+    </>
+  ) : serve.route === "other" ? (
+    <>
+      <span title={serve.target ?? undefined}>serves something else at /</span>
+      {a.enabled && point("Replace")}
+    </>
+  ) : (
+    <>
+      <span className="muted">not set up</span>
+      {a.enabled && point("Point Tailscale here")}
+    </>
+  );
+  // Dev builds point Serve here only on request, and the installed app takes it back.
+  const devNote = serve && !serve.auto && serve.running && serve.route && serve.route !== "other" && (a.enabled || serve.route === "ours");
 
   return (
     <Popover anchor={anchor} anchorIsTrigger onClose={onClose} side="top" align="end" className="phone-pop">
@@ -181,9 +261,25 @@ export function PhonePopover({
           Use {suggest}
         </button>
       )}
-      <p className="hint ph-setup">
-        Expose it with <code>tailscale serve --bg {a.port}</code>, or point a Cloudflare tunnel at <code>http://localhost:{a.port}</code>
-      </p>
+      <div className="ph-ts">
+        <span className="pace-label">Tailscale</span> {tailscaleLine}
+      </div>
+      {devNote && <p className="hint ph-setup">This is a dev build: the installed app takes the address back when it next starts with Phone access on.</p>}
+      {serve && !serve.cli ? (
+        <p className="hint ph-setup">
+          Expose it with <code>tailscale serve --bg {a.port}</code>, or point a Cloudflare tunnel at <code>http://localhost:{a.port}</code>
+        </p>
+      ) : (
+        <p className="hint ph-setup">
+          Or point a Cloudflare tunnel at <code>http://localhost:{a.port}</code>
+        </p>
+      )}
+      {a.enabled && a.publicUrl && (
+        <div className="ph-qr">
+          <QrCode value={phoneUrl(a.publicUrl)} label={`QR code for ${phoneUrl(a.publicUrl)}`} />
+          <p className="hint">Scan with your iPhone camera, then Share › Add to Home Screen</p>
+        </div>
+      )}
       {code && left > 0 ? (
         <div className="ph-code">
           <div className="ph-code-value" aria-label="Pairing code">{code.code}</div>

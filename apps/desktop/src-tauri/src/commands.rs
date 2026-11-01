@@ -292,8 +292,11 @@ pub async fn get_mobile_access(state: S<'_>) -> Res<MobileAccess> {
 
 /// Turns phone access on or off and sets the URL the phone uses (its host passes the Host check).
 #[tauri::command]
-pub async fn set_mobile_access(app: tauri::AppHandle, enabled: bool, public_url: String) -> Res<MobileAccess> {
-    mobile::set_access(crate::AppRef(app), enabled, public_url).await
+/// `enabled: null` keeps it as it is, so saving the URL can't turn access off from a stale view.
+pub async fn set_mobile_access(app: tauri::AppHandle, enabled: Option<bool>, public_url: String) -> Res<MobileAccess> {
+    let ctx = crate::AppRef(app);
+    let enabled = enabled.unwrap_or_else(|| ctx.as_ref().mobile.enabled());
+    mobile::set_access(ctx, enabled, public_url).await
 }
 
 #[tauri::command]
@@ -310,6 +313,33 @@ pub async fn reset_mobile_token(state: S<'_>) -> Res<MobileAccess> {
 #[tauri::command]
 pub async fn detect_tailscale() -> Res<Option<crate::tailscale::Tailscale>> {
     tauri::async_runtime::spawn_blocking(crate::tailscale::detect).await.map_err(db::err)
+}
+
+/// Where Tailscale Serve sends this Mac's https address, against this build's phone port.
+#[tauri::command]
+pub async fn tailscale_serve_status(state: S<'_>) -> Res<crate::tailscale::Serve> {
+    let port = state.mobile.port;
+    let auto = crate::dev_name().is_none();
+    tauri::async_runtime::spawn_blocking(move || crate::tailscale::serve_status(port, auto)).await.map_err(db::err)
+}
+
+/// Points Tailscale Serve's https://<this Mac>/ at this build's phone server (`on`), taking it from something
+/// else only with `replace`; or removes it if it is ours. Takes up to ~15 s.
+#[tauri::command]
+pub async fn tailscale_serve(state: S<'_>, on: bool, replace: bool) -> Res<crate::tailscale::Serve> {
+    let port = state.mobile.port;
+    let auto = crate::dev_name().is_none();
+    tauri::async_runtime::spawn_blocking(move || crate::tailscale::serve(port, auto, on, replace)).await.map_err(db::err)
+}
+
+/// Opens Tailscale's page for enabling HTTPS on the tailnet, a link `tailscale serve` printed.
+#[tauri::command]
+pub async fn open_tailscale_login(url: String) -> Res<()> {
+    let ok = url.starts_with("https://login.tailscale.com/") && url.chars().all(|c| c.is_ascii_graphic());
+    if !ok {
+        return Err("Not a Tailscale login link".into());
+    }
+    run_open(&[&url])
 }
 
 #[cfg(test)]

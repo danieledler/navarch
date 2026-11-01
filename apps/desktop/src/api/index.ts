@@ -1,4 +1,4 @@
-import type { BuildInfo, CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Tailscale, Period, Project, Session, Snapshot, Space, SystemStats, Task, TaskPatch, Usage } from "./types";
+import type { BuildInfo, CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Tailscale, TailscaleServe, Period, Project, Session, Snapshot, Space, SystemStats, Task, TaskPatch, Usage } from "./types";
 import { mockApi } from "./mock";
 
 export * from "./types";
@@ -43,13 +43,19 @@ export interface Api {
   onMobileChanged(cb: () => void): () => void;
   getMobileAccess(): Promise<MobileAccess>;
   /** Starts or stops the phone API on 127.0.0.1 and saves the setting; the first enable creates the token. */
-  setMobileAccess(enabled: boolean, publicUrl: string): Promise<MobileAccess>;
+  setMobileAccess(enabled: boolean | null, publicUrl: string): Promise<MobileAccess>;
   /** A single-use code, valid 10 minutes, that a phone trades for the token. Fails while access is off. */
   newPairingCode(): Promise<PairingCode>;
   /** A new token: every paired phone has to pair again. */
   resetMobileToken(): Promise<MobileAccess>;
   /** This Mac's Tailscale name, for the public URL; null when the Tailscale CLI isn't installed. Takes up to 2 s. */
   detectTailscale(): Promise<Tailscale | null>;
+  /** Where Tailscale Serve sends https://<this Mac>/, against this build's phone port. Takes a few seconds. */
+  tailscaleServeStatus(): Promise<TailscaleServe>;
+  /** Points https://<this Mac>/ at this build's phone server (takes another target only with replace), or removes it if ours. Up to ~15 s. */
+  tailscaleServe(on: boolean, replace: boolean): Promise<TailscaleServe>;
+  /** Opens a login.tailscale.com link `tailscale serve` printed, to enable HTTPS for the tailnet. */
+  openTailscaleLogin(url: string): Promise<void>;
   /** Edit › Undo or ⌘Z. The app's menu item owns ⌘Z, so the webview never sees the keystroke. */
   onUndoRequest(cb: () => void): void;
   /** Name what Edit › Undo will undo ("Undo Link “x”"), or grey it out. */
@@ -131,6 +137,9 @@ function tauriApi(): Api {
     newPairingCode: () => call("new_pairing_code"),
     resetMobileToken: () => call("reset_mobile_token"),
     detectTailscale: () => call("detect_tailscale"),
+    tailscaleServeStatus: () => call("tailscale_serve_status"),
+    tailscaleServe: (on, replace) => call("tailscale_serve", { on, replace }),
+    openTailscaleLogin: (url) => call("open_tailscale_login", { url }),
     onUndoRequest: (cb) => {
       event.then((e) => e.listen("menu-undo", cb));
     },

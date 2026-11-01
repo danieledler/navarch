@@ -671,3 +671,9 @@ kbd {
   .app { grid-template-columns: 68px 230px minmax(380px, 1fr) 260px; }
   .row-total { width: 80px; }
 }
+.ph-ts { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 6px; font-size: 12px; color: var(--text-2); margin-top: -4px; }
+.ph-ts .pace-label { margin: 0; }
+.ph-ts .link { font-size: 12px; }
+.ph-qr { display: flex; align-items: center; gap: 12px; }
+.ph-qr .qr { flex: none; border-radius: 6px; }
+.ph-qr .hint { margin: 0; }
