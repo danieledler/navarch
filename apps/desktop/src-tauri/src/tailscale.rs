@@ -47,11 +47,15 @@ struct Output {
 /// Runs `cli args` with a timeout, never through a shell. `stop` sees stdout + stderr so far and can end
 /// the run early (it is then killed). Errs if the CLI can't start (not installed there).
 fn exec(cli: &str, args: &[&str], timeout: Duration, stop: impl Fn(&str) -> bool) -> std::io::Result<Output> {
+    use std::os::unix::process::CommandExt;
+    // Its own process group, so a kill also ends what a wrapper script started: /usr/local/bin/tailscale is
+    // a `#!/bin/sh` that runs the app's binary without `exec`, and that binary would hold the pipes open.
     let mut child = Command::new(cli)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()?;
     // Read on threads: the peer list can outgrow the pipe buffer, which would stall the child.
     let pump = |mut r: Box<dyn Read + Send>, buf: Arc<Mutex<String>>| {
@@ -75,14 +79,19 @@ fn exec(cli: &str, args: &[&str], timeout: Duration, stop: impl Fn(&str) -> bool
                 std::thread::sleep(Duration::from_millis(20))
             }
             _ => {
+                // SAFETY: plain syscall; the group is the child's (process_group(0) made its pid the pgid).
+                unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
             }
         }
     };
-    for r in readers {
-        let _ = r.join();
+    // After a kill, something outside the group (a daemonized grandchild) may still hold a pipe: wait briefly,
+    // then take what the buffers hold rather than block on it.
+    let deadline = Instant::now() + Duration::from_millis(if status.is_some() { 2000 } else { 300 });
+    while readers.iter().any(|r| !r.is_finished()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
     }
     let take = |b: Arc<Mutex<String>>| std::mem::take(&mut *b.lock().unwrap());
     Ok(Output { status, out: take(out), err: take(err) })
@@ -126,31 +135,52 @@ fn local_port(proxy: &str) -> Option<u16> {
     (path.is_empty() && matches!(host, "127.0.0.1" | "localhost")).then(|| port.parse().ok()).flatten()
 }
 
+/// A serve config (the top level or a foreground session's) that uses port 443.
+fn uses_443(c: &Value) -> bool {
+    c.pointer("/TCP/443").is_some() || c.get("Web").and_then(Value::as_object).is_some_and(|w| w.keys().any(|k| k.ends_with(":443")))
+}
+
 /// Reads `tailscale serve status --json`: where 443 `/` goes (for `port`, this build's), and its target as
-/// Tailscale shows it. `None` if it isn't a serve config.
+/// Tailscale shows it. `None` if it isn't a serve config. Funnel on 443 (any path) and a foreground
+/// `tailscale serve` on 443 read as `Other`, so Navarch only changes them on an explicit Replace.
 pub fn parse_serve(json: &str, port: u16) -> Option<(Route, Option<String>)> {
     let json = json.trim();
     if json.is_empty() || json == "null" {
         return Some((Route::None, None));
     }
     let v: Value = serde_json::from_str(json).ok()?;
-    let v = v.as_object()?;
+    if v.get("Foreground").and_then(Value::as_object).is_some_and(|f| f.values().any(uses_443)) {
+        return Some((Route::Other, Some("a foreground tailscale serve".into())));
+    }
+    let funnel = v
+        .get("AllowFunnel")
+        .and_then(Value::as_object)
+        .is_some_and(|f| f.iter().any(|(k, on)| k.ends_with(":443") && on.as_bool() == Some(true)));
+    let (route, target) = parse_root(v.as_object()?, port);
+    if funnel {
+        let what = target.unwrap_or_else(|| "other paths".into());
+        return Some((Route::Other, Some(format!("{what} through Funnel, open to the internet"))));
+    }
+    Some((route, target))
+}
+
+fn parse_root(v: &serde_json::Map<String, Value>, port: u16) -> (Route, Option<String>) {
     if let Some(fwd) = v.get("TCP").and_then(|t| t.get("443")).and_then(|p| p.get("TCPForward")) {
-        return Some((Route::Other, Some(format!("TCP to {}", fwd.as_str().unwrap_or("?")))));
+        return (Route::Other, Some(format!("TCP to {}", fwd.as_str().unwrap_or("?"))));
     }
     let web = v.get("Web").and_then(Value::as_object);
     let root = web.into_iter().flatten().filter(|(k, _)| k.ends_with(":443")).find_map(|(_, s)| s.get("Handlers")?.get("/"));
-    let Some(h) = root else { return Some((Route::None, None)) };
+    let Some(h) = root else { return (Route::None, None) };
     let Some(proxy) = h.get("Proxy").and_then(Value::as_str) else {
         let what = if h.get("Path").is_some() { "a file or folder" } else { "text" };
-        return Some((Route::Other, Some(what.into())));
+        return (Route::Other, Some(what.into()));
     };
     let route = match local_port(proxy) {
         Some(p) if p == port => Route::Ours,
         Some(p) if p == crate::mobile::PORT || p == crate::mobile::DEV_PORT => Route::Navarch,
         _ => Route::Other,
     };
-    Some((route, Some(proxy.to_string())))
+    (route, Some(proxy.to_string()))
 }
 
 /// The `https://login.tailscale.com/...` link the first `serve` prints on a tailnet without HTTPS.
@@ -285,6 +315,12 @@ mod tests {
         assert_eq!(login_url(&o.out).as_deref(), Some("https://login.tailscale.com/f/serve?node=abc"));
         let o = exec("/bin/sh", &["-c", "sleep 5"], Duration::from_millis(100), |_| false).unwrap();
         assert!(o.status.is_none());
+        // A wrapper that runs the real CLI without `exec` (as /usr/local/bin/tailscale does): the kill must
+        // reach the grandchild too, or its open pipes would hold the run up past the timeout.
+        let t = Instant::now();
+        let o = exec("/bin/sh", &["-c", "sleep 5; true"], Duration::from_millis(100), |_| false).unwrap();
+        assert!(o.status.is_none());
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
         let o = exec("/bin/sh", &["-c", "echo out; echo err >&2; exit 3"], TIMEOUT, |_| false).unwrap();
         assert_eq!((o.status.and_then(|s| s.code()), o.out.as_str(), first_line(&o).as_str()), (Some(3), "out\n", "err"));
     }
@@ -312,6 +348,20 @@ mod tests {
         // Other paths or ports leave / on 443 free.
         let elsewhere = r#"{"Web":{"mac.tail1234.ts.net:443":{"Handlers":{"/grafana":{"Proxy":"http://127.0.0.1:3000"}}},"mac.tail1234.ts.net:8443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3000"}}}}}"#;
         assert_eq!(parse_serve(elsewhere, PORT), Some((Route::None, None)));
+        // Funnel on 443, at / or on another path, and a foreground serve on 443 are never taken over unasked.
+        let funneled = r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"mac.tail1234.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:47820"}}}},"AllowFunnel":{"mac.tail1234.ts.net:443":true}}"#;
+        assert_eq!(
+            parse_serve(funneled, PORT),
+            Some((Route::Other, Some("http://127.0.0.1:47820 through Funnel, open to the internet".into())))
+        );
+        let funneled_elsewhere = r#"{"Web":{"mac.tail1234.ts.net:443":{"Handlers":{"/blog":{"Path":"/srv/blog"}}}},"AllowFunnel":{"mac.tail1234.ts.net:443":true}}"#;
+        assert_eq!(parse_serve(funneled_elsewhere, PORT).unwrap().0, Route::Other);
+        let funnel_off = r#"{"Web":{"mac.tail1234.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:47820"}}}},"AllowFunnel":{"mac.tail1234.ts.net:443":false,"mac.tail1234.ts.net:8443":true}}"#;
+        assert_eq!(parse_serve(funnel_off, PORT).unwrap().0, Route::Ours);
+        let foreground = r#"{"Foreground":{"abc123":{"TCP":{"443":{"HTTPS":true}},"Web":{"mac.tail1234.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3000"}}}}}}}"#;
+        assert_eq!(parse_serve(foreground, PORT), Some((Route::Other, Some("a foreground tailscale serve".into()))));
+        let foreground_8443 = r#"{"Foreground":{"abc123":{"TCP":{"8443":{"HTTPS":true}}}}}"#;
+        assert_eq!(parse_serve(foreground_8443, PORT), Some((Route::None, None)));
         for none in ["", "{}", "null", "\n"] {
             assert_eq!(parse_serve(none, PORT), Some((Route::None, None)), "{none:?}");
         }

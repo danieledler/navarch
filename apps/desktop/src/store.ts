@@ -131,6 +131,7 @@ export const useStore = create<State>((set, get) => ({
       get().toast(`Usage limit close (${summary}): told running sessions to save their work and schedule their resume`);
       get().refreshUsage(false);
     });
+    api.onPhoneServe((message, error) => get().toast(`Phone access: ${message}`, undefined, error ? "error" : undefined));
     // In a text field, undo means the field's own text history.
     api.onUndoRequest(() => {
       if (inTextField()) document.execCommand("undo");

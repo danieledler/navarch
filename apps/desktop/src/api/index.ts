@@ -36,6 +36,8 @@ export interface Api {
   setLimitThresholds(fiveHour: number, sevenDay: number): Promise<LimitAlerts>;
   /** A usage-limit alert went out to running sessions; the payload is its summary. */
   onLimitAlert(cb: (summary: string) => void): void;
+  /** The installed app's launch-time Tailscale Serve change or failure. */
+  onPhoneServe(cb: (message: string, error: boolean) => void): void;
   onSessions(cb: (s: Session[]) => void): () => void;
   /** A paired phone changed tasks over the phone API: reload the snapshot. Returns the unsubscribe. */
   onSnapshotChanged(cb: () => void): () => void;
@@ -117,6 +119,9 @@ function tauriApi(): Api {
     setLimitThresholds: (fiveHour, sevenDay) => call("set_limit_thresholds", { thresholds: { fiveHour, sevenDay } }),
     onLimitAlert: (cb) => {
       event.then((e) => e.listen<string>("limit-alert", (ev) => cb(ev.payload)));
+    },
+    onPhoneServe: (cb) => {
+      event.then((e) => e.listen<{ message: string; error: boolean }>("phone-serve", (ev) => cb(ev.payload.message, ev.payload.error)));
     },
     onSessions: (cb) => {
       let un: (() => void) | undefined;

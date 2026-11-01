@@ -229,9 +229,13 @@ pub fn run() {
                 std::thread::spawn(move || {
                     if mobile::start_if_enabled(app.clone(), 10) && dev_name().is_none() {
                         // The installed app takes https://<this Mac>/ back from a dev build, or sets it up.
+                        // Told to the UI as a toast: from Finder, stderr goes nowhere. (Not MOBILE_CHANGED, which
+                        // would end a pairing code on screen; the popover reads Serve each time it opens.)
                         let s = tailscale::serve(port, true, true, false);
+                        let error = s.error.is_some();
                         if let Some(msg) = s.changed.or(s.error) {
                             eprintln!("phone access: {msg}");
+                            let _ = app.0.emit("phone-serve", serde_json::json!({ "message": msg, "error": error }));
                         }
                     }
                 });

@@ -229,6 +229,7 @@ export function mockApi(): Api {
     getLimitAlerts: async () => limitAlerts,
     setLimitThresholds: async (fiveHour, sevenDay) => (limitAlerts = { ...limitAlerts, fiveHour, sevenDay }),
     onLimitAlert: () => {},
+    onPhoneServe: () => {},
     getUsage: async (): Promise<Usage> => {
       // ?usage=hot shows over-pace tones, ?usage=zero a fresh window, ?usage=error the unavailable state,
       // ?usage=stale the last good numbers after a 429.

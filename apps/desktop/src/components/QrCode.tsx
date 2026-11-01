@@ -22,9 +22,11 @@ export function QrCode({ value, size = 136, label }: { value: string; size?: num
     return { n, d };
   }, [value]);
   const full = n + 2 * QUIET;
+  // A whole number of CSS px per module, near `size`, so crispEdges doesn't make modules uneven.
+  const px = Math.max(2, Math.round(size / full)) * full;
   return (
     <svg
-      className="qr" role="img" aria-label={label} width={size} height={size}
+      className="qr" role="img" aria-label={label} width={px} height={px}
       viewBox={`0 0 ${full} ${full}`} shapeRendering="crispEdges"
     >
       <rect width={full} height={full} fill="#fff" />

@@ -212,7 +212,9 @@ export function PhonePopover({
     </>
   ) : serve.route === "other" ? (
     <>
-      <span title={serve.target ?? undefined}>serves something else at /</span>
+      <span title={serve.target ?? undefined}>
+        {serve.target?.endsWith("open to the internet") ? "is public through Tailscale Funnel" : "serves something else at /"}
+      </span>
       {a.enabled && point("Replace")}
     </>
   ) : (
@@ -264,7 +266,13 @@ export function PhonePopover({
       <div className="ph-ts">
         <span className="pace-label">Tailscale</span> {tailscaleLine}
       </div>
-      {devNote && <p className="hint ph-setup">This is a dev build: the installed app takes the address back when it next starts with Phone access on.</p>}
+      {devNote && (
+        <p className="hint ph-setup">
+          {a.port === 47821
+            ? "This is a dev build: the installed app takes the address back when it next starts with Phone access on."
+            : `This dev build uses port ${a.port}, which the installed app doesn't know as Navarch's: it takes the address back only with Replace.`}
+        </p>
+      )}
       {serve && !serve.cli ? (
         <p className="hint ph-setup">
           Expose it with <code>tailscale serve --bg {a.port}</code>, or point a Cloudflare tunnel at <code>http://localhost:{a.port}</code>
