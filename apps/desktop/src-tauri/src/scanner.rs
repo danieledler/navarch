@@ -81,14 +81,16 @@ pub struct FileState {
     /// "user" | "assistant" | "interrupt" | ""
     pub last_kind: String,
     pub last_stop: String,
-    pub last_tool: String,
+    /// tool_use id of an AskUserQuestion/ExitPlanMode call still waiting for its result. Other
+    /// tool calls in the same message can finish first, so the last line alone doesn't show it.
+    pub asking: Option<String>,
     pub lp: Option<String>,
     pub last_user_prompt: Option<String>,
     /// Claude's latest text block since the last prompt (main transcript only).
     pub last_reply: Option<String>,
-    /// False for states saved before `last_reply` existed; `parse_file` fills it in once.
+    /// False for states saved before `last_reply` and `asking` existed; `parse_file` fills them in once.
     #[serde(default)]
-    pub reply_checked: bool,
+    pub tail_checked: bool,
     pub first_prompt: Option<String>,
     pub tokens: i64,
     pub cache_read: i64,
@@ -145,8 +147,10 @@ enum Content {
 struct Block {
     #[serde(rename = "type")]
     kind: Option<String>,
+    id: Option<String>,
     name: Option<String>,
     text: Option<String>,
+    tool_use_id: Option<String>,
 }
 
 fn parse_ts(s: &str) -> Option<i64> {
@@ -210,6 +214,7 @@ pub fn parse_chunk(st: &mut FileState, data: &[u8], is_sub: bool) -> usize {
                         }
                         st.last_user_prompt = Some(truncate_chars(&s, FIRST_PROMPT_MAX));
                         st.last_reply = None;
+                        st.asking = None;
                         st.last_kind = "user".into();
                     }
                     Some(Content::Blocks(b)) => {
@@ -221,12 +226,15 @@ pub fn parse_chunk(st: &mut FileState, data: &[u8], is_sub: bool) -> usize {
                         if prompt {
                             st.last_reply = None;
                         }
+                        let answered = b.iter().any(|b| b.tool_use_id.is_some() && b.tool_use_id == st.asking);
+                        if prompt || interrupted || answered {
+                            st.asking = None;
+                        }
                         st.last_kind = if interrupted { "interrupt" } else { "user" }.into();
                     }
                     None => continue,
                 }
                 st.last_stop.clear();
-                st.last_tool.clear();
                 add_active(st, ts);
             }
             "assistant" => {
@@ -250,18 +258,16 @@ pub fn parse_chunk(st: &mut FileState, data: &[u8], is_sub: bool) -> usize {
                     }
                     st.last_msg_id = id;
                     if !is_sub {
-                        st.last_tool.clear();
+                        st.asking = None; // a new message means any question was answered
                     }
                 }
                 if !is_sub {
                     if let Some(Content::Blocks(b)) = &msg.content {
-                        if let Some(name) = b
-                            .iter()
-                            .rev()
-                            .find(|b| b.kind.as_deref() == Some("tool_use"))
-                            .and_then(|b| b.name.clone())
-                        {
-                            st.last_tool = name;
+                        if let Some(ask) = b.iter().find(|b| {
+                            b.kind.as_deref() == Some("tool_use")
+                                && matches!(b.name.as_deref(), Some("AskUserQuestion" | "ExitPlanMode"))
+                        }) {
+                            st.asking = ask.id.clone();
                         }
                         if let Some(t) = b
                             .iter()
@@ -284,9 +290,9 @@ pub fn parse_chunk(st: &mut FileState, data: &[u8], is_sub: bool) -> usize {
     last_nl + 1
 }
 
-/// Claude's latest reply in the transcript before byte `end`, looking back at most 1 MB.
-/// Fills in `last_reply` for states saved before it existed, without reparsing whole files.
-fn reply_before(path: &Path, end: u64) -> Option<String> {
+/// The transcript's state from its last 1 MB before byte `end`. Fills in `last_reply` and
+/// `asking` for states saved before they existed, without reparsing whole files.
+fn tail_state(path: &Path, end: u64) -> Option<FileState> {
     let start = end.saturating_sub(1 << 20);
     let mut f = fs::File::open(path).ok()?;
     f.seek(SeekFrom::Start(start)).ok()?;
@@ -295,7 +301,7 @@ fn reply_before(path: &Path, end: u64) -> Option<String> {
     let from = if start == 0 { 0 } else { memchr::memchr(b'\n', &buf)? + 1 };
     let mut tmp = FileState::default();
     parse_chunk(&mut tmp, &buf[from..], false);
-    tmp.last_reply
+    Some(tmp)
 }
 
 fn add_active(st: &mut FileState, ts: Option<i64>) {
@@ -321,12 +327,14 @@ pub enum Turn {
 }
 
 pub fn turn_state(st: &FileState) -> Turn {
+    if st.asking.is_some() {
+        return Turn::Waiting;
+    }
     match st.last_kind.as_str() {
         "" => Turn::Empty,
         "interrupt" => Turn::Ended,
         "assistant" => match st.last_stop.as_str() {
             "end_turn" | "stop_sequence" => Turn::Ended,
-            "tool_use" if st.last_tool == "AskUserQuestion" || st.last_tool == "ExitPlanMode" => Turn::Waiting,
             _ => Turn::Mid,
         },
         _ => Turn::Mid,
@@ -512,17 +520,19 @@ impl Scanner {
         let Ok(md) = fs::metadata(path) else { return false };
         let len = md.len();
         let mut st = self.files.get(path).cloned().unwrap_or_default();
-        if len == st.offset && st.reply_checked {
+        if len == st.offset && st.tail_checked {
             return false;
         }
         if len < st.offset {
             st = FileState::default(); // file was rewritten: start over
         }
-        if !st.reply_checked {
+        if !st.tail_checked {
             if !is_sub && st.offset > 0 {
-                st.last_reply = reply_before(path, st.offset);
+                let tail = tail_state(path, st.offset).unwrap_or_default();
+                st.last_reply = tail.last_reply;
+                st.asking = tail.asking;
             }
-            st.reply_checked = true;
+            st.tail_checked = true;
         }
         if len > st.offset {
             let Ok(mut f) = fs::File::open(path) else { return false };
@@ -850,7 +860,7 @@ mod tests {
         let split = text.len();
         text += &line(serde_json::json!({"type":"assistant","timestamp":"2026-10-29T10:01:00Z",
             "message":{"id":"m2","usage":usage,"stop_reason":"tool_use",
-            "content":[{"type":"tool_use","name":"AskUserQuestion","input":{}}]}}));
+            "content":[{"type":"tool_use","id":"ask1","name":"AskUserQuestion","input":{}}]}}));
         text += &line(serde_json::json!({"type":"last-prompt","lastPrompt":"the last one","timestamp":"2026-10-29T10:01:00Z"}));
         // a gap > 5 min is not active time
         text += &line(serde_json::json!({"type":"user","timestamp":"2026-10-29T11:00:00Z",
@@ -900,11 +910,13 @@ mod tests {
         parse_chunk(&mut st4, &bytes[..line_end], false);
         assert_eq!(st4.last_reply, None);
 
-        // backfill for states saved before last_reply: found in the tail of the parsed part
+        // backfill for states saved before last_reply/asking: found in the tail of the parsed part
         let path = std::env::temp_dir().join(format!("navarch-reply-{}.jsonl", std::process::id()));
         fs::write(&path, &text).unwrap();
-        assert_eq!(reply_before(&path, line_start as u64).as_deref(), Some("hi"));
-        assert_eq!(reply_before(&path, bytes.len() as u64).as_deref(), Some("done"));
+        let tail = tail_state(&path, line_start as u64).unwrap();
+        assert_eq!((tail.last_reply.as_deref(), tail.asking.as_deref()), (Some("hi"), Some("ask1")));
+        let tail = tail_state(&path, bytes.len() as u64).unwrap();
+        assert_eq!((tail.last_reply.as_deref(), tail.asking), (Some("done"), None));
         let _ = fs::remove_file(&path);
         assert_eq!(derive_status(Turn::Waiting, true, None, None), "needs_input");
 
@@ -915,6 +927,34 @@ mod tests {
         assert_eq!(sub.days.values().map(|v| v[0]).sum::<i64>(), 0);
         assert!(sub.first_prompt.is_none());
         assert!(sub.last_reply.is_none());
+    }
+
+    #[test]
+    fn waits_on_a_question_asked_alongside_other_tools() {
+        let mut st = FileState::default();
+        let feed = |st: &mut FileState, v: serde_json::Value| {
+            parse_chunk(st, line(v).as_bytes(), false);
+            turn_state(st)
+        };
+        let result = |id: &str| serde_json::json!({"type":"user","timestamp":"2026-11-02T22:50:49Z",
+            "message":{"content":[{"type":"tool_result","tool_use_id":id,"content":"ok"}]}});
+        // AskUserQuestion and a plan update in one message: the plan update's result lands first
+        for (i, (id, name)) in [("ask1", "AskUserQuestion"), ("plan1", "mcp__ccd_turn__update_plan")].into_iter().enumerate() {
+            let turn = feed(&mut st, serde_json::json!({"type":"assistant","timestamp":"2026-11-02T22:50:47Z",
+                "message":{"id":"m1","stop_reason":"tool_use",
+                "content":[{"type":"tool_use","id":id,"name":name,"input":{}}]}}));
+            assert_eq!(turn, Turn::Waiting, "after block {i}");
+        }
+        assert_eq!(feed(&mut st, result("plan1")), Turn::Waiting);
+        assert_eq!(feed(&mut st, result("ask1")), Turn::Mid); // answered
+        // a plan approval the user interrupts
+        feed(&mut st, serde_json::json!({"type":"assistant","timestamp":"2026-11-02T22:51:00Z",
+            "message":{"id":"m2","stop_reason":"tool_use",
+            "content":[{"type":"tool_use","id":"exit1","name":"ExitPlanMode","input":{}}]}}));
+        assert_eq!(st.asking.as_deref(), Some("exit1"));
+        let turn = feed(&mut st, serde_json::json!({"type":"user","timestamp":"2026-11-02T22:52:00Z",
+            "message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}));
+        assert_eq!(turn, Turn::Ended);
     }
 
     #[test]
