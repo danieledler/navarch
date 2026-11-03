@@ -11,6 +11,7 @@ import { Goals, periodLeft } from "./Goals";
 import { Usage } from "./Usage";
 import { QuickAdd } from "./QuickAdd";
 import { Toasts } from "./Toasts";
+import { WidgetSetup } from "./WidgetSetup";
 
 type Tab = "waiting" | "week" | "goals" | "usage";
 const TAB_KEY = "navarch-phone-tab";
@@ -179,6 +180,7 @@ function SettingsSheet({ close }: { close: () => void }) {
           {isMock ? `${__PHONE_DEMO__ ? "Demo" : "Mock"} data: no Mac involved.` : `Paired with Navarch on your Mac${updatedAt ? `, last heard from ${ago(updatedAt, now)}` : ""}.`} To
           cut off every phone at once, reset the token under Phone access on the Mac.
         </p>
+        {!__PHONE_DEMO__ && <WidgetSetup />}
         <button
           type="button"
           className="btn-danger"

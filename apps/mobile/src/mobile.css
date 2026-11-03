@@ -338,6 +338,8 @@ a { color: var(--accent); }
 .sheet h2 { margin: 0 0 4px; font-size: 20px; }
 .sheet p { margin: 0 0 16px; color: var(--text-2); font-size: 15px; }
 .sheet .btn-plain { width: 100%; margin-top: 8px; }
+.btn-sheet { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 50px; width: 100%; border-radius: var(--radius); background: var(--panel); color: var(--accent); font-size: 17px; font-weight: 500; }
+.sheet-note { margin: 6px 4px 16px; color: var(--muted); font-size: 13px; }
 @keyframes rise { from { transform: translateY(100%); } }
 @keyframes fade { from { opacity: 0; } }
 
