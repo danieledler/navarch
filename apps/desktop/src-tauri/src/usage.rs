@@ -4,14 +4,19 @@
 //! Every Navarch process on the Mac (the installed app, dev windows) shares one cache file beside
 //! the database, so they make one request per interval between them. After a 429 nobody asks again
 //! until the backoff is over, and a failed request keeps the last good numbers, marked with the error.
+//!
+//! The keychain token lasts 8 hours, and only Claude Code renews it, when it makes a request of its own; the
+//! desktop app's Code tab never renews this copy. So when it has expired, Navarch has Claude Code make the
+//! smallest request it can (`renew`), at most every half hour, and asks again.
 
 use crate::db::now_ms;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const URL: &str = "https://api.anthropic.com/api/oauth/usage";
 pub const CACHE_FILE: &str = "usage-cache.json";
@@ -23,6 +28,9 @@ const BACKOFF_FIRST_MS: i64 = MAX_AGE_MS;
 const BACKOFF_MAX_MS: i64 = 30 * 60_000;
 /// Retry-After is honoured up to this, so a garbled value can't stop updates for good.
 const RETRY_AFTER_MAX_MS: i64 = 60 * 60_000;
+/// At most one renewal per this, so a Claude Code that can't renew (signed out) isn't run every 5 minutes.
+const RENEW_EVERY_MS: i64 = 30 * 60_000;
+const RENEW_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -52,11 +60,17 @@ struct Shared {
     retry_at: i64,
     /// 429s in a row, for the backoff.
     rate_limited: u32,
+    /// When some process last had Claude Code renew the token.
+    renewed_at: i64,
+    /// Why that renewal failed; cleared once a request works again.
+    renew_error: Option<String>,
 }
 
 enum Outcome {
     Usage(Option<UsageWindow>, Option<UsageWindow>),
     RateLimited(Option<i64>),
+    /// The token has expired (or was refused): time to renew it.
+    Expired,
     Failed(String),
 }
 
@@ -90,12 +104,25 @@ fn clock(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+fn expired_message(renew_error: Option<&str>) -> String {
+    match renew_error {
+        Some(e) => format!("Claude Code's sign-in expired and Navarch couldn't renew it ({e}). Run claude in Terminal to sign in again."),
+        None => "Claude Code's sign-in expired".into(),
+    }
+}
+
 /// The cache after a request made at `now`.
 fn record(prev: Shared, outcome: Outcome, now: i64) -> Shared {
     let failed = |error: String, retry_at, rate_limited| {
         let had_numbers = prev.usage.five_hour.is_some() || prev.usage.seven_day.is_some();
         let fetched_at = if had_numbers { prev.usage.fetched_at } else { now };
-        Shared { usage: Usage { error: Some(error), fetched_at, ..prev.usage.clone() }, asked_at: now, retry_at, rate_limited }
+        Shared {
+            usage: Usage { error: Some(error), fetched_at, ..prev.usage.clone() },
+            asked_at: now,
+            retry_at,
+            rate_limited,
+            ..prev.clone()
+        }
     };
     match outcome {
         Outcome::Usage(five_hour, seven_day) => Shared {
@@ -103,6 +130,8 @@ fn record(prev: Shared, outcome: Outcome, now: i64) -> Shared {
             asked_at: now,
             retry_at: 0,
             rate_limited: 0,
+            renewed_at: prev.renewed_at,
+            renew_error: None,
         },
         Outcome::RateLimited(retry_after) => {
             let n = prev.rate_limited + 1;
@@ -110,6 +139,7 @@ fn record(prev: Shared, outcome: Outcome, now: i64) -> Shared {
             let retry_at = now + wait;
             failed(format!("Usage requests rate-limited (HTTP 429); next try at {}", clock(retry_at)), retry_at, n)
         }
+        Outcome::Expired => failed(expired_message(prev.renew_error.as_deref()), 0, prev.rate_limited),
         Outcome::Failed(e) => failed(e, 0, prev.rate_limited),
     }
 }
@@ -135,17 +165,34 @@ impl UsageCache {
     }
 
     pub fn get(&self, force: bool) -> Usage {
-        self.get_with(force, now_ms(), request)
+        self.get_with(force, now_ms(), request, renew)
     }
 
-    /// Holds the file lock while deciding and fetching, so other processes wait for the answer
-    /// instead of asking too.
-    fn get_with(&self, force: bool, now: i64, request: impl FnOnce() -> Outcome) -> Usage {
+    /// Holds the file lock while deciding, fetching and renewing, so other processes wait for the
+    /// answer instead of asking (or renewing) too.
+    fn get_with(
+        &self,
+        force: bool,
+        now: i64,
+        mut request: impl FnMut() -> Outcome,
+        renew: impl FnOnce() -> Result<(), String>,
+    ) -> Usage {
         let mut mem = self.mem.lock().unwrap_or_else(|e| e.into_inner());
         let mut file = self.file.as_ref().and_then(|p| open_locked(p).ok());
-        let shared = file.as_mut().and_then(read_shared).unwrap_or_else(|| mem.clone());
+        let mut shared = file.as_mut().and_then(read_shared).unwrap_or_else(|| mem.clone());
         let shared = if should_fetch(&shared, force, now) {
-            let next = record(shared, request(), now);
+            let mut outcome = request();
+            if matches!(outcome, Outcome::Expired) && now - shared.renewed_at >= RENEW_EVERY_MS {
+                shared.renewed_at = now;
+                shared.renew_error = match renew() {
+                    Ok(()) => {
+                        outcome = request();
+                        matches!(outcome, Outcome::Expired).then(|| "still expired after renewing".to_string())
+                    }
+                    Err(e) => Some(e),
+                };
+            }
+            let next = record(shared, outcome, now);
             if let Some(f) = file.as_mut() {
                 let _ = write_shared(f, &next);
             }
@@ -214,7 +261,7 @@ fn request() -> Outcome {
         Err(e) => return Outcome::Failed(e),
     };
     if expires.is_some_and(|e| e <= now_ms()) {
-        return Outcome::Failed("Claude Code login expired".into());
+        return Outcome::Expired;
     }
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
@@ -231,7 +278,7 @@ fn request() -> Outcome {
     let Ok(mut res) = res else { return Outcome::Failed("Usage request failed (network)".into()) };
     match res.status().as_u16() {
         200..=299 => {}
-        401 => return Outcome::Failed("Claude Code login expired".into()),
+        401 => return Outcome::Expired,
         429 => {
             let retry_after = res.headers().get("retry-after").and_then(|v| v.to_str().ok());
             return Outcome::RateLimited(retry_after.and_then(|v| retry_after_ms(v, now_ms())));
@@ -245,6 +292,51 @@ fn request() -> Outcome {
         return Outcome::Failed("Unexpected usage response".into());
     };
     Outcome::Usage(window(&v, "five_hour"), window(&v, "seven_day"))
+}
+
+/// Has Claude Code renew its keychain token by making the smallest request it can: Haiku, no tools, no
+/// settings (so no hooks), and no saved session (so nothing for the scanner). Navarch never touches the
+/// token itself. Inherited CLAUDE*/ANTHROPIC* variables are dropped: a dev window started from a Claude
+/// session carries them, and a token or key in them would leave the keychain copy as it is.
+fn renew() -> Result<(), String> {
+    let bin = claude_bin().ok_or("no claude command found")?;
+    let mut cmd = Command::new(bin);
+    cmd.args(["-p", "Reply with OK.", "--model", "haiku", "--no-session-persistence", "--tools", "", "--setting-sources", ""])
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (k, _) in std::env::vars_os() {
+        if k.to_str().is_some_and(|k| k.starts_with("CLAUDE") || k.starts_with("ANTHROPIC")) {
+            cmd.env_remove(k);
+        }
+    }
+    let mut child = cmd.spawn().map_err(|_| "couldn't run claude".to_string())?;
+    let deadline = Instant::now() + RENEW_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("claude exited with {}", status.code().unwrap_or(-1))),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("claude timed out".into());
+            }
+            Err(_) => return Err("couldn't run claude".into()),
+        }
+    }
+}
+
+/// The claude command: an app from Finder gets a bare PATH, so the usual install places come first.
+fn claude_bin() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let known = home
+        .iter()
+        .flat_map(|h| [h.join(".local/bin/claude"), h.join(".claude/local/claude")])
+        .chain(["/opt/homebrew/bin/claude", "/usr/local/bin/claude"].map(PathBuf::from));
+    let on_path = std::env::var_os("PATH").into_iter().flat_map(|p| std::env::split_paths(&p).map(|d| d.join("claude")).collect::<Vec<_>>());
+    known.chain(on_path).find(|p| p.is_file())
 }
 
 #[cfg(test)]
@@ -305,6 +397,45 @@ mod tests {
         assert_eq!(retry_after_ms("soon", now), None);
     }
 
+    fn no_renew() -> Result<(), String> {
+        panic!("nothing expired, so nothing to renew")
+    }
+
+    #[test]
+    fn expired_token_is_renewed_at_most_every_half_hour() {
+        let cache = UsageCache::new(None);
+        let now = 1_000 * MIN;
+        let script = std::cell::RefCell::new(std::collections::VecDeque::new());
+        let renewals = Cell::new(0);
+        let run = |at: i64, outcomes: Vec<Outcome>, renewal: Result<(), String>| {
+            script.borrow_mut().extend(outcomes);
+            let next = || script.borrow_mut().pop_front().expect("one request too many");
+            let u = cache.get_with(false, at, next, || {
+                renewals.set(renewals.get() + 1);
+                renewal
+            });
+            assert!(script.borrow().is_empty(), "a scripted request wasn't made");
+            u
+        };
+        // Expired: Claude Code renews it and the second request works.
+        let u = run(now, vec![Outcome::Expired, ok(10.0)], Ok(()));
+        assert_eq!((renewals.get(), u.error, u.five_hour.map(|w| w.percent)), (1, None, Some(10.0)));
+        // A failed renewal keeps the numbers and says why.
+        let u = run(now + 31 * MIN, vec![Outcome::Expired], Err("claude timed out".into()));
+        let e = u.error.unwrap();
+        assert!(e.contains("claude timed out") && e.contains("Run claude"), "{e}");
+        assert_eq!((renewals.get(), u.five_hour.map(|w| w.percent)), (2, Some(10.0)));
+        // Within half an hour it isn't tried again, and the reason stays.
+        let u = run(now + 37 * MIN, vec![Outcome::Expired], Ok(()));
+        assert_eq!(renewals.get(), 2);
+        assert!(u.error.unwrap().contains("claude timed out"));
+        let u = run(now + 62 * MIN, vec![Outcome::Expired, ok(20.0)], Ok(()));
+        assert_eq!((renewals.get(), u.error, u.five_hour.map(|w| w.percent)), (3, None, Some(20.0)));
+        // Renewed, yet still refused.
+        let u = run(now + 93 * MIN, vec![Outcome::Expired, Outcome::Expired], Ok(()));
+        assert!(u.error.unwrap().contains("still expired after renewing"));
+    }
+
     #[test]
     fn processes_share_one_request() {
         let dir = std::env::temp_dir().join(format!("navarch-usage-test-{}", std::process::id()));
@@ -318,16 +449,16 @@ mod tests {
             o
         };
         let now = 1_000 * MIN;
-        assert_eq!(a.get_with(false, now, || fetch(ok(10.0))).five_hour.unwrap().percent, 10.0);
+        assert_eq!(a.get_with(false, now, || fetch(ok(10.0)), no_renew).five_hour.unwrap().percent, 10.0);
         // B reads A's answer from the file instead of asking.
-        assert_eq!(b.get_with(false, now + MIN, || fetch(ok(99.0))).five_hour.unwrap().percent, 10.0);
+        assert_eq!(b.get_with(false, now + MIN, || fetch(ok(99.0)), no_renew).five_hour.unwrap().percent, 10.0);
         assert_eq!(calls.get(), 1);
         // A 429 seen by B holds A back too, and both keep showing the numbers.
-        let u = b.get_with(false, now + 5 * MIN, || fetch(Outcome::RateLimited(None)));
+        let u = b.get_with(false, now + 5 * MIN, || fetch(Outcome::RateLimited(None)), no_renew);
         assert!(u.error.is_some() && u.five_hour.is_some());
-        let u = a.get_with(true, now + 9 * MIN, || fetch(ok(99.0)));
+        let u = a.get_with(true, now + 9 * MIN, || fetch(ok(99.0)), no_renew);
         assert_eq!((calls.get(), u.five_hour.unwrap().percent), (2, 10.0));
-        assert_eq!(a.get_with(false, now + 10 * MIN, || fetch(ok(20.0))).error, None);
+        assert_eq!(a.get_with(false, now + 10 * MIN, || fetch(ok(20.0)), no_renew).error, None);
         assert!(!std::fs::read_to_string(&path).unwrap().contains("Bearer"));
         let _ = std::fs::remove_dir_all(&dir);
     }

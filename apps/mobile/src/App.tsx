@@ -16,7 +16,17 @@ import { WidgetSetup } from "./WidgetSetup";
 type Tab = "waiting" | "week" | "goals" | "usage";
 const TAB_KEY = "navarch-phone-tab";
 
+/** A link to a tab, such as the usage widget's `…/#usage`, used up so a reload doesn't go back to it. */
+function takeHashTab(): Tab | null {
+  const t = location.hash.slice(1);
+  if (t !== "waiting" && t !== "week" && t !== "goals" && t !== "usage") return null;
+  history.replaceState(null, "", location.pathname + location.search);
+  return t;
+}
+
 function loadTab(): Tab {
+  const linked = takeHashTab();
+  if (linked) return linked;
   try {
     const t = localStorage.getItem(TAB_KEY);
     if (t === "waiting" || t === "week" || t === "goals" || t === "usage") return t;
@@ -53,6 +63,15 @@ function Shell() {
       /* ignore */
     }
   };
+  useEffect(() => {
+    const onHash = () => {
+      const t = takeHashTab();
+      if (t) setTab(t);
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+    // setTab only sets state and storage, so the first render's copy will do.
+  }, []);
 
   const waiting = m?.attentionTotal ?? 0;
   const head: Record<Tab, { title: string; sub?: string }> = {

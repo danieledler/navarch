@@ -407,6 +407,7 @@ a { color: var(--accent); }
 .meter-usage.tone-hot > span { background: var(--red); }
 .pace-mark { position: absolute; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; border-radius: 1px; background: var(--text); }
 .usage-meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 12px; margin-top: 8px; font-size: 13px; }
+.foot.is-stale { color: var(--amber); }
 .usage-pct.tone-good, .usage-meta .tone-good { color: var(--green); }
 .usage-pct.tone-warn, .usage-meta .tone-warn { color: var(--amber); }
 .usage-pct.tone-hot, .usage-meta .tone-hot { color: var(--red); }

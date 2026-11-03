@@ -107,7 +107,7 @@ function freshness(r, now) {
   if (r.problem === "unpaired") return { text: "Pair again", color: C.hot };
   if (r.problem === "offline") return { text: `Mac offline${read}`, color: C.warn };
   if (r.problem) return { text: r.problem, color: C.warn };
-  if (r.usage.error) return { text: `Stale${read}`, color: C.warn };
+  if (r.usage.error) return { text: `${/sign-in/.test(r.usage.error) ? "Sign-in expired" : "Stale"}${read}`, color: C.warn };
   const old = now - r.usage.fetchedAt > 30 * 60_000;
   return { text: `Read ${ago(r.usage.fetchedAt, now)}`, color: old ? C.warn : C.muted, quiet: !old };
 }
@@ -332,6 +332,8 @@ async function build(family) {
 
 const family = config.widgetFamily || "medium";
 const widget = await build(family);
+// iOS 26 opens a Home Screen web app for webapp://<its address> (undocumented); #usage picks the tab.
+if (!SERVER.startsWith("{{")) widget.url = `${SERVER.replace(/^https?:\/\//, "webapp://")}/#usage`;
 widget.refreshAfterDate = new Date(Date.now() + 5 * 60_000);
 if (config.runsInWidget) Script.setWidget(widget);
 else await widget.presentMedium();

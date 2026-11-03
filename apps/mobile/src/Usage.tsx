@@ -52,10 +52,10 @@ export function Usage() {
             <WindowRow title="5-hour window" name="5-hour window" w={usage.fiveHour} pace={paces.fiveHour} now={now} />
             <WindowRow title="Weekly" name="week" w={usage.sevenDay} pace={paces.sevenDay} now={now} weekly />
           </div>
-          <div className="foot muted">
-            {usage.error ? `${usage.error} · ` : ""}
-            {offline ? "Mac offline · " : ""}
-            Read {ago(usage.fetchedAt, now)}
+          {/* Stale numbers say so in amber, with why: they still look like today's otherwise. */}
+          <div className={`foot ${usage.error ? "is-stale" : "muted"}`}>
+            {usage.error ? `Numbers from ${ago(usage.fetchedAt, now)}. ${usage.error}` : `Read ${ago(usage.fetchedAt, now)}`}
+            {offline ? " · Mac offline" : ""}
           </div>
         </div>
       )}

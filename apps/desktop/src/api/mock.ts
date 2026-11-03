@@ -248,7 +248,7 @@ export function mockApi(): Api {
       // ?usage=stale the last good numbers after a 429.
       const mode = new URLSearchParams(location.search).get("usage");
       const at = (ms: number) => new Date(Date.now() + ms).toISOString();
-      if (mode === "error") return { fiveHour: null, sevenDay: null, error: "Claude Code login expired", fetchedAt: Date.now() };
+      if (mode === "error") return { fiveHour: null, sevenDay: null, error: "Claude Code's sign-in expired and Navarch couldn't renew it (no claude command found). Run claude in Terminal to sign in again.", fetchedAt: Date.now() };
       if (mode === "stale")
         return {
           fiveHour: { percent: 37, resetsAt: at(200 * 6e4) },
