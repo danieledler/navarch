@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { FolderOpen, FolderPlus, History, MoreHorizontal, Pencil, Trash2, ArrowRightLeft, Cpu, Zap } from "lucide-react";
+import { FolderInput, FolderOpen, FolderPlus, History, MoreHorizontal, Pencil, Trash2, ArrowRightLeft, Cpu, Zap } from "lucide-react";
 import { api, type Id, type Project } from "../api";
 import { useModel, useStore } from "../store";
 import { deadlineInfo, fmtDuration, fmtTokens, parentTail } from "../lib/format";
@@ -197,6 +197,7 @@ function ProjectCard({
 }) {
   const m = useModel();
   const run = useStore((s) => s.run);
+  const toast = useStore((s) => s.toast);
   const selectProject = useStore((s) => s.selectProject);
   const [renaming, setRenaming] = useState(false);
   const tasks = m.tasks.filter((t) => t.projectId === p.id);
@@ -247,6 +248,16 @@ function ProjectCard({
           items={[
             { label: "Rename", icon: <Pencil size={14} />, onSelect: () => setRenaming(true) },
             { label: "Reveal in Finder", icon: <FolderOpen size={14} />, onSelect: () => run(api.revealPath(p.path)) },
+            {
+              label: "Change folder…",
+              icon: <FolderInput size={14} />,
+              onSelect: async () => {
+                const folder = await api.pickFolder();
+                if (!folder || folder === p.path) return;
+                const q = await run(api.changeProjectFolder(p.id, folder));
+                if (q) toast(`${q.name} now uses ${folder}`);
+              },
+            },
             ...m.spaces
               .filter((s) => s.id !== p.spaceId)
               .map((s) => ({

@@ -247,6 +247,7 @@ pub fn run() {
             commands::delete_space,
             commands::create_project,
             commands::update_project,
+            commands::change_project_folder,
             commands::reorder_projects,
             commands::delete_project,
             commands::create_task,

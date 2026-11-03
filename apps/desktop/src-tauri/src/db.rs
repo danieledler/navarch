@@ -341,6 +341,17 @@ pub fn create_project(conn: &Connection, space_id: i64, path: &str, name: Option
     get_project(conn, conn.last_insert_rowid())
 }
 
+/// Points a project at its folder's new place, after the folder was renamed or moved (and Claude's records
+/// of it updated). A name that was the old folder's name follows the folder.
+pub fn change_project_folder(conn: &Connection, id: i64, path: &str) -> Res<Project> {
+    let p = get_project(conn, id)?;
+    let base = |s: &str| Path::new(s).file_name().map(|n| n.to_string_lossy().into_owned());
+    let name = if base(&p.path).as_deref() == Some(p.name.as_str()) { base(path).unwrap_or(p.name) } else { p.name };
+    conn.execute("UPDATE projects SET path=?, name=? WHERE id=?", params![path, name, id])
+        .map_err(|e| if e.to_string().contains("UNIQUE") { format!("Another project already uses {path}") } else { err(e) })?;
+    get_project(conn, id)
+}
+
 pub fn update_project(conn: &Connection, id: i64, name: Option<String>, space_id: Option<i64>) -> Res<Project> {
     if let Some(n) = name {
         conn.execute("UPDATE projects SET name=? WHERE id=?", params![n, id]).map_err(err)?;
@@ -605,6 +616,19 @@ pub fn add_pending_spawn(conn: &Connection, task_id: Option<i64>, path: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn change_project_folder_moves_a_default_name_along() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        let space = snapshot(&c).unwrap().spaces[0].id;
+        let a = create_project(&c, space, "/tmp/networks", None).unwrap();
+        let b = create_project(&c, space, "/tmp/other", Some("Mine".into())).unwrap();
+        let a = change_project_folder(&c, a.id, "/tmp/netgamut").unwrap();
+        assert_eq!((a.path.as_str(), a.name.as_str()), ("/tmp/netgamut", "netgamut"));
+        assert_eq!(change_project_folder(&c, b.id, "/tmp/elsewhere").unwrap().name, "Mine");
+        assert!(change_project_folder(&c, b.id, "/tmp/netgamut").is_err());
+    }
 
     #[test]
     fn copy_database_includes_the_wal() {

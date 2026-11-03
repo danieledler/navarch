@@ -135,6 +135,14 @@ export function mockApi(): Api {
       if (spaceId) p.spaceId = spaceId;
       return ok();
     },
+    changeProjectFolder: async (id, path) => {
+      const p = db.projects.find((x) => x.id === id)!;
+      if (db.projects.some((x) => x.id !== id && x.path === path)) throw `Another project already uses ${path}`;
+      if (p.name === p.path.split("/").pop()) p.name = path.split("/").pop()!;
+      p.path = path;
+      await ok();
+      return p;
+    },
     reorderProjects: async (ids) => {
       ids.forEach((id, i) => (db.projects.find((p) => p.id === id)!.sort = i + 1));
       return ok();

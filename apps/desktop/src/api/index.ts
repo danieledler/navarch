@@ -11,6 +11,8 @@ export interface Api {
   deleteSpace(id: Id): Promise<void>;
   createProject(spaceId: Id, path: string, name?: string): Promise<Project>;
   updateProject(id: Id, name?: string, spaceId?: Id): Promise<void>;
+  /** Points a project at its folder's new place, once the folder was moved and Claude's records of it updated. */
+  changeProjectFolder(id: Id, path: string): Promise<Project>;
   /** Puts a space's projects in this order. */
   reorderProjects(ids: Id[]): Promise<void>;
   deleteProject(id: Id): Promise<void>;
@@ -94,6 +96,7 @@ function tauriApi(): Api {
     deleteSpace: (id) => call("delete_space", { id }),
     createProject: (spaceId, path, name) => call("create_project", { spaceId, path, name: name ?? null }),
     updateProject: (id, name, spaceId) => call("update_project", { id, name: name ?? null, spaceId: spaceId ?? null }),
+    changeProjectFolder: (id, path) => call("change_project_folder", { id, path }),
     reorderProjects: (ids) => call("reorder_projects", { ids }),
     deleteProject: (id) => call("delete_project", { id }),
     createTask: (projectId, parentId, title, afterId) =>

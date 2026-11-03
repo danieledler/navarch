@@ -93,6 +93,11 @@ pub async fn update_project(state: S<'_>, id: i64, name: Option<String>, space_i
 }
 
 #[tauri::command]
+pub async fn change_project_folder(state: S<'_>, id: i64, path: String) -> Res<Project> {
+    with_db!(state, |c| db::change_project_folder(c, id, &path))
+}
+
+#[tauri::command]
 pub async fn reorder_projects(state: S<'_>, ids: Vec<i64>) -> Res<()> {
     with_db!(state, |c| db::reorder_projects(c, &ids))
 }
