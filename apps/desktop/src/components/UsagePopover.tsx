@@ -51,7 +51,14 @@ export function UsagePopover({ anchor, onClose }: { anchor: React.RefObject<HTML
         </div>
       )}
       <LimitAlertsRow />
-      <div className="up-foot">{usage ? `Updated ${relTime(usage.fetchedAt)}` : "Loading…"}</div>
+      <div className="up-foot">
+        {usage ? `Updated ${relTime(usage.fetchedAt)}` : "Loading…"}
+        {usage?.signInEndsAt && !usage.needsSignIn && (
+          <span title={`Claude Code's sign-in runs out ${new Date(usage.signInEndsAt).toLocaleString()}; then it has to sign in again.`}>
+            {" · "}signed in until {new Date(usage.signInEndsAt).toLocaleDateString(undefined, { day: "numeric", month: "short" })}
+          </span>
+        )}
+      </div>
     </Popover>
   );
 }

@@ -243,7 +243,7 @@ export const useStore = create<State>((set, get) => ({
     try {
       set({ usage: await api.getUsage(force) });
     } catch (e) {
-      set((s) => ({ usage: { fiveHour: null, sevenDay: null, fetchedAt: Date.now(), needsSignIn: false, ...s.usage, error: String(e) } }));
+      set((s) => ({ usage: { fiveHour: null, sevenDay: null, fetchedAt: Date.now(), needsSignIn: false, signInEndsAt: null, ...s.usage, error: String(e) } }));
     }
   },
 

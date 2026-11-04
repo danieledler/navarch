@@ -132,6 +132,8 @@ export interface Usage {
   fetchedAt: number;
   /** Claude Code is signed out, or its sign-in expired and couldn't be renewed: only a new sign-in helps. */
   needsSignIn: boolean;
+  /** When Claude Code's sign-in runs out (ms), as of the last good request. */
+  signInEndsAt: number | null;
 }
 
 /** At these percentages Navarch tells running sessions to save their work and schedule their resume. */

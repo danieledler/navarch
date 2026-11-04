@@ -258,7 +258,7 @@ export function mockApi(): Api {
       // ?usage=stale the last good numbers after a 429, ?usage=signedout a sign-out (until Sign in).
       const mode = new URLSearchParams(location.search).get("usage");
       const at = (ms: number) => new Date(Date.now() + ms).toISOString();
-      if (mode === "error") return { fiveHour: null, sevenDay: null, error: "Usage request failed (network)", fetchedAt: Date.now(), needsSignIn: false };
+      if (mode === "error") return { fiveHour: null, sevenDay: null, error: "Usage request failed (network)", fetchedAt: Date.now(), needsSignIn: false, signInEndsAt: null };
       if (mode === "signedout" && !mockSignedIn)
         return {
           fiveHour: { percent: 37, resetsAt: at(-200 * 6e4) },
@@ -266,6 +266,7 @@ export function mockApi(): Api {
           error: "Claude Code is signed out, so Navarch can't read plan usage or warn sessions near a limit. Sign in again to fix it.",
           fetchedAt: Date.now() - 13 * 36e5,
           needsSignIn: true,
+          signInEndsAt: Date.now() - 15 * 36e5,
         };
       if (mode === "stale")
         return {
@@ -274,16 +275,18 @@ export function mockApi(): Api {
           error: `Usage requests rate-limited (HTTP 429); next try at ${new Date(Date.now() + 9 * 6e4).toTimeString().slice(0, 5)}`,
           fetchedAt: Date.now() - 12 * 6e4,
           needsSignIn: false,
+          signInEndsAt: Date.now() + 27 * 864e5,
         };
       const hot = mode === "hot";
       if (mode === "zero")
-        return { fiveHour: { percent: 0, resetsAt: at(299 * 6e4) }, sevenDay: { percent: 0.4, resetsAt: at(167 * 36e5) }, error: null, fetchedAt: Date.now(), needsSignIn: false };
+        return { fiveHour: { percent: 0, resetsAt: at(299 * 6e4) }, sevenDay: { percent: 0.4, resetsAt: at(167 * 36e5) }, error: null, fetchedAt: Date.now(), needsSignIn: false, signInEndsAt: null };
       return {
         fiveHour: { percent: hot ? 78 : 2, resetsAt: at((hot ? 180 : 250) * 6e4) },
         sevenDay: { percent: hot ? 64 : 41, resetsAt: at((hot ? 72 : 45) * 36e5) },
         error: null,
         fetchedAt: Date.now() - 2 * 6e4,
         needsSignIn: false,
+        signInEndsAt: Date.now() + 27 * 864e5,
       };
     },
     // Stands in for the browser sign-in: it "works" after a moment.

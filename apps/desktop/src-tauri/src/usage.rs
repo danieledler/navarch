@@ -57,6 +57,9 @@ pub struct Usage {
     /// Claude Code is signed out, or its sign-in expired and couldn't be renewed: only a new sign-in helps.
     #[serde(default)]
     pub needs_sign_in: bool,
+    /// When Claude Code's sign-in runs out (its refresh token's expiry), as of the last good request.
+    #[serde(default)]
+    pub sign_in_ends_at: Option<i64>,
 }
 
 /// The shared cache file's contents: usage plus request bookkeeping. Never the token.
@@ -79,7 +82,8 @@ struct Shared {
 }
 
 enum Outcome {
-    Usage(Option<UsageWindow>, Option<UsageWindow>),
+    /// The two windows, and when the sign-in runs out.
+    Usage(Option<UsageWindow>, Option<UsageWindow>, Option<i64>),
     RateLimited(Option<i64>),
     /// The token has expired (or was refused): time to renew it.
     Expired,
@@ -141,8 +145,8 @@ fn record(prev: Shared, outcome: Outcome, now: i64) -> Shared {
         }
     };
     match outcome {
-        Outcome::Usage(five_hour, seven_day) => Shared {
-            usage: Usage { five_hour, seven_day, error: None, fetched_at: now, needs_sign_in: false },
+        Outcome::Usage(five_hour, seven_day, sign_in_ends_at) => Shared {
+            usage: Usage { five_hour, seven_day, error: None, fetched_at: now, needs_sign_in: false, sign_in_ends_at },
             asked_at: now,
             retry_at: 0,
             rate_limited: 0,
@@ -273,9 +277,16 @@ fn write_shared(f: &mut File, s: &Shared) -> std::io::Result<()> {
     f.write_all(&serde_json::to_vec(s).map_err(std::io::Error::other)?)
 }
 
-/// The access token and when it expires, or None when Claude Code is signed out: no keychain item, no
-/// Claude login in it, or the empty token Claude Code leaves behind when its sign-in runs out.
-fn read_token() -> Result<Option<(String, Option<i64>)>, String> {
+struct Token {
+    access: String,
+    expires_at: Option<i64>,
+    /// The refresh token's expiry: past it Claude Code can't renew, and signs out.
+    sign_in_ends_at: Option<i64>,
+}
+
+/// The keychain token, or None when Claude Code is signed out: no keychain item, no Claude login in
+/// it, or the empty token Claude Code leaves behind when its sign-in runs out.
+fn read_token() -> Result<Option<Token>, String> {
     let out = std::process::Command::new("/usr/bin/security")
         .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
         .output()
@@ -289,8 +300,9 @@ fn read_token() -> Result<Option<(String, Option<i64>)>, String> {
     let Some(token) = oauth.and_then(|o| o.get("accessToken")).and_then(|t| t.as_str()).filter(|t| !t.is_empty()) else {
         return Ok(None);
     };
-    let expires = oauth.and_then(|o| o.get("expiresAt")).and_then(|e| e.as_f64()).map(|e| e as i64);
-    Ok(Some((token.to_string(), expires)))
+    let ms = |key| oauth.and_then(|o| o.get(key)).and_then(|e| e.as_f64()).map(|e| e as i64);
+    let sign_in_ends_at = ms("refreshTokenExpiresAt").filter(|e| *e > 0);
+    Ok(Some(Token { access: token.to_string(), expires_at: ms("expiresAt"), sign_in_ends_at }))
 }
 
 fn window(v: &serde_json::Value, key: &str) -> Option<UsageWindow> {
@@ -305,12 +317,12 @@ fn window(v: &serde_json::Value, key: &str) -> Option<UsageWindow> {
 }
 
 fn request() -> Outcome {
-    let (token, expires) = match read_token() {
+    let Token { access: token, expires_at, sign_in_ends_at } = match read_token() {
         Ok(Some(t)) => t,
         Ok(None) => return Outcome::SignedOut,
         Err(e) => return Outcome::Failed(e),
     };
-    if expires.is_some_and(|e| e <= now_ms()) {
+    if expires_at.is_some_and(|e| e <= now_ms()) {
         return Outcome::Expired;
     }
     let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -341,7 +353,7 @@ fn request() -> Outcome {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
         return Outcome::Failed("Unexpected usage response".into());
     };
-    Outcome::Usage(window(&v, "five_hour"), window(&v, "seven_day"))
+    Outcome::Usage(window(&v, "five_hour"), window(&v, "seven_day"), sign_in_ends_at)
 }
 
 /// Has Claude Code renew its keychain token by making the smallest request it can: Haiku, no tools, no
@@ -464,7 +476,7 @@ mod tests {
     const MIN: i64 = 60_000;
 
     fn ok(five: f64) -> Outcome {
-        Outcome::Usage(Some(UsageWindow { percent: five, resets_at: None }), None)
+        Outcome::Usage(Some(UsageWindow { percent: five, resets_at: None }), None, None)
     }
 
     #[test]

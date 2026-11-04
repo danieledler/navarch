@@ -268,7 +268,7 @@ mod tests {
 
     fn usage(five: f64, week: f64) -> Usage {
         let w = |percent, resets_at: &str| Some(UsageWindow { percent, resets_at: Some(resets_at.into()) });
-        Usage { five_hour: w(five, "2026-10-30T14:30:00+00:00"), seven_day: w(week, "2026-11-03T09:00:00+00:00"), error: None, fetched_at: 0, needs_sign_in: false }
+        Usage { five_hour: w(five, "2026-10-30T14:30:00+00:00"), seven_day: w(week, "2026-11-03T09:00:00+00:00"), error: None, fetched_at: 0, needs_sign_in: false, sign_in_ends_at: None }
     }
 
     #[test]
