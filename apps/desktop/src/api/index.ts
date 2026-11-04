@@ -36,6 +36,10 @@ export interface Api {
   getUsage(force: boolean): Promise<Usage>;
   getLimitAlerts(): Promise<LimitAlerts>;
   setLimitThresholds(fiveHour: number, sevenDay: number): Promise<LimitAlerts>;
+  /** Starts Claude Code's sign-in (`claude auth login`), which opens the browser; onClaudeSignIn hears how it ended. */
+  signInClaude(): Promise<void>;
+  /** A sign-in ended: null when it worked, else why not. */
+  onClaudeSignIn(cb: (error: string | null) => void): void;
   /** A usage-limit alert went out to running sessions; the payload is its summary. */
   onLimitAlert(cb: (summary: string) => void): void;
   /** The installed app's launch-time Tailscale Serve change or failure. */
@@ -120,6 +124,10 @@ function tauriApi(): Api {
     getUsage: (force) => call("get_usage", { force }),
     getLimitAlerts: () => call("get_limit_alerts"),
     setLimitThresholds: (fiveHour, sevenDay) => call("set_limit_thresholds", { thresholds: { fiveHour, sevenDay } }),
+    signInClaude: () => call("sign_in_claude"),
+    onClaudeSignIn: (cb) => {
+      event.then((e) => e.listen<string | null>("claude-sign-in", (ev) => cb(ev.payload)));
+    },
     onLimitAlert: (cb) => {
       event.then((e) => e.listen<string>("limit-alert", (ev) => cb(ev.payload)));
     },

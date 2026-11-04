@@ -63,6 +63,8 @@ function cpuSim() {
 export function mockApi(): Api {
   const cpu = cpuSim();
   const db = load();
+  let mockSignedIn = false;
+  const signInListeners = new Set<(error: string | null) => void>();
   let limitAlerts: LimitAlerts = { fiveHour: 95, sevenDay: 99, active: null, hookInstalled: false, live: false };
   // A pretend phone server: nothing listens, but the popover shows every state. ?mobile=paired starts it on and paired.
   const pairedMode = new URLSearchParams(location.search).get("mobile") === "paired";
@@ -253,27 +255,45 @@ export function mockApi(): Api {
     onPhoneServe: () => {},
     getUsage: async (): Promise<Usage> => {
       // ?usage=hot shows over-pace tones, ?usage=zero a fresh window, ?usage=error the unavailable state,
-      // ?usage=stale the last good numbers after a 429.
+      // ?usage=stale the last good numbers after a 429, ?usage=signedout a sign-out (until Sign in).
       const mode = new URLSearchParams(location.search).get("usage");
       const at = (ms: number) => new Date(Date.now() + ms).toISOString();
-      if (mode === "error") return { fiveHour: null, sevenDay: null, error: "Claude Code's sign-in expired and Navarch couldn't renew it (no claude command found). Run claude in Terminal to sign in again.", fetchedAt: Date.now() };
+      if (mode === "error") return { fiveHour: null, sevenDay: null, error: "Usage request failed (network)", fetchedAt: Date.now(), needsSignIn: false };
+      if (mode === "signedout" && !mockSignedIn)
+        return {
+          fiveHour: { percent: 37, resetsAt: at(-200 * 6e4) },
+          sevenDay: { percent: 52, resetsAt: at(60 * 36e5) },
+          error: "Claude Code is signed out, so Navarch can't read plan usage or warn sessions near a limit. Sign in again to fix it.",
+          fetchedAt: Date.now() - 13 * 36e5,
+          needsSignIn: true,
+        };
       if (mode === "stale")
         return {
           fiveHour: { percent: 37, resetsAt: at(200 * 6e4) },
           sevenDay: { percent: 52, resetsAt: at(60 * 36e5) },
           error: `Usage requests rate-limited (HTTP 429); next try at ${new Date(Date.now() + 9 * 6e4).toTimeString().slice(0, 5)}`,
           fetchedAt: Date.now() - 12 * 6e4,
+          needsSignIn: false,
         };
       const hot = mode === "hot";
       if (mode === "zero")
-        return { fiveHour: { percent: 0, resetsAt: at(299 * 6e4) }, sevenDay: { percent: 0.4, resetsAt: at(167 * 36e5) }, error: null, fetchedAt: Date.now() };
+        return { fiveHour: { percent: 0, resetsAt: at(299 * 6e4) }, sevenDay: { percent: 0.4, resetsAt: at(167 * 36e5) }, error: null, fetchedAt: Date.now(), needsSignIn: false };
       return {
         fiveHour: { percent: hot ? 78 : 2, resetsAt: at((hot ? 180 : 250) * 6e4) },
         sevenDay: { percent: hot ? 64 : 41, resetsAt: at((hot ? 72 : 45) * 36e5) },
         error: null,
         fetchedAt: Date.now() - 2 * 6e4,
+        needsSignIn: false,
       };
     },
+    // Stands in for the browser sign-in: it "works" after a moment.
+    signInClaude: async () => {
+      setTimeout(() => {
+        mockSignedIn = true;
+        signInListeners.forEach((cb) => cb(null));
+      }, 1500);
+    },
+    onClaudeSignIn: (cb) => void signInListeners.add(cb),
     onSessions: (cb) => {
       listeners.add(cb);
       return () => listeners.delete(cb);

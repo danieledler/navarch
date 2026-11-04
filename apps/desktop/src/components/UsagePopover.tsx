@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { RefreshCw } from "lucide-react";
+import { RefreshCw, TriangleAlert } from "lucide-react";
 import { api, type LimitAlerts, type UsageWindow } from "../api";
 import { useStore } from "../store";
 import { fmtUntil, relTime } from "../lib/format";
@@ -33,7 +33,13 @@ export function UsagePopover({ anchor, onClose }: { anchor: React.RefObject<HTML
           <RefreshCw size={14} />
         </button>
       </div>
-      {usage?.error && <p className="hint up-error">{usage.error}</p>}
+      {usage?.error && (
+        <p className={`up-error ${usage.needsSignIn ? "is-error" : "is-warn"}`}>
+          <TriangleAlert size={14} aria-hidden />
+          <span>{usage.error}</span>
+        </p>
+      )}
+      {usage?.needsSignIn && <SignIn />}
       {(!usage?.error || stale) && (
         <div className={`up-body ${stale ? "is-stale" : ""}`}>
           <div className="up-rings">
@@ -47,6 +53,24 @@ export function UsagePopover({ anchor, onClose }: { anchor: React.RefObject<HTML
       <LimitAlertsRow />
       <div className="up-foot">{usage ? `Updated ${relTime(usage.fetchedAt)}` : "Loading…"}</div>
     </Popover>
+  );
+}
+
+/** The fix for a sign-out: `claude auth login`, which opens Claude's sign-in page in the browser. */
+function SignIn() {
+  const signingIn = useStore((s) => s.signingIn);
+  const signIn = useStore((s) => s.signInClaude);
+  return (
+    <div className="up-signin">
+      <button type="button" className="btn btn-primary" onClick={signIn}>
+        {signingIn ? "Open the sign-in page again" : "Sign in to Claude Code"}
+      </button>
+      <p className="hint">
+        {signingIn
+          ? "Finish signing in in the browser tab that opened. Navarch picks it up from there."
+          : "Opens Claude’s sign-in page in your browser, as claude auth login does in Terminal."}
+      </p>
+    </div>
   );
 }
 

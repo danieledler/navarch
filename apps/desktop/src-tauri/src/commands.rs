@@ -5,9 +5,9 @@ use crate::procs::{CpuSample, SystemStats};
 use crate::scanner::Session;
 use crate::limits::{self, Thresholds};
 use crate::mobile::{self, MobileAccess, PairingCode};
-use crate::usage::Usage;
+use crate::usage::{self, Usage};
 use crate::AppState;
-use tauri::State;
+use tauri::{Emitter, State};
 
 type S<'a> = State<'a, AppState>;
 
@@ -265,6 +265,19 @@ pub async fn get_build_info(state: S<'_>) -> Res<BuildInfo> {
 pub async fn get_usage(state: S<'_>, force: bool) -> Res<Usage> {
     let cache = state.usage.clone();
     tauri::async_runtime::spawn_blocking(move || cache.get(force)).await.map_err(db::err)
+}
+
+/// Starts Claude Code's sign-in, which opens the browser; `claude-sign-in` says how it ended (null when
+/// it worked, else why not), and the next usage read asks the server again.
+#[tauri::command]
+pub async fn sign_in_claude(app: tauri::AppHandle, state: S<'_>) -> Res<()> {
+    let cache = state.usage.clone();
+    usage::sign_in(move |result| {
+        if result.is_ok() {
+            cache.signed_in();
+        }
+        let _ = app.emit("claude-sign-in", result.err());
+    })
 }
 
 #[tauri::command]

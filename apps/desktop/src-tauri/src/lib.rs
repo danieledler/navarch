@@ -72,6 +72,9 @@ fn start_limit_watch(app: tauri::AppHandle) {
             loop {
                 let st = app.state::<AppState>();
                 let usage = st.usage.get(near && installed);
+                if usage.needs_sign_in && st.usage.claim_sign_in_notice() {
+                    notify_signed_out(&app);
+                }
                 // A failed fetch says nothing about usage: keep the alert as it is.
                 if usage.error.is_none() {
                     if let Ok(mut w) = st.limits.lock() {
@@ -85,6 +88,18 @@ fn start_limit_watch(app: tauri::AppHandle) {
             }
         })
         .expect("spawn limit watch thread");
+}
+
+/// Says so once per sign-out (whichever Navarch process sees it first), since usage and limit alerts
+/// stop until Claude Code is signed in again. Clicking it brings Navarch forward, where the fix is.
+fn notify_signed_out(app: &tauri::AppHandle) {
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app
+        .notification()
+        .builder()
+        .title("Claude Code is signed out")
+        .body("Navarch can't read plan usage or warn sessions near a limit. Click Claude in Navarch's status bar to sign in again.")
+        .show();
 }
 
 fn start_scanner(app: tauri::AppHandle, db_path: std::path::PathBuf, sessions: Arc<Mutex<Vec<scanner::Session>>>) {
@@ -191,6 +206,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .on_menu_event(|app, event| {
             if event.id().as_ref() == "undo" {
                 let _ = app.emit("menu-undo", ());
@@ -268,6 +284,7 @@ pub fn run() {
             commands::get_cpu_history,
             commands::get_build_info,
             commands::get_usage,
+            commands::sign_in_claude,
             commands::get_limit_alerts,
             commands::set_limit_thresholds,
             commands::get_mobile_access,
@@ -282,9 +299,12 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while running Navarch")
-        .run(|_app, _event| {
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                usage::cancel_sign_in();
+            }
             #[cfg(all(dev, target_os = "macos"))]
-            if let tauri::RunEvent::Ready = _event {
+            if let tauri::RunEvent::Ready = event {
                 set_dev_dock_icon();
             }
         });

@@ -450,7 +450,7 @@ mod tests {
     fn usage_is_never_forced() {
         // Old enough that a forced read would refetch, young enough for a plain read to use the cache.
         let fetched_at = db::now_ms() - 60_000;
-        let cached = Usage { five_hour: None, seven_day: None, error: Some("cached".into()), fetched_at };
+        let cached = Usage { five_hour: None, seven_day: None, error: Some("cached".into()), fetched_at, needs_sign_in: false };
         let t = setup(UsageCache::holding(cached));
         let (status, body) = t.call("get_usage", json!({ "force": true }));
         assert_eq!(status, 200);

@@ -35,6 +35,8 @@ interface State extends UIPrefs {
   sessions: Session[];
   sys: SystemStats | null;
   usage: Usage | null;
+  /** A Claude Code sign-in is waiting for the browser. */
+  signingIn: boolean;
   selectedTask: Id | null;
   editing: Id | null;
   toasts: Toast[];
@@ -59,6 +61,8 @@ interface State extends UIPrefs {
   setRecentFirst: (spaceId: Id, on: boolean) => void;
   setLogByProject: (b: boolean) => void;
   refreshUsage: (force: boolean) => Promise<void>;
+  /** Opens Claude Code's sign-in in the browser; a toast says how it went. */
+  signInClaude: () => Promise<void>;
 }
 
 const PREFS = "navarch-ui";
@@ -102,6 +106,7 @@ export const useStore = create<State>((set, get) => ({
   sessions: [],
   sys: null,
   usage: null,
+  signingIn: false,
   selectedTask: null,
   editing: null,
   toasts: [],
@@ -130,6 +135,14 @@ export const useStore = create<State>((set, get) => ({
     api.onLimitAlert((summary) => {
       get().toast(`Usage limit close (${summary}): told running sessions to save their work and schedule their resume`);
       get().refreshUsage(false);
+    });
+    api.onClaudeSignIn((error) => {
+      set({ signingIn: false });
+      if (error) get().toast(`Claude Code sign-in didn’t finish: ${error}`, undefined, "error");
+      else {
+        get().toast("Signed in to Claude Code");
+        get().refreshUsage(false);
+      }
     });
     api.onPhoneServe((message, error) => get().toast(`Phone access: ${message}`, undefined, error ? "error" : undefined));
     // In a text field, undo means the field's own text history.
@@ -230,7 +243,17 @@ export const useStore = create<State>((set, get) => ({
     try {
       set({ usage: await api.getUsage(force) });
     } catch (e) {
-      set((s) => ({ usage: { fiveHour: null, sevenDay: null, fetchedAt: Date.now(), ...s.usage, error: String(e) } }));
+      set((s) => ({ usage: { fiveHour: null, sevenDay: null, fetchedAt: Date.now(), needsSignIn: false, ...s.usage, error: String(e) } }));
+    }
+  },
+
+  signInClaude: async () => {
+    set({ signingIn: true });
+    try {
+      await api.signInClaude();
+    } catch (e) {
+      set({ signingIn: false });
+      get().toast(`Couldn’t start the Claude Code sign-in: ${e}`, undefined, "error");
     }
   },
 }));

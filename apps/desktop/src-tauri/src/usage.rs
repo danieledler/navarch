@@ -8,13 +8,18 @@
 //! The keychain token lasts 8 hours, and only Claude Code renews it, when it makes a request of its own; the
 //! desktop app's Code tab never renews this copy. So when it has expired, Navarch has Claude Code make the
 //! smallest request it can (`renew`), at most every half hour, and asks again.
+//!
+//! Renewing needs Claude Code's refresh token, which runs out too (its own expiry, weeks on). Then Claude
+//! Code clears the keychain copy and is signed out: only a new sign-in helps, so the usage says
+//! `needs_sign_in`, `sign_in` runs `claude auth login` (it opens the browser), and the limit watch
+//! posts one notification per sign-out, claimed through the shared file so only one process posts it.
 
 use crate::db::now_ms;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -31,6 +36,8 @@ const RETRY_AFTER_MAX_MS: i64 = 60 * 60_000;
 /// At most one renewal per this, so a Claude Code that can't renew (signed out) isn't run every 5 minutes.
 const RENEW_EVERY_MS: i64 = 30 * 60_000;
 const RENEW_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long `claude auth login` may wait for the browser before Navarch gives up on it.
+const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +54,9 @@ pub struct Usage {
     pub seven_day: Option<UsageWindow>,
     pub error: Option<String>,
     pub fetched_at: i64,
+    /// Claude Code is signed out, or its sign-in expired and couldn't be renewed: only a new sign-in helps.
+    #[serde(default)]
+    pub needs_sign_in: bool,
 }
 
 /// The shared cache file's contents: usage plus request bookkeeping. Never the token.
@@ -64,6 +74,8 @@ struct Shared {
     renewed_at: i64,
     /// Why that renewal failed; cleared once a request works again.
     renew_error: Option<String>,
+    /// Some process has posted the notification for this sign-out; cleared once a request works again.
+    sign_in_noticed: bool,
 }
 
 enum Outcome {
@@ -71,6 +83,8 @@ enum Outcome {
     RateLimited(Option<i64>),
     /// The token has expired (or was refused): time to renew it.
     Expired,
+    /// The keychain holds no token: Claude Code is signed out, and renewing can't help.
+    SignedOut,
     Failed(String),
 }
 
@@ -104,20 +118,22 @@ fn clock(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+const SIGNED_OUT: &str = "Claude Code is signed out, so Navarch can't read plan usage or warn sessions near a limit. Sign in again to fix it.";
+
 fn expired_message(renew_error: Option<&str>) -> String {
     match renew_error {
-        Some(e) => format!("Claude Code's sign-in expired and Navarch couldn't renew it ({e}). Run claude in Terminal to sign in again."),
+        Some(e) => format!("Claude Code's sign-in expired and Navarch couldn't renew it ({e}). Sign in again to fix it."),
         None => "Claude Code's sign-in expired".into(),
     }
 }
 
 /// The cache after a request made at `now`.
 fn record(prev: Shared, outcome: Outcome, now: i64) -> Shared {
-    let failed = |error: String, retry_at, rate_limited| {
+    let failed = |error: String, retry_at, rate_limited, needs_sign_in| {
         let had_numbers = prev.usage.five_hour.is_some() || prev.usage.seven_day.is_some();
         let fetched_at = if had_numbers { prev.usage.fetched_at } else { now };
         Shared {
-            usage: Usage { error: Some(error), fetched_at, ..prev.usage.clone() },
+            usage: Usage { error: Some(error), fetched_at, needs_sign_in, ..prev.usage.clone() },
             asked_at: now,
             retry_at,
             rate_limited,
@@ -126,21 +142,26 @@ fn record(prev: Shared, outcome: Outcome, now: i64) -> Shared {
     };
     match outcome {
         Outcome::Usage(five_hour, seven_day) => Shared {
-            usage: Usage { five_hour, seven_day, error: None, fetched_at: now },
+            usage: Usage { five_hour, seven_day, error: None, fetched_at: now, needs_sign_in: false },
             asked_at: now,
             retry_at: 0,
             rate_limited: 0,
             renewed_at: prev.renewed_at,
             renew_error: None,
+            sign_in_noticed: false,
         },
         Outcome::RateLimited(retry_after) => {
             let n = prev.rate_limited + 1;
             let wait = backoff_ms(n).max(retry_after.map_or(0, |ms| ms.min(RETRY_AFTER_MAX_MS)));
             let retry_at = now + wait;
-            failed(format!("Usage requests rate-limited (HTTP 429); next try at {}", clock(retry_at)), retry_at, n)
+            failed(format!("Usage requests rate-limited (HTTP 429); next try at {}", clock(retry_at)), retry_at, n, false)
         }
-        Outcome::Expired => failed(expired_message(prev.renew_error.as_deref()), 0, prev.rate_limited),
-        Outcome::Failed(e) => failed(e, 0, prev.rate_limited),
+        Outcome::Expired => {
+            let renew_failed = prev.renew_error.is_some();
+            failed(expired_message(prev.renew_error.as_deref()), 0, prev.rate_limited, renew_failed)
+        }
+        Outcome::SignedOut => failed(SIGNED_OUT.into(), 0, prev.rate_limited, true),
+        Outcome::Failed(e) => failed(e, 0, prev.rate_limited, false),
     }
 }
 
@@ -177,32 +198,60 @@ impl UsageCache {
         mut request: impl FnMut() -> Outcome,
         renew: impl FnOnce() -> Result<(), String>,
     ) -> Usage {
-        let mut mem = self.mem.lock().unwrap_or_else(|e| e.into_inner());
+        self.update(|shared| {
+            if should_fetch(shared, force, now) {
+                let mut outcome = request();
+                if matches!(outcome, Outcome::Expired) && now - shared.renewed_at >= RENEW_EVERY_MS {
+                    shared.renewed_at = now;
+                    shared.renew_error = match renew() {
+                        Ok(()) => {
+                            outcome = request();
+                            matches!(outcome, Outcome::Expired).then(|| "still expired after renewing".to_string())
+                        }
+                        Err(e) => Some(e),
+                    };
+                }
+                *shared = record(shared.clone(), outcome, now);
+            }
+            shared.usage.clone()
+        })
+    }
+
+    /// True for the one caller, across Navarch processes, that should post the notice for this sign-out.
+    pub fn claim_sign_in_notice(&self) -> bool {
+        self.update(|s| {
+            let claim = s.usage.needs_sign_in && !s.sign_in_noticed;
+            s.sign_in_noticed |= claim;
+            claim
+        })
+    }
+
+    /// After a sign-in: the next `get` asks the server, and may renew right away should that be needed.
+    pub fn signed_in(&self) {
+        self.update(|s| {
+            s.asked_at = 0;
+            s.renewed_at = 0;
+            s.renew_error = None;
+        })
+    }
+
+    /// Runs `f` on the shared state under the file lock, and writes back what it changed.
+    fn update<R>(&self, f: impl FnOnce(&mut Shared) -> R) -> R {
+        let mut mem = lock(&self.mem);
         let mut file = self.file.as_ref().and_then(|p| open_locked(p).ok());
         let mut shared = file.as_mut().and_then(read_shared).unwrap_or_else(|| mem.clone());
-        let shared = if should_fetch(&shared, force, now) {
-            let mut outcome = request();
-            if matches!(outcome, Outcome::Expired) && now - shared.renewed_at >= RENEW_EVERY_MS {
-                shared.renewed_at = now;
-                shared.renew_error = match renew() {
-                    Ok(()) => {
-                        outcome = request();
-                        matches!(outcome, Outcome::Expired).then(|| "still expired after renewing".to_string())
-                    }
-                    Err(e) => Some(e),
-                };
-            }
-            let next = record(shared, outcome, now);
-            if let Some(f) = file.as_mut() {
-                let _ = write_shared(f, &next);
-            }
-            next
-        } else {
-            shared
-        };
-        *mem = shared.clone();
-        shared.usage
+        let before = shared.clone();
+        let r = f(&mut shared);
+        if let Some(file) = file.as_mut().filter(|_| shared != before) {
+            let _ = write_shared(file, &shared);
+        }
+        *mem = shared;
+        r
     }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Opens the cache file with an exclusive lock, released when the file is dropped.
@@ -224,24 +273,24 @@ fn write_shared(f: &mut File, s: &Shared) -> std::io::Result<()> {
     f.write_all(&serde_json::to_vec(s).map_err(std::io::Error::other)?)
 }
 
-fn read_token() -> Result<(String, Option<i64>), String> {
+/// The access token and when it expires, or None when Claude Code is signed out: no keychain item, no
+/// Claude login in it, or the empty token Claude Code leaves behind when its sign-in runs out.
+fn read_token() -> Result<Option<(String, Option<i64>)>, String> {
     let out = std::process::Command::new("/usr/bin/security")
         .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
         .output()
         .map_err(|_| "Could not run security".to_string())?;
     if !out.status.success() {
-        return Err("Claude Code credentials not found in keychain".into());
+        return Ok(None);
     }
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).map_err(|_| "Unreadable Claude Code credentials".to_string())?;
-    let oauth = v.get("claudeAiOauth").ok_or("No Claude login in credentials")?;
-    let token = oauth
-        .get("accessToken")
-        .and_then(|t| t.as_str())
-        .ok_or("No access token in credentials")?
-        .to_string();
-    let expires = oauth.get("expiresAt").and_then(|e| e.as_f64()).map(|e| e as i64);
-    Ok((token, expires))
+    let oauth = v.get("claudeAiOauth");
+    let Some(token) = oauth.and_then(|o| o.get("accessToken")).and_then(|t| t.as_str()).filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    let expires = oauth.and_then(|o| o.get("expiresAt")).and_then(|e| e.as_f64()).map(|e| e as i64);
+    Ok(Some((token.to_string(), expires)))
 }
 
 fn window(v: &serde_json::Value, key: &str) -> Option<UsageWindow> {
@@ -257,7 +306,8 @@ fn window(v: &serde_json::Value, key: &str) -> Option<UsageWindow> {
 
 fn request() -> Outcome {
     let (token, expires) = match read_token() {
-        Ok(t) => t,
+        Ok(Some(t)) => t,
+        Ok(None) => return Outcome::SignedOut,
         Err(e) => return Outcome::Failed(e),
     };
     if expires.is_some_and(|e| e <= now_ms()) {
@@ -296,36 +346,103 @@ fn request() -> Outcome {
 
 /// Has Claude Code renew its keychain token by making the smallest request it can: Haiku, no tools, no
 /// settings (so no hooks), and no saved session (so nothing for the scanner). Navarch never touches the
-/// token itself. Inherited CLAUDE*/ANTHROPIC* variables are dropped: a dev window started from a Claude
-/// session carries them, and a token or key in them would leave the keychain copy as it is.
+/// token itself.
 fn renew() -> Result<(), String> {
+    let mut cmd = claude_command()?;
+    cmd.args(["-p", "Reply with OK.", "--model", "haiku", "--no-session-persistence", "--tools", "", "--setting-sources", ""]);
+    let mut child = cmd.spawn().map_err(|_| "couldn't run claude".to_string())?;
+    let deadline = Instant::now() + RENEW_TIMEOUT;
+    loop {
+        if let Some(result) = ended(&mut child, deadline) {
+            return result;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// The `claude auth login` under way, with its number: starting another one replaces it.
+static SIGN_IN: Mutex<Option<(u64, Child)>> = Mutex::new(None);
+
+/// Starts `claude auth login`, which opens Claude's sign-in page in the browser and waits for it to come
+/// back with a new token for the keychain. `done` hears how it ended, unless a later sign-in replaced it.
+pub fn sign_in(done: impl FnOnce(Result<(), String>) + Send + 'static) -> Result<(), String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut cmd = claude_command()?;
+    cmd.args(["auth", "login"]);
+    let child = cmd.spawn().map_err(|_| "Couldn't run claude".to_string())?;
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some((_, mut old)) = lock(&SIGN_IN).replace((id, child)) {
+        let _ = old.kill();
+        let _ = old.wait();
+    }
+    let deadline = Instant::now() + SIGN_IN_TIMEOUT;
+    std::thread::Builder::new()
+        .name("navarch-sign-in".into())
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let mut slot = lock(&SIGN_IN);
+            let Some((_, child)) = slot.as_mut().filter(|(current, _)| *current == id) else { return };
+            if let Some(result) = ended(child, deadline) {
+                *slot = None;
+                drop(slot);
+                return done(result.map_err(|e| if e == "claude timed out" { "Sign-in timed out".into() } else { e }));
+            }
+        })
+        .map_err(|_| "Couldn't wait for claude".to_string())?;
+    Ok(())
+}
+
+/// Stops a sign-in still waiting for the browser, so it doesn't outlive Navarch.
+pub fn cancel_sign_in() {
+    if let Some((_, mut child)) = lock(&SIGN_IN).take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// `claude` set up to run on its own: in the temp folder, with no input, and output kept for the error.
+/// Inherited CLAUDE*/ANTHROPIC* variables are dropped: a dev window started from a Claude session carries
+/// them, and a token or key in them would leave the keychain copy as it is.
+fn claude_command() -> Result<Command, String> {
     let bin = claude_bin().ok_or("no claude command found")?;
     let mut cmd = Command::new(bin);
-    cmd.args(["-p", "Reply with OK.", "--model", "haiku", "--no-session-persistence", "--tools", "", "--setting-sources", ""])
-        .current_dir(std::env::temp_dir())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    cmd.current_dir(std::env::temp_dir()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     for (k, _) in std::env::vars_os() {
         if k.to_str().is_some_and(|k| k.starts_with("CLAUDE") || k.starts_with("ANTHROPIC")) {
             cmd.env_remove(k);
         }
     }
-    let mut child = cmd.spawn().map_err(|_| "couldn't run claude".to_string())?;
-    let deadline = Instant::now() + RENEW_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => return Err(format!("claude exited with {}", status.code().unwrap_or(-1))),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("claude timed out".into());
-            }
-            Err(_) => return Err("couldn't run claude".into()),
+    Ok(cmd)
+}
+
+/// How `child` ended, once it has: on failure, the last thing it said. Kills it past `deadline`.
+fn ended(child: &mut Child, deadline: Instant) -> Option<Result<(), String>> {
+    match child.try_wait() {
+        Ok(Some(status)) if status.success() => Some(Ok(())),
+        Ok(Some(status)) => Some(Err(last_words(child).unwrap_or_else(|| format!("claude exited with {}", status.code().unwrap_or(-1))))),
+        Ok(None) if Instant::now() < deadline => None,
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Some(Err("claude timed out".into()))
         }
+        Err(_) => Some(Err("couldn't run claude".into())),
     }
+}
+
+/// The last line an ended `claude` wrote, stderr first (`-p` puts its errors on stdout), skipping
+/// `auth login`'s prompt for a pasted code. Short, so it fits in the usage error.
+fn last_words(child: &mut Child) -> Option<String> {
+    let read = |r: Option<&mut dyn Read>| {
+        let mut s = String::new();
+        r.map(|r| r.read_to_string(&mut s));
+        s.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("Paste code")).last().map(str::to_string)
+    };
+    let line = read(child.stderr.as_mut().map(|r| r as &mut dyn Read)).or_else(|| read(child.stdout.as_mut().map(|r| r as &mut dyn Read)))?;
+    Some(match line.char_indices().nth(160) {
+        Some((i, _)) => format!("{}…", &line[..i]),
+        None => line,
+    })
 }
 
 /// The claude command: an app from Finder gets a bare PATH, so the usual install places come first.
@@ -423,17 +540,47 @@ mod tests {
         // A failed renewal keeps the numbers and says why.
         let u = run(now + 31 * MIN, vec![Outcome::Expired], Err("claude timed out".into()));
         let e = u.error.unwrap();
-        assert!(e.contains("claude timed out") && e.contains("Run claude"), "{e}");
-        assert_eq!((renewals.get(), u.five_hour.map(|w| w.percent)), (2, Some(10.0)));
+        assert!(e.contains("claude timed out") && e.contains("Sign in again"), "{e}");
+        assert_eq!((renewals.get(), u.five_hour.map(|w| w.percent), u.needs_sign_in), (2, Some(10.0), true));
         // Within half an hour it isn't tried again, and the reason stays.
         let u = run(now + 37 * MIN, vec![Outcome::Expired], Ok(()));
         assert_eq!(renewals.get(), 2);
         assert!(u.error.unwrap().contains("claude timed out"));
         let u = run(now + 62 * MIN, vec![Outcome::Expired, ok(20.0)], Ok(()));
-        assert_eq!((renewals.get(), u.error, u.five_hour.map(|w| w.percent)), (3, None, Some(20.0)));
+        assert_eq!((renewals.get(), u.error, u.five_hour.map(|w| w.percent), u.needs_sign_in), (3, None, Some(20.0), false));
         // Renewed, yet still refused.
         let u = run(now + 93 * MIN, vec![Outcome::Expired, Outcome::Expired], Ok(()));
         assert!(u.error.unwrap().contains("still expired after renewing"));
+        assert!(u.needs_sign_in);
+        // After a sign-in the next read asks at once, and may renew again.
+        cache.signed_in();
+        let u = run(now + 94 * MIN, vec![Outcome::Expired, ok(30.0)], Ok(()));
+        assert_eq!((renewals.get(), u.error, u.needs_sign_in), (5, None, false));
+    }
+
+    #[test]
+    fn signed_out_needs_a_sign_in_and_one_notice() {
+        let cache = UsageCache::new(None);
+        let now = 1_000 * MIN;
+        let get = |at: i64, outcome: Outcome| {
+            let mut outcome = Some(outcome);
+            cache.get_with(false, at, || outcome.take().expect("one request"), || panic!("signed out: nothing to renew"))
+        };
+        get(now, ok(10.0));
+        assert!(!cache.claim_sign_in_notice(), "nothing to tell while signed in");
+        // Signed out: no renewal, the numbers stay, and one notice goes out.
+        let u = get(now + 5 * MIN, Outcome::SignedOut);
+        assert_eq!((u.needs_sign_in, u.five_hour.map(|w| w.percent)), (true, Some(10.0)));
+        assert!(u.error.unwrap().contains("signed out"));
+        assert!(cache.claim_sign_in_notice());
+        assert!(!cache.claim_sign_in_notice());
+        assert!(get(now + 10 * MIN, Outcome::SignedOut).needs_sign_in && !cache.claim_sign_in_notice());
+        // Signed in again: clear, and the next sign-out gets a notice of its own.
+        assert!(!get(now + 15 * MIN, ok(12.0)).needs_sign_in);
+        // A network failure says nothing about the sign-in.
+        assert!(!get(now + 20 * MIN, Outcome::Failed("x".into())).needs_sign_in);
+        get(now + 25 * MIN, Outcome::SignedOut);
+        assert!(cache.claim_sign_in_notice());
     }
 
     #[test]

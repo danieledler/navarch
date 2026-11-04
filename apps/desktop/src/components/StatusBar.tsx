@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { TriangleAlert } from "lucide-react";
 import { useStore } from "../store";
 import { fmtUntil, relTime } from "../lib/format";
 import { usagePaces, type Pace } from "../lib/pace";
@@ -43,9 +44,13 @@ export function StatusBar() {
       <span className="usage-win muted">{label} –</span>
     );
 
-  // After a failed request the last good numbers stay, dimmed, with the error on hover.
+  // After a failed request the last good numbers stay, dimmed, with a warning sign and the error on
+  // hover. Signed out, they'd only get older: the bar says so in red instead, since nothing else fixes it.
+  const signedOut = !!usage?.needsSignIn;
   const stale = !!usage?.error && !!(usage.fiveHour || usage.sevenDay);
-  const usageTitle = usage?.error && !stale
+  const usageTitle = signedOut
+    ? `${usage.error}\nClick to sign in again`
+    : usage?.error && !stale
     ? `Claude usage unavailable: ${usage.error}`
     : usage
       ? [
@@ -98,14 +103,17 @@ export function StatusBar() {
       <button
         ref={usageRef}
         type="button"
-        className={`sb-item sb-btn usage ${usageOpen ? "is-open" : ""} ${stale ? "is-stale" : ""}`}
+        className={`sb-item sb-btn usage ${usageOpen ? "is-open" : ""} ${stale ? "is-stale" : ""} ${signedOut ? "is-error" : usage?.error ? "is-warn" : ""}`}
         title={usageOpen ? undefined : usageTitle}
         aria-expanded={usageOpen}
         onClick={() => setUsageOpen((o) => !o)}
       >
+        {usage?.error && <TriangleAlert size={13} className="usage-alert" aria-label="Warning" />}
         <span className="muted">Claude</span>
-        {usage?.error && !stale ? (
-          <span className="muted">unavailable</span>
+        {signedOut ? (
+          <span className="usage-msg">signed out</span>
+        ) : usage?.error && !stale ? (
+          <span className="usage-msg">unavailable</span>
         ) : (
           <>
             {win("5h", usage?.fiveHour ?? null, paces.fiveHour)}

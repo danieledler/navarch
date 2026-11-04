@@ -130,6 +130,8 @@ export interface Usage {
   sevenDay: UsageWindow | null;
   error: string | null;
   fetchedAt: number;
+  /** Claude Code is signed out, or its sign-in expired and couldn't be renewed: only a new sign-in helps. */
+  needsSignIn: boolean;
 }
 
 /** At these percentages Navarch tells running sessions to save their work and schedule their resume. */
