@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { TriangleAlert } from "lucide-react";
 import { useStore } from "../store";
 import { fmtUntil, relTime } from "../lib/format";
-import { usagePaces, type Pace } from "../lib/pace";
+import { fmtSignInEnd, signInEndsSoon, usagePaces, type Pace } from "../lib/pace";
 import { api, type BuildInfo, type MobileAccess, type UsageWindow } from "../api";
 import { StatusDot } from "./ui";
 import { UsagePopover } from "./UsagePopover";
@@ -47,7 +47,11 @@ export function StatusBar() {
   // After a failed request the last good numbers stay, dimmed, with a warning sign and the error on
   // hover. Signed out, they'd only get older: the bar says so in red instead, since nothing else fixes it.
   const signedOut = !!usage?.needsSignIn;
+  const endsSoon = signInEndsSoon(usage);
   const stale = !!usage?.error && !!(usage.fiveHour || usage.sevenDay);
+  const headsUp = endsSoon
+    ? `Claude Code's sign-in runs out in ${fmtUntil(new Date(endsSoon).toISOString(), true)} (${fmtSignInEnd(endsSoon)}). Click to sign in again.`
+    : null;
   const usageTitle = signedOut
     ? `${usage.error}\nClick to sign in again`
     : usage?.error && !stale
@@ -57,7 +61,7 @@ export function StatusBar() {
           stale && `Numbers from ${relTime(usage.fetchedAt)}: ${usage.error}`,
           usage.fiveHour && `5-hour window: ${Math.round(usage.fiveHour.percent)}% used, resets in ${fmtUntil(usage.fiveHour.resetsAt, true)}`,
           usage.sevenDay && `Weekly: ${Math.round(usage.sevenDay.percent)}% used, resets in ${fmtUntil(usage.sevenDay.resetsAt, true)}`,
-          "Click for pacing details",
+          headsUp ?? "Click for pacing details",
         ]
           .filter(Boolean)
           .join("\n")
@@ -103,12 +107,12 @@ export function StatusBar() {
       <button
         ref={usageRef}
         type="button"
-        className={`sb-item sb-btn usage ${usageOpen ? "is-open" : ""} ${stale ? "is-stale" : ""} ${signedOut ? "is-error" : usage?.error ? "is-warn" : ""}`}
+        className={`sb-item sb-btn usage ${usageOpen ? "is-open" : ""} ${stale ? "is-stale" : ""} ${signedOut ? "is-error" : usage?.error || endsSoon ? "is-warn" : ""}`}
         title={usageOpen ? undefined : usageTitle}
         aria-expanded={usageOpen}
         onClick={() => setUsageOpen((o) => !o)}
       >
-        {usage?.error && <TriangleAlert size={13} className="usage-alert" aria-label="Warning" />}
+        {(usage?.error || endsSoon) && <TriangleAlert size={13} className="usage-alert" aria-label="Warning" />}
         <span className="muted">Claude</span>
         {signedOut ? (
           <span className="usage-msg">signed out</span>

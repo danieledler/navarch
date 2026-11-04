@@ -36,6 +36,9 @@ const RETRY_AFTER_MAX_MS: i64 = 60 * 60_000;
 /// At most one renewal per this, so a Claude Code that can't renew (signed out) isn't run every 5 minutes.
 const RENEW_EVERY_MS: i64 = 30 * 60_000;
 const RENEW_TIMEOUT: Duration = Duration::from_secs(60);
+/// A notification goes out this long before the sign-in runs out (the UI warns from 3 days before).
+/// Signing in again early moves the end out (about 30 days), so the heads-up can prevent the gap.
+const SIGN_IN_NOTICE_MS: i64 = 24 * 3_600_000;
 /// How long `claude auth login` may wait for the browser before Navarch gives up on it.
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
@@ -79,6 +82,16 @@ struct Shared {
     renew_error: Option<String>,
     /// Some process has posted the notification for this sign-out; cleared once a request works again.
     sign_in_noticed: bool,
+    /// The sign-in end the "runs out soon" notification went out for.
+    ends_noticed: Option<i64>,
+}
+
+/// A notification to post, claimed by one Navarch process.
+#[derive(Debug, PartialEq)]
+pub enum Notice {
+    SignedOut,
+    /// The sign-in runs out at this time, within a day.
+    EndsSoon(i64),
 }
 
 enum Outcome {
@@ -153,6 +166,7 @@ fn record(prev: Shared, outcome: Outcome, now: i64) -> Shared {
             renewed_at: prev.renewed_at,
             renew_error: None,
             sign_in_noticed: false,
+            ends_noticed: prev.ends_noticed,
         },
         Outcome::RateLimited(retry_after) => {
             let n = prev.rate_limited + 1;
@@ -221,12 +235,15 @@ impl UsageCache {
         })
     }
 
-    /// True for the one caller, across Navarch processes, that should post the notice for this sign-out.
-    pub fn claim_sign_in_notice(&self) -> bool {
+    /// The notification due at `now`, for the one caller across Navarch processes that should post it:
+    /// once per sign-out, and once per sign-in end that's less than a day away.
+    pub fn claim_notice(&self, now: i64) -> Option<Notice> {
         self.update(|s| {
-            let claim = s.usage.needs_sign_in && !s.sign_in_noticed;
-            s.sign_in_noticed |= claim;
-            claim
+            if s.usage.needs_sign_in {
+                return (!std::mem::replace(&mut s.sign_in_noticed, true)).then_some(Notice::SignedOut);
+            }
+            let ends = s.usage.sign_in_ends_at.filter(|e| *e > now && *e - now <= SIGN_IN_NOTICE_MS)?;
+            (s.ends_noticed.replace(ends) != Some(ends)).then_some(Notice::EndsSoon(ends))
         })
     }
 
@@ -579,20 +596,42 @@ mod tests {
             cache.get_with(false, at, || outcome.take().expect("one request"), || panic!("signed out: nothing to renew"))
         };
         get(now, ok(10.0));
-        assert!(!cache.claim_sign_in_notice(), "nothing to tell while signed in");
+        assert_eq!(cache.claim_notice(now), None, "nothing to tell while signed in");
         // Signed out: no renewal, the numbers stay, and one notice goes out.
         let u = get(now + 5 * MIN, Outcome::SignedOut);
         assert_eq!((u.needs_sign_in, u.five_hour.map(|w| w.percent)), (true, Some(10.0)));
         assert!(u.error.unwrap().contains("signed out"));
-        assert!(cache.claim_sign_in_notice());
-        assert!(!cache.claim_sign_in_notice());
-        assert!(get(now + 10 * MIN, Outcome::SignedOut).needs_sign_in && !cache.claim_sign_in_notice());
+        assert_eq!(cache.claim_notice(now), Some(Notice::SignedOut));
+        assert_eq!(cache.claim_notice(now), None);
+        assert!(get(now + 10 * MIN, Outcome::SignedOut).needs_sign_in && cache.claim_notice(now).is_none());
         // Signed in again: clear, and the next sign-out gets a notice of its own.
         assert!(!get(now + 15 * MIN, ok(12.0)).needs_sign_in);
         // A network failure says nothing about the sign-in.
         assert!(!get(now + 20 * MIN, Outcome::Failed("x".into())).needs_sign_in);
         get(now + 25 * MIN, Outcome::SignedOut);
-        assert!(cache.claim_sign_in_notice());
+        assert_eq!(cache.claim_notice(now), Some(Notice::SignedOut));
+    }
+
+    #[test]
+    fn one_heads_up_a_day_before_the_sign_in_runs_out() {
+        const DAY: i64 = 24 * 60 * MIN;
+        let cache = UsageCache::new(None);
+        let ends = 1_000 * DAY;
+        let mut at = ends - 3 * DAY;
+        let mut get = |ends: i64| {
+            at += 10 * MIN;
+            let mut outcome = Some(Outcome::Usage(None, None, Some(ends)));
+            cache.get_with(false, at, || outcome.take().expect("one request"), || panic!("nothing to renew"));
+        };
+        get(ends);
+        assert_eq!(cache.claim_notice(ends - 2 * DAY), None, "too early");
+        assert_eq!(cache.claim_notice(ends - DAY + MIN), Some(Notice::EndsSoon(ends)));
+        assert_eq!(cache.claim_notice(ends - MIN), None, "once per end");
+        assert_eq!(cache.claim_notice(ends + MIN), None, "past it, the sign-out notice takes over");
+        // Signed in again: a new end, a heads-up of its own when it comes near.
+        get(ends + 30 * DAY);
+        assert_eq!(cache.claim_notice(ends + MIN), None);
+        assert_eq!(cache.claim_notice(ends + 29 * DAY + MIN), Some(Notice::EndsSoon(ends + 30 * DAY)));
     }
 
     #[test]

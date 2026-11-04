@@ -255,7 +255,8 @@ export function mockApi(): Api {
     onPhoneServe: () => {},
     getUsage: async (): Promise<Usage> => {
       // ?usage=hot shows over-pace tones, ?usage=zero a fresh window, ?usage=error the unavailable state,
-      // ?usage=stale the last good numbers after a 429, ?usage=signedout a sign-out (until Sign in).
+      // ?usage=stale the last good numbers after a 429, ?usage=signedout a sign-out (until Sign in),
+      // ?usage=endsoon a sign-in that runs out tomorrow (until Sign in).
       const mode = new URLSearchParams(location.search).get("usage");
       const at = (ms: number) => new Date(Date.now() + ms).toISOString();
       if (mode === "error") return { fiveHour: null, sevenDay: null, error: "Usage request failed (network)", fetchedAt: Date.now(), needsSignIn: false, signInEndsAt: null };
@@ -286,7 +287,7 @@ export function mockApi(): Api {
         error: null,
         fetchedAt: Date.now() - 2 * 6e4,
         needsSignIn: false,
-        signInEndsAt: Date.now() + 27 * 864e5,
+        signInEndsAt: Date.now() + (mode === "endsoon" && !mockSignedIn ? 30 * 36e5 : 27 * 864e5),
       };
     },
     // Stands in for the browser sign-in: it "works" after a moment.

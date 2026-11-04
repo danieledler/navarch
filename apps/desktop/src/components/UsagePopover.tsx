@@ -3,7 +3,7 @@ import { RefreshCw, TriangleAlert } from "lucide-react";
 import { api, type LimitAlerts, type UsageWindow } from "../api";
 import { useStore } from "../store";
 import { fmtUntil, relTime } from "../lib/format";
-import { usagePaces, type Pace } from "../lib/pace";
+import { fmtSignInEnd, signInEndsSoon, usagePaces, type Pace } from "../lib/pace";
 import { Popover } from "./ui";
 
 /** Claude plan limits in detail: a ring per window and how usage compares with an even pace. */
@@ -18,6 +18,7 @@ export function UsagePopover({ anchor, onClose }: { anchor: React.RefObject<HTML
   }, []);
 
   const paces = usagePaces(usage);
+  const endsSoon = signInEndsSoon(usage);
   const stale = !!usage?.error && !!(usage.fiveHour || usage.sevenDay);
   const refresh = async () => {
     setBusy(true);
@@ -39,7 +40,16 @@ export function UsagePopover({ anchor, onClose }: { anchor: React.RefObject<HTML
           <span>{usage.error}</span>
         </p>
       )}
-      {usage?.needsSignIn && <SignIn />}
+      {endsSoon && (
+        <p className="up-error is-warn">
+          <TriangleAlert size={14} aria-hidden />
+          <span>
+            Claude Code’s sign-in runs out in {fmtUntil(new Date(endsSoon).toISOString(), true)} ({fmtSignInEnd(endsSoon)}). Sign in
+            again now to keep plan usage and limit alerts working; it then lasts about 30 days.
+          </span>
+        </p>
+      )}
+      {(usage?.needsSignIn || endsSoon) && <SignIn />}
       {(!usage?.error || stale) && (
         <div className={`up-body ${stale ? "is-stale" : ""}`}>
           <div className="up-rings">

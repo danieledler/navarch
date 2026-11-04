@@ -33,3 +33,16 @@ export function usagePaces(u: Usage | null, now = Date.now()) {
     sevenDay: u?.sevenDay ? paceOf(u.sevenDay, SEVEN_DAYS, now) : null,
   };
 }
+
+/** From this long before Claude Code's sign-in runs out, Navarch suggests signing in again (it then lasts about 30 days). */
+export const SIGN_IN_HEADS_UP_MS = 3 * 24 * 3600_000;
+
+/** When the sign-in runs out, if that's within the heads-up and still ahead; past it, `needsSignIn` takes over. */
+export function signInEndsSoon(u: Usage | null, now = Date.now()): number | null {
+  const at = u?.signInEndsAt;
+  return at && !u.needsSignIn && at > now && at - now <= SIGN_IN_HEADS_UP_MS ? at : null;
+}
+
+/** "Fri 4 Dec, 14:06" */
+export const fmtSignInEnd = (ms: number) =>
+  new Date(ms).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });

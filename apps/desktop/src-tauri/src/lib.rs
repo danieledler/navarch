@@ -72,8 +72,8 @@ fn start_limit_watch(app: tauri::AppHandle) {
             loop {
                 let st = app.state::<AppState>();
                 let usage = st.usage.get(near && installed);
-                if usage.needs_sign_in && st.usage.claim_sign_in_notice() {
-                    notify_signed_out(&app);
+                if let Some(notice) = st.usage.claim_notice(db::now_ms()) {
+                    notify(&app, notice);
                 }
                 // A failed fetch says nothing about usage: keep the alert as it is.
                 if usage.error.is_none() {
@@ -90,16 +90,24 @@ fn start_limit_watch(app: tauri::AppHandle) {
         .expect("spawn limit watch thread");
 }
 
-/// Says so once per sign-out (whichever Navarch process sees it first), since usage and limit alerts
-/// stop until Claude Code is signed in again. Clicking it brings Navarch forward, where the fix is.
-fn notify_signed_out(app: &tauri::AppHandle) {
+/// A sign-out, or a sign-in about to run out: usage and limit alerts stop until Claude Code is signed
+/// in again. Clicking it brings Navarch forward, where the fix is.
+fn notify(app: &tauri::AppHandle, notice: usage::Notice) {
     use tauri_plugin_notification::NotificationExt;
-    let _ = app
-        .notification()
-        .builder()
-        .title("Claude Code is signed out")
-        .body("Navarch can't read plan usage or warn sessions near a limit. Click Claude in Navarch's status bar to sign in again.")
-        .show();
+    let (title, body) = match notice {
+        usage::Notice::SignedOut => (
+            "Claude Code is signed out".to_string(),
+            "Navarch can't read plan usage or warn sessions near a limit. Click Claude in Navarch's status bar to sign in again.".to_string(),
+        ),
+        usage::Notice::EndsSoon(at) => {
+            let when = chrono::DateTime::from_timestamp_millis(at).map(|t| t.with_timezone(&chrono::Local).format("%a %-d %b, %H:%M").to_string());
+            (
+                format!("Claude Code's sign-in runs out {}", when.unwrap_or_else(|| "soon".into())),
+                "Sign in again now to keep plan usage and limit alerts working: click Claude in Navarch's status bar.".to_string(),
+            )
+        }
+    };
+    let _ = app.notification().builder().title(title).body(body).show();
 }
 
 fn start_scanner(app: tauri::AppHandle, db_path: std::path::PathBuf, sessions: Arc<Mutex<Vec<scanner::Session>>>) {
