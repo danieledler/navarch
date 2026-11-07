@@ -4,6 +4,7 @@ pub mod http;
 pub mod limits;
 pub mod mobile;
 pub mod procs;
+pub mod repo;
 pub mod scanner;
 pub mod tailscale;
 pub mod usage;
@@ -303,6 +304,8 @@ pub fn run() {
             commands::tailscale_serve_status,
             commands::tailscale_serve,
             commands::open_tailscale_login,
+            commands::get_repo_overview,
+            commands::open_url,
             set_undo_menu,
         ])
         .build(tauri::generate_context!())

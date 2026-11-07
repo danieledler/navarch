@@ -3,7 +3,7 @@
 // Add ?reset to the URL to reseed.
 import type { Api } from "./index";
 import type { CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Tailscale, TailscaleServe, Session, Snapshot, SystemStats, Task, Usage } from "./types";
-import { DEMO_PICK_FOLDER, demoSessions, demoSnapshot } from "./demo";
+import { DEMO_PICK_FOLDER, demoRepoOverview, demoSessions, demoSnapshot } from "./demo";
 
 const KEY = "navarch-mock-v2";
 
@@ -240,6 +240,17 @@ export function mockApi(): Api {
     revealPath: async (path) => {
       if (import.meta.env.PROD) throw "In the app this shows the folder in Finder. The demo has no real folders.";
       console.info("[mock] reveal", path);
+    },
+    // Made-up repos for the busiest demo projects; GitHub data "fetched" a few minutes ago unless forced.
+    getRepoOverview: async (path, force) => {
+      await new Promise((r) => setTimeout(r, 150));
+      const o = demoRepoOverview(path);
+      if (o?.github && force) o.github.fetchedAt = Date.now();
+      return o;
+    },
+    openUrl: async (url) => {
+      if (import.meta.env.PROD) throw "In the app this opens it on GitHub. The demo's repos are made up.";
+      window.open(url, "_blank", "noopener");
     },
     getSessions: async () => mockSessions(db),
     getSystemStats: async () => cpu.stats(),

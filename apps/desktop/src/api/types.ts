@@ -92,6 +92,9 @@ export interface Session {
   tempFolder: boolean; // Claude started it in a temporary folder of its own ("This computer")
   launchPath: string | null; // while it's there: the folder Navarch launched it for
   remoteId?: string; // the app's latest bridgeSessionIds entry: the session's id for remote control
+  /** Folders its transcript worked in (the `cwd` of its turns), distinct, most recent last, at most 8. A session
+   *  that works in a worktree keeps the main checkout as `cwd`; only these show the worktree. */
+  cwds: string[];
 }
 
 export interface SystemStats {
@@ -195,4 +198,122 @@ export interface TailscaleServe {
 export interface PairingCode {
   code: string; // 6 characters, no 0/O/1/I/L
   expiresAt: string; // RFC 3339, 10 minutes after it was made
+}
+
+// ── Repo overview (get_repo_overview): a project folder's git worktrees and its GitHub PRs and issues ──
+
+export type CheckState = "success" | "failure" | "pending" | "neutral";
+
+export interface PrCheck {
+  name: string; // check run name or status context
+  state: CheckState;
+}
+
+export interface Label {
+  name: string;
+  color: string; // "#rrggbb"
+}
+
+export interface PullRequest {
+  number: number;
+  title: string;
+  url: string; // https://github.com/…
+  author: string; // login
+  isDraft: boolean;
+  state: "open" | "merged" | "closed";
+  headRef: string; // branch it merges from
+  baseRef: string; // branch it merges into
+  createdAt: number; // unix ms
+  updatedAt: number; // unix ms
+  review: "approved" | "changes_requested" | "review_required" | null;
+  checksState: CheckState | null; // rolled up: any failure → failure, else any pending → pending, else success; null: no checks
+  checks: PrCheck[]; // failing first, then pending, then the rest; at most 20
+  additions: number;
+  deletions: number;
+  changedFiles: number;
+  labels: Label[];
+  body: string; // description, at most 600 chars, "" when empty
+  mergeable: "mergeable" | "conflicting" | "unknown";
+  /** GitHub's mergeStateStatus, lowercased: clean, behind (base moved on), blocked (rules/reviews), dirty
+   *  (conflicts), unstable (failing non-required checks), draft, has_hooks, unknown. */
+  mergeState: string;
+  reviewers: Reviewer[]; // latest review per person, then still-requested reviewers as "pending"
+  commits: number;
+  comments: number;
+  closingIssues: number[]; // issues it closes when merged
+  autoMerge: boolean; // auto-merge is enabled
+  mergedAt: number | null; // unix ms
+  closedAt: number | null; // unix ms
+}
+
+export interface Reviewer {
+  login: string; // user login, or team name for a requested team
+  state: "approved" | "changes_requested" | "commented" | "dismissed" | "pending";
+}
+
+export interface Issue {
+  number: number;
+  title: string;
+  url: string;
+  author: string;
+  createdAt: number;
+  updatedAt: number;
+  labels: Label[];
+  assignees: string[]; // logins
+  comments: number;
+  body: string; // at most 600 chars
+  milestone: string | null;
+  issueType: string | null; // e.g. Bug, Feature (GitHub issue types)
+  subIssues: { total: number; completed: number } | null; // null: no sub-issues
+  linkedPulls: number[]; // PRs that close it when merged
+}
+
+export interface Worktree {
+  path: string; // absolute
+  branch: string | null; // null when HEAD is detached
+  head: string; // short commit hash
+  subject: string; // subject of the HEAD commit
+  committedAt: number; // unix ms of the HEAD commit
+  ahead: number; // commits on HEAD not on the base branch
+  behind: number; // commits on the base branch not on HEAD
+  dirty: number; // uncommitted entries (lines of `git status --porcelain`, untracked included)
+  changes: string[]; // the first 20 of those lines, e.g. " M apps/desktop/src/App.tsx"
+  merged: boolean; // a branch other than base whose commits are all on base (ahead == 0)
+  locked: boolean;
+  prunable: boolean; // its folder is gone
+  commitsAhead: WorktreeCommit[]; // the commits on HEAD not on base, newest first, at most 10
+  upstream: string | null; // tracking branch, e.g. "origin/repo-panel"; null when the branch was never pushed
+  unpushed: number | null; // commits not on upstream; null without upstream
+  procs: WorktreeProc[]; // processes whose working folder is inside it (dev servers, watchers), at most 10
+}
+
+export interface WorktreeCommit {
+  hash: string; // short
+  subject: string;
+  at: number; // unix ms
+}
+
+export interface WorktreeProc {
+  pid: number;
+  name: string; // process name, e.g. node, cargo, navarch
+  cmd: string; // command line, at most 160 chars
+}
+
+export interface GitHubInfo {
+  repo: string; // "owner/name"
+  url: string; // https://github.com/owner/name
+  pulls: PullRequest[]; // open, most recently updated first
+  recentPulls: PullRequest[]; // the 15 most recently merged or closed, to label worktrees whose PR is done
+  issues: Issue[]; // open, most recently updated first
+  fetchedAt: number; // unix ms of the gh calls behind this
+}
+
+/** What `get_repo_overview` returns for a folder inside a git repo (null for any other folder). */
+export interface RepoOverview {
+  root: string; // the repo's main checkout
+  base: string; // branch worktrees are compared with: origin's default branch if known, else main/master
+  branch: string | null; // the main checkout's current branch
+  worktrees: Worktree[]; // linked worktrees, main checkout excluded
+  github: GitHubInfo | null; // last good GitHub data (may be older than a failed refresh)
+  githubError: string | null; // why there is no fresh GitHub data: gh missing, not signed in, no GitHub remote, or gh's error
 }

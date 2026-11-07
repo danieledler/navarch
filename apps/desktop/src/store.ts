@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api, type Id, type Session, type Snapshot, type SystemStats, type Usage } from "./api";
+import { api, type Id, type RepoOverview, type Session, type Snapshot, type SystemStats, type Usage } from "./api";
 import { baseName } from "./lib/format";
 import { buildModel, type Model } from "./lib/model";
 
@@ -27,6 +27,16 @@ interface UIPrefs {
   recentFirst: Record<Id, true>;
   /** The week log groups time by project instead of by task. */
   logByProject: boolean;
+  /** The Repo panel at the bottom of a project: shown or folded, and its height in px. */
+  repoPanel: { open: boolean; height: number };
+}
+
+/** A project folder's repo overview as last loaded. */
+export interface RepoState {
+  data: RepoOverview | null; // null: not loaded yet, or the folder isn't in a git repo
+  loading: boolean;
+  error: string | null; // the last load failed (data stays from before)
+  at: number; // ms of the last successful load, 0 before one
 }
 
 interface State extends UIPrefs {
@@ -42,6 +52,8 @@ interface State extends UIPrefs {
   toasts: Toast[];
   /** Session row to highlight briefly after it moved, so the eye can follow it. */
   flashSession: string | null;
+  /** Repo overviews by project path. */
+  repos: Record<string, RepoState | undefined>;
   init: () => Promise<void>;
   reload: () => Promise<void>;
   /** Run a backend mutation, reload the snapshot, and surface errors as toasts. */
@@ -63,13 +75,17 @@ interface State extends UIPrefs {
   refreshUsage: (force: boolean) => Promise<void>;
   /** Opens Claude Code's sign-in in the browser; a toast says how it went. */
   signInClaude: () => Promise<void>;
+  /** Load a project folder's repo overview. A load already running for it is left alone unless `force`
+   *  (which also refetches GitHub data and toasts a failure; background loads fail silently). */
+  loadRepo: (path: string, force?: boolean) => Promise<void>;
+  setRepoPanel: (p: Partial<{ open: boolean; height: number }>) => void;
 }
 
 const PREFS = "navarch-ui";
 const empty: Snapshot = { spaces: [], projects: [], tasks: [], periods: [], periodTasks: [], weekTasks: [] };
 
 function loadPrefs(): UIPrefs {
-  const base: UIPrefs = { view: { kind: "dashboard" }, projectOfSpace: {}, collapsed: {}, hideDone: false, recentFirst: {}, logByProject: false };
+  const base: UIPrefs = { view: { kind: "dashboard" }, projectOfSpace: {}, collapsed: {}, hideDone: false, recentFirst: {}, logByProject: false, repoPanel: { open: true, height: 300 } };
   try {
     return { ...base, ...JSON.parse(localStorage.getItem(PREFS) ?? "{}") };
   } catch {
@@ -82,6 +98,9 @@ let started = false;
 // Reloads can overlap (a phone's write and the desktop's own): only a newer one may replace the snapshot.
 let reloadSeq = 0;
 let appliedReload = 0;
+// Repo loads in flight, by path: the newest one's number. An older one finishing later is dropped.
+const repoLoads = new Map<string, number>();
+let repoSeq = 0;
 
 // Undoable actions, newest last, keyed by the toast that announced them.
 const undoStack: ({ id: number; text: string } & Undoable)[] = [];
@@ -111,6 +130,7 @@ export const useStore = create<State>((set, get) => ({
   editing: null,
   toasts: [],
   flashSession: null,
+  repos: {},
 
   init: async () => {
     if (started) return; // StrictMode runs effects twice in dev
@@ -256,10 +276,31 @@ export const useStore = create<State>((set, get) => ({
       get().toast(`Couldn’t start the Claude Code sign-in: ${e}`, undefined, "error");
     }
   },
+
+  loadRepo: async (path, force = false) => {
+    if (repoLoads.has(path) && !force) return;
+    const n = ++repoSeq;
+    repoLoads.set(path, n);
+    const patch = (p: Partial<RepoState>) =>
+      set((s) => ({ repos: { ...s.repos, [path]: { data: null, loading: false, error: null, at: 0, ...s.repos[path], ...p } } }));
+    patch({ loading: true });
+    try {
+      const data = await api.getRepoOverview(path, force);
+      if (repoLoads.get(path) !== n) return;
+      patch({ data, loading: false, error: null, at: Date.now() });
+    } catch (e) {
+      if (repoLoads.get(path) !== n) return;
+      patch({ loading: false, error: String(e) });
+      if (force) get().toast(`Couldn’t load the repo: ${e}`, undefined, "error");
+    } finally {
+      if (repoLoads.get(path) === n) repoLoads.delete(path);
+    }
+  },
+  setRepoPanel: (p) => set((s) => ({ repoPanel: { ...s.repoPanel, ...p } })),
 }));
 
 useStore.subscribe((s) => {
-  const prefs: UIPrefs = { view: s.view, projectOfSpace: s.projectOfSpace, collapsed: s.collapsed, hideDone: s.hideDone, recentFirst: s.recentFirst, logByProject: s.logByProject };
+  const prefs: UIPrefs = { view: s.view, projectOfSpace: s.projectOfSpace, collapsed: s.collapsed, hideDone: s.hideDone, recentFirst: s.recentFirst, logByProject: s.logByProject, repoPanel: s.repoPanel };
   try {
     localStorage.setItem(PREFS, JSON.stringify(prefs));
   } catch {

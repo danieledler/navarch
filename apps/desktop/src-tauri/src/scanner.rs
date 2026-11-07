@@ -62,6 +62,9 @@ pub struct Session {
     /// The last of the app's `bridgeSessionIds`: the session's id for remote control (claude.ai, phone).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_id: Option<String>,
+    /// Folders the main transcript worked in (its lines' `cwd`), distinct, most recent last. A session that
+    /// works in a git worktree keeps the main checkout as `cwd`; only these show the worktree.
+    pub cwds: Vec<String>,
 }
 
 /// Claude's own folders for sessions started without one ("This computer" in the Code tab).
@@ -92,6 +95,12 @@ pub struct FileState {
     #[serde(default)]
     pub tail_checked: bool,
     pub first_prompt: Option<String>,
+    /// Folders the lines ran in (`cwd`), distinct, most recent last, at most `CWDS_MAX` (main transcript only).
+    #[serde(default)]
+    pub cwds: Vec<String>,
+    /// False for states saved before `cwds` existed; `parse_file` fills them in once from the tail.
+    #[serde(default)]
+    pub cwds_checked: bool,
     pub tokens: i64,
     pub cache_read: i64,
     /// local day -> [active_ms, tokens]
@@ -118,6 +127,7 @@ struct Line {
     message: Option<Msg>,
     #[serde(rename = "lastPrompt")]
     last_prompt: Option<String>,
+    cwd: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -175,6 +185,20 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     memchr::memmem::find(hay, needle).is_some()
 }
 
+const CWDS_MAX: usize = 8;
+
+/// Moves `cwd` to the end of `cwds` (the most recent), dropping the oldest past `CWDS_MAX`.
+fn note_cwd(cwds: &mut Vec<String>, cwd: &str) {
+    if cwd.is_empty() || cwds.last().is_some_and(|c| c == cwd) {
+        return;
+    }
+    cwds.retain(|c| c != cwd);
+    cwds.push(cwd.to_string());
+    if cwds.len() > CWDS_MAX {
+        cwds.remove(0);
+    }
+}
+
 /// Parse the complete lines in `data` (bytes after `st.offset`). Returns bytes consumed;
 /// a trailing partial line is left for the next read. Subagent files only contribute tokens.
 pub fn parse_chunk(st: &mut FileState, data: &[u8], is_sub: bool) -> usize {
@@ -196,6 +220,11 @@ pub fn parse_chunk(st: &mut FileState, data: &[u8], is_sub: bool) -> usize {
         let Ok(line) = serde_json::from_slice::<Line>(raw) else { continue };
         let kind = line.kind.as_deref().unwrap_or("");
         let ts = line.timestamp.as_deref().and_then(parse_ts);
+        if !is_sub && (kind == "user" || kind == "assistant") {
+            if let Some(c) = line.cwd.as_deref() {
+                note_cwd(&mut st.cwds, c);
+            }
+        }
         match kind {
             "last-prompt" => {
                 if let Some(p) = line.last_prompt.filter(|p| !p.trim().is_empty()) {
@@ -520,19 +549,26 @@ impl Scanner {
         let Ok(md) = fs::metadata(path) else { return false };
         let len = md.len();
         let mut st = self.files.get(path).cloned().unwrap_or_default();
-        if len == st.offset && st.tail_checked {
+        if len == st.offset && st.tail_checked && st.cwds_checked {
             return false;
         }
         if len < st.offset {
             st = FileState::default(); // file was rewritten: start over
         }
-        if !st.tail_checked {
+        if !(st.tail_checked && st.cwds_checked) {
+            // State restored without these fields: read them from the transcript's tail, once for both.
             if !is_sub && st.offset > 0 {
                 let tail = tail_state(path, st.offset).unwrap_or_default();
-                st.last_reply = tail.last_reply;
-                st.asking = tail.asking;
+                if !st.tail_checked {
+                    st.last_reply = tail.last_reply;
+                    st.asking = tail.asking;
+                }
+                if !st.cwds_checked {
+                    st.cwds = tail.cwds;
+                }
             }
             st.tail_checked = true;
+            st.cwds_checked = true;
         }
         if len > st.offset {
             let Ok(mut f) = fs::File::open(path) else { return false };
@@ -765,6 +801,7 @@ impl Scanner {
                 temp_folder,
                 launch_path: if temp_folder { folders.get(&m.session_id).cloned() } else { None },
                 remote_id: m.remote_id.clone(),
+                cwds: main.cwds.clone(),
             });
         }
         out.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at).then_with(|| a.id.cmp(&b.id)));
@@ -837,6 +874,30 @@ mod tests {
         assert_eq!(st.recent.len(), 2);
         assert_eq!(st.recent.iter().map(|r| r.1).sum::<i64>(), 20);
         assert_eq!(st.tokens, 30);
+    }
+
+    #[test]
+    fn keeps_the_folders_a_transcript_worked_in() {
+        let mut text = String::new();
+        let main = "/r";
+        let wt = |n: u32| format!("/r/.claude/worktrees/w{n}");
+        let mut cwds = vec![main.to_string(), wt(1), wt(1), main.to_string()];
+        cwds.extend((2..=9).map(wt));
+        for (i, c) in cwds.iter().enumerate() {
+            let kind = if i % 2 == 0 { "user" } else { "assistant" };
+            text += &line(serde_json::json!({"type":kind,"cwd":c,"timestamp":"2026-10-29T10:00:00Z",
+                "message":{"content":[{"type":"text","text":"x"}]}}));
+        }
+        let mut st = FileState::default();
+        parse_chunk(&mut st, text.as_bytes(), false);
+        // the main checkout moved to the end when it came back, then w2..w9 pushed both out
+        assert_eq!(st.cwds, (2..=9).map(wt).collect::<Vec<_>>());
+        let mut sub = FileState::default();
+        parse_chunk(&mut sub, text.as_bytes(), true);
+        assert!(sub.cwds.is_empty());
+        let mut short = FileState::default();
+        parse_chunk(&mut short, text.lines().take(4).map(|l| format!("{l}\n")).collect::<String>().as_bytes(), false);
+        assert_eq!(short.cwds, vec![wt(1), main.to_string()]);
     }
 
     #[test]

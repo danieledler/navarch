@@ -38,15 +38,16 @@ pub fn parse(json: &str) -> Option<Tailscale> {
 }
 
 /// What a CLI run printed. `status` is `None` when it was killed (timed out or stopped early).
-struct Output {
-    status: Option<std::process::ExitStatus>,
-    out: String,
-    err: String,
+pub(crate) struct Output {
+    pub(crate) status: Option<std::process::ExitStatus>,
+    pub(crate) out: String,
+    pub(crate) err: String,
 }
 
 /// Runs `cli args` with a timeout, never through a shell. `stop` sees stdout + stderr so far and can end
-/// the run early (it is then killed). Errs if the CLI can't start (not installed there).
-fn exec(cli: &str, args: &[&str], timeout: Duration, stop: impl Fn(&str) -> bool) -> std::io::Result<Output> {
+/// the run early (it is then killed). Errs if the CLI can't start (not installed there). Also runs git and gh
+/// for the Repo panel (repo.rs).
+pub(crate) fn exec(cli: &str, args: &[&str], timeout: Duration, stop: impl Fn(&str) -> bool) -> std::io::Result<Output> {
     use std::os::unix::process::CommandExt;
     // Its own process group, so a kill also ends what a wrapper script started: /usr/local/bin/tailscale is
     // a `#!/bin/sh` that runs the app's binary without `exec`, and that binary would hold the pipes open.

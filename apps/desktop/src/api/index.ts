@@ -1,4 +1,4 @@
-import type { BuildInfo, CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Tailscale, TailscaleServe, Period, Project, Session, Snapshot, Space, SystemStats, Task, TaskPatch, Usage } from "./types";
+import type { BuildInfo, CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Tailscale, TailscaleServe, Period, Project, RepoOverview, Session, Snapshot, Space, SystemStats, Task, TaskPatch, Usage } from "./types";
 import { mockApi } from "./mock";
 
 export * from "./types";
@@ -28,6 +28,11 @@ export interface Api {
   linkSession(sessionId: string, taskId: Id | null): Promise<void>;
   openNewSession(folder: string, prompt: string, taskId?: Id): Promise<void>;
   openSession(sessionId: string): Promise<void>;
+  /** Worktrees of the git repo holding `path`, with its GitHub PRs and issues (via `gh`); null if `path` is in no
+   *  git repo. GitHub data is cached ~5 min per repo; `force` fetches it again now. */
+  getRepoOverview(path: string, force: boolean): Promise<RepoOverview | null>;
+  /** Opens a https://github.com/ link in the default browser. */
+  openUrl(url: string): Promise<void>;
   revealPath(path: string): Promise<void>;
   getSessions(): Promise<Session[]>;
   getSystemStats(): Promise<SystemStats>;
@@ -117,6 +122,8 @@ function tauriApi(): Api {
     openNewSession: (folder, prompt, taskId) => call("open_new_session", { folder, prompt, taskId: taskId ?? null }),
     openSession: (sessionId) => call("open_session", { sessionId }),
     revealPath: (path) => call("reveal_path", { path }),
+    getRepoOverview: (path, force) => call("get_repo_overview", { path, force }),
+    openUrl: (url) => call("open_url", { url }),
     getSessions: () => call("get_sessions"),
     getSystemStats: () => call("get_system_stats"),
     getCpuHistory: () => call("get_cpu_history"),

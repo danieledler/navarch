@@ -614,6 +614,7 @@ mod tests {
             temp_folder: false,
             launch_path: None,
             remote_id: Some("session_r".into()),
+            cwds: vec![],
         }
     }
 

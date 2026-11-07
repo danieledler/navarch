@@ -360,6 +360,23 @@ pub async fn open_tailscale_login(url: String) -> Res<()> {
     run_open(&[&url])
 }
 
+/// The Repo panel's data for a project folder: its git worktrees and GitHub pull requests and issues;
+/// null when the folder isn't in a git repo. GitHub data is cached 5 min unless `force`.
+#[tauri::command]
+pub async fn get_repo_overview(path: String, force: bool) -> Res<Option<crate::repo::RepoOverview>> {
+    tauri::async_runtime::spawn_blocking(move || crate::repo::overview(&path, force)).await.map_err(db::err)
+}
+
+/// Opens a GitHub page (a pull request, an issue) in the browser.
+#[tauri::command]
+pub async fn open_url(url: String) -> Res<()> {
+    let ok = url.starts_with("https://github.com/") && url.chars().all(|c| c.is_ascii_graphic());
+    if !ok {
+        return Err("Not a GitHub link".into());
+    }
+    run_open(&[&url])
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
