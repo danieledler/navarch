@@ -225,7 +225,7 @@ const SESSIONS: DemoSession[] = [
     title: "Talk slides outline", dir: "writing/local-first-talk", status: "idle", minsAgo: 1700,
     prompt: "Turn the outline into a slide-by-slide plan, about 25 slides",
     reply: "24 slides in `slides/plan.md`: intro (3), last-write-wins (5), operational transforms (5), CRDTs (7), live demo (2), takeaways (2).",
-    task: "Slides", hours: 0.8, tokens: 260_000,
+    task: "Slides", hours: 0.8, tokens: 260_000, worktree: "sync-diagram",
   },
   {
     title: "Restic backups to the NAS", dir: "homelab", status: "idle", minsAgo: 2900,
@@ -392,6 +392,14 @@ export function demoRepoOverview(path: string): RepoOverview | null {
       ...p,
     };
   };
+  /** A merged PR, `ago` days ago, reviewed and green. */
+  const merged = (number: number, title: string, headRef: string, ago: number, additions: number, deletions: number, p: Partial<PullRequest> = {}) =>
+    pr({
+      number, title, headRef, state: "merged", createdAt: d(ago + 1.5), updatedAt: d(ago), mergedAt: d(ago), closedAt: d(ago),
+      additions, deletions, changedFiles: Math.max(1, Math.round((additions + deletions) / 45)), commits: 1 + (number % 4),
+      review: "approved", checks: checks("build, test"), ...p,
+    });
+  const newestFirst = (prs: PullRequest[]) => prs.sort((a, b) => (b.mergedAt ?? b.closedAt ?? 0) - (a.mergedAt ?? a.closedAt ?? 0));
   const issue = (i: Partial<Issue> & Pick<Issue, "number" | "title">): Issue => ({
     url: `${gh}/issues/${i.number}`, author: ME, createdAt: d(20), updatedAt: d(2), labels: [], assignees: [],
     comments: 0, body: "", milestone: null, issueType: null, subIssues: null, linkedPulls: [], ...i,
@@ -453,7 +461,18 @@ export function demoRepoOverview(path: string): RepoOverview | null {
         labels: [L.debt], review: null, checks: checks("build, typecheck:failure"),
         body: "Closing: the React compiler gets most of this for less churn.",
       }),
+      merged(213, "Show who last edited a slot in its tooltip", "slot-last-editor", 0.12, 58, 7, { labels: [L.avail] }),
+      merged(208, "Team time zone setting on the team page", "team-time-zone", 1.3, 164, 22, { labels: [L.avail] }),
+      merged(207, "Fix double submit on the shift form", "shift-form-double-submit", 2.4, 19, 11, { author: "sam-okafor", labels: [L.bug] }),
+      merged(204, "Availability API client with typed errors", "availability-client", 4.1, 231, 40, { labels: [L.avail] }),
+      merged(202, "Shard the e2e suite across four CI runners", "e2e-shards", 5.2, 44, 18, { author: "mika-tan", labels: [L.flaky] }),
+      merged(201, "Feature flag availability_v2", "flag-availability-v2", 6.2, 37, 3),
+      merged(200, "Week picker in the availability header", "week-picker", 8.3, 142, 26, { labels: [L.avail] }),
+      merged(199, "Seed script for the pilot teams", "seed-pilots", 9.6, 88, 0, { author: "lena-voss" }),
+      merged(197, "Availability table and migrations", "availability-table", 11.2, 196, 4, { labels: [L.avail] }),
+      merged(196, "Design tokens for the grid", "grid-tokens", 13.4, 73, 51, { labels: [L.a11y] }),
     ];
+    newestFirst(recentPulls);
     const issues = [
       issue({
         number: 215, title: "Login still loops after SSO in Safari on staging", author: "sam-okafor", createdAt: h(18), updatedAt: h(4),
@@ -527,7 +546,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
     ];
     return {
       root, base: "main", branch: "main", worktrees, githubError: null,
-      github: { repo: slug, url: gh, pulls, recentPulls, issues, fetchedAt: m(1) },
+      github: { repo: slug, url: gh, pulls, recentPulls, viewer: ME, issues, fetchedAt: m(1) },
     };
   }
 
@@ -572,7 +591,15 @@ export function demoRepoOverview(path: string): RepoOverview | null {
         createdAt: d(14), updatedAt: d(10), mergedAt: d(10), closedAt: d(10), additions: 77, deletions: 9, changedFiles: 3,
         review: "approved", checks: checks("test (ubuntu), test (macos), test (windows), clippy, fmt"),
       }),
+      merged(83, "Hash target inputs with BLAKE3", "blake3-hashes", 0.25, 96, 58, { labels: [L.rust] }),
+      merged(78, "Read targets from knot.toml includes", "toml-includes", 3.1, 188, 35, { labels: [L.feature] }),
+      merged(77, "Clearer error when targets form a cycle", "cycle-error", 4.6, 61, 12, { author: "ana-sousa" }),
+      merged(76, "Release 0.9.0", "release-0.9.0", 6.4, 42, 9),
+      merged(74, "Keep the cache under XDG_CACHE_HOME", "xdg-cache", 8.2, 54, 21),
+      merged(73, "Stop the progress bar flickering on narrow terminals", "progress-flicker", 12.1, 33, 17, { author: "lgarnier" }),
+      merged(72, "CI: run the tests on Windows too", "ci-windows", 13.3, 28, 2, { labels: [L.windows] }),
     ];
+    newestFirst(recentPulls);
     const issues = [
       issue({
         number: 80, title: "One save in VS Code triggers 3–4 rebuilds", author: "pkerr", createdAt: d(11), updatedAt: m(40),
@@ -630,7 +657,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
     ];
     return {
       root, base: "main", branch: "main", worktrees, githubError: null,
-      github: { repo: slug, url: gh, pulls, recentPulls, issues, fetchedAt: m(3) },
+      github: { repo: slug, url: gh, pulls, recentPulls, viewer: ME, issues, fetchedAt: m(3) },
     };
   }
 
@@ -653,7 +680,12 @@ export function demoRepoOverview(path: string): RepoOverview | null {
         createdAt: d(5), updatedAt: d(2), mergedAt: d(2), closedAt: d(2), additions: 402, deletions: 31, changedFiles: 9, commits: 6,
         review: "approved", reviewers: [{ login: "ana-sousa", state: "approved" }], checks: checks("build, test"),
       }),
+      merged(10, "Two editors side by side in the demo layout", "two-tab-layout", 1.1, 87, 14),
+      merged(8, "Tiny sync relay on a WebSocket", "sync-relay", 4.8, 156, 3),
+      merged(7, "Presence list of connected peers", "presence", 5.5, 49, 6, { author: "ana-sousa" }),
+      merged(6, "Vite + React skeleton", "skeleton", 7.4, 212, 0),
     ];
+    newestFirst(recentPulls);
     const issues = [
       issue({ number: 13, title: "Conflicting edits flash on reconnect", createdAt: d(3), updatedAt: h(7), labels: [L.bug], comments: 2 }),
       issue({ number: 9, title: "QR code so the audience can join the demo", createdAt: d(12), updatedAt: d(5), labels: [L.feature] }),
@@ -674,15 +706,32 @@ export function demoRepoOverview(path: string): RepoOverview | null {
           "offline-toggle",
         ),
       ],
-      github: { repo: slug, url: gh, pulls, recentPulls, issues, fetchedAt: m(2) },
+      github: { repo: slug, url: gh, pulls, recentPulls, viewer: ME, issues, fetchedAt: m(2) },
     };
   }
 
   if (name === "slides") {
+    // Its worktree sits in the talk's folder: the session started there, not in the slides repo.
+    const diagram = wt(
+      {
+        head: "b2c7e40", subject: "Draw the three sync strategies side by side", committedAt: h(27), ahead: 2, upstream: null, unpushed: null,
+        changes: [" M slides.md", "?? assets/sync-strategies.svg"],
+        commitsAhead: [
+          { hash: "b2c7e40", subject: "Draw the three sync strategies side by side", at: h(27) },
+          { hash: "6f1a9d3", subject: "Slide-by-slide plan, 24 slides", at: h(28) },
+        ],
+      },
+      "sync-diagram",
+    );
+    diagram.path = `${TALK}/.claude/worktrees/sync-diagram`;
     return {
-      root, base: "main", branch: "main", githubError: null, worktrees: [],
+      root, base: "main", branch: "main", githubError: null, worktrees: [diagram],
       github: {
-        repo: slug, url: gh, pulls: [], recentPulls: [], fetchedAt: m(4),
+        repo: slug, url: gh, pulls: [], viewer: ME, fetchedAt: m(4),
+        recentPulls: [
+          merged(2, "Outline and title slide", "outline", 9.2, 64, 2),
+          merged(1, "Slide deck scaffold", "scaffold", 12.5, 118, 0),
+        ],
         issues: [issue({ number: 3, title: "Diagram for the three sync strategies", createdAt: d(6), updatedAt: d(1), labels: [L.docs] })],
       },
     };

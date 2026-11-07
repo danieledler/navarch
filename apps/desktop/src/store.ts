@@ -27,18 +27,27 @@ interface UIPrefs {
   recentFirst: Record<Id, true>;
   /** The week log groups time by project instead of by task. */
   logByProject: boolean;
-  /** The Repo panel at the bottom of a project: shown or folded, and its height in px. */
-  repoPanel: { open: boolean; height: number };
+  /** The Repo panel at the bottom of a project: shown or folded, its height in px, whether its PR column lists open
+   *  or recently merged PRs, and whether the merged list holds only the viewer's own. */
+  repoPanel: RepoPanelPrefs;
   /** The repo the Repo panel shows, by project path (its root), for a folder holding several. */
   repoOfProject: Record<string, string>;
 }
 
-/** A project folder's repo overview as last loaded. */
+export interface RepoPanelPrefs {
+  open: boolean;
+  height: number;
+  prView?: "open" | "merged"; // default open
+  mine?: boolean; // default false
+}
+
+/** A repo's overview as last loaded. */
 export interface RepoState {
   data: RepoOverview | null; // null: not loaded yet, or the folder isn't in a git repo
-  loading: boolean;
+  loading: boolean; // a load with GitHub data is running
   error: string | null; // the last load failed (data stays from before)
   at: number; // ms of the last successful load, 0 before one
+  ghAt: number; // ms of the last successful load with GitHub data, 0 before one (local-only loads keep its github)
 }
 
 interface State extends UIPrefs {
@@ -79,10 +88,11 @@ interface State extends UIPrefs {
   refreshUsage: (force: boolean) => Promise<void>;
   /** Opens Claude Code's sign-in in the browser; a toast says how it went. */
   signInClaude: () => Promise<void>;
-  /** Load a project folder's repo overview. A load already running for it is left alone unless `force`
-   *  (which also refetches GitHub data and toasts a failure; background loads fail silently). */
-  loadRepo: (path: string, force?: boolean) => Promise<void>;
-  setRepoPanel: (p: Partial<{ open: boolean; height: number }>) => void;
+  /** Load a repo's overview. A load of the same kind already running for it is left alone unless `force` (which
+   *  also refetches GitHub data and toasts a failure; background loads fail silently). `github: false` reads only
+   *  the local git side and keeps the GitHub data loaded before. */
+  loadRepo: (path: string, force?: boolean, github?: boolean) => Promise<void>;
+  setRepoPanel: (p: Partial<RepoPanelPrefs>) => void;
   /** Look for the git repos of a project folder. Fails silently (the old list stays); one at a time per folder. */
   findRepos: (projectPath: string) => Promise<void>;
   /** Pick which of a project folder's repos the Repo panel shows. */
@@ -111,8 +121,11 @@ let started = false;
 // Reloads can overlap (a phone's write and the desktop's own): only a newer one may replace the snapshot.
 let reloadSeq = 0;
 let appliedReload = 0;
-// Repo loads in flight, by path: the newest one's number. An older one finishing later is dropped.
+// Repo loads in flight, by kind and path ("gh:<path>" or "local:<path>"): the newest one's number. An older one
+// finishing later is dropped.
 const repoLoads = new Map<string, number>();
+// The number of the newest load applied per path, so a local-only load that started before it is dropped.
+const repoApplied = new Map<string, number>();
 let repoSeq = 0;
 // Project folders whose repo search is running.
 const repoFinds = new Set<string>();
@@ -293,23 +306,41 @@ export const useStore = create<State>((set, get) => ({
     }
   },
 
-  loadRepo: async (path, force = false) => {
-    if (repoLoads.has(path) && !force) return;
+  loadRepo: async (path, force = false, github = true) => {
+    const key = `${github ? "gh" : "local"}:${path}`;
+    if (repoLoads.has(key) && !force) return;
     const n = ++repoSeq;
-    repoLoads.set(path, n);
-    const patch = (p: Partial<RepoState>) =>
-      set((s) => ({ repos: { ...s.repos, [path]: { data: null, loading: false, error: null, at: 0, ...s.repos[path], ...p } } }));
-    patch({ loading: true });
+    repoLoads.set(key, n);
+    const patch = (p: (cur: RepoState) => Partial<RepoState>) =>
+      set((s) => {
+        const cur: RepoState = { data: null, loading: false, error: null, at: 0, ghAt: 0, ...s.repos[path] };
+        return { repos: { ...s.repos, [path]: { ...cur, ...p(cur) } } };
+      });
+    if (github) patch(() => ({ loading: true }));
+    const stale = () => repoLoads.get(key) !== n || (!github && (repoApplied.get(path) ?? 0) > n);
     try {
-      const data = await api.getRepoOverview(path, force);
-      if (repoLoads.get(path) !== n) return;
-      patch({ data, loading: false, error: null, at: Date.now() });
+      const data = await api.getRepoOverview(path, force, github);
+      if (stale()) return;
+      repoApplied.set(path, Math.max(n, repoApplied.get(path) ?? 0));
+      const now = Date.now();
+      patch((cur) =>
+        github
+          ? { data, loading: false, error: null, at: now, ghAt: now }
+          : // Local only: keep the GitHub side of the last full load while it is fresh (the backend's 5-min cache),
+            // so a repo picked once and left doesn't show stale PRs on its worktrees for the rest of the run.
+            (() => {
+              const fresh = now - cur.ghAt < 5 * 60_000;
+              const github = fresh ? (cur.data?.github ?? null) : null;
+              const githubError = fresh ? (cur.data?.githubError ?? null) : null;
+              return { data: data && { ...data, github, githubError }, error: null, at: now };
+            })(),
+      );
     } catch (e) {
-      if (repoLoads.get(path) !== n) return;
-      patch({ loading: false, error: String(e) });
+      if (repoLoads.get(key) !== n) return;
+      patch(() => (github ? { loading: false, error: String(e) } : { error: String(e) }));
       if (force) get().toast(`Couldn’t load the repo: ${e}`, undefined, "error");
     } finally {
-      if (repoLoads.get(path) === n) repoLoads.delete(path);
+      if (repoLoads.get(key) === n) repoLoads.delete(key);
     }
   },
   setRepoPanel: (p) => set((s) => ({ repoPanel: { ...s.repoPanel, ...p } })),

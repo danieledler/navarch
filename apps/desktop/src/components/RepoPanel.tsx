@@ -1,7 +1,7 @@
 // The Repo panel at the bottom of a project: open PRs, issues and git worktrees of the project's folder, cross-linked
 // with Claude sessions. Rows are read-only (click opens on GitHub, reveals in Finder, or opens a session); hovering a
 // row shows a hover card with the details.
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ArrowDown, ArrowUp, BadgeCheck, Check, ChevronDown, ChevronRight, CircleDot, Copy, Eye, ExternalLink, FileDiff, FolderGit2, FolderOpen,
   GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft, Lock, MessageSquare, Minus, RefreshCw, SquareTerminal,
@@ -10,7 +10,7 @@ import {
 import { api, type CheckState, type GitHubInfo, type Issue, type Label, type PullRequest, type RepoOverview, type RepoRef, type Reviewer, type Session } from "../api";
 import { chosenRepo, useModel, useStore } from "../store";
 import { baseName, plainText, relTime, shortPath } from "../lib/format";
-import { linkRepo, type LinkedIssue, type LinkedPull, type LinkedRepo, type LinkedWorktree } from "../lib/repo";
+import { doneAt, linkProject, type LinkedIssue, type LinkedPull, type LinkedRepo, type LinkedWorktree, type RepoEntry } from "../lib/repo";
 import { IconButton, Popover, STATUS_LABEL, StatusDot } from "./ui";
 import { HoverCard, useHoverCard } from "./HoverCard";
 
@@ -35,7 +35,13 @@ export function RepoPanel({ path }: { path: string }) {
   const repos = list?.repos ?? [];
   const chosen = chosenRepo(repos, saved);
   const root = chosen?.root ?? null;
-  const st = useStore((s) => (root ? s.repos[root] : undefined));
+  const repoStates = useStore((s) => s.repos);
+  const st = root ? repoStates[root] : undefined;
+  // The other repos of the project load without GitHub (local git only): the Worktrees column shows all of theirs.
+  const otherKey = repos
+    .filter((r) => r.root !== root)
+    .map((r) => r.root)
+    .join("\n");
   const sessions = useStore((s) => s.sessions);
   const loadRepo = useStore((s) => s.loadRepo);
   const panel = useStore((s) => s.repoPanel);
@@ -47,6 +53,8 @@ export function RepoPanel({ path }: { path: string }) {
   const [tab, setTab] = useState<Col>("pulls");
   const [showDone, setShowDone] = useState(false);
   const hc = useHoverCard();
+  const prView = panel.prView ?? "open";
+  const mine = panel.mine ?? false;
 
   const data = st?.data ?? null;
   // Keep the panel open while the chosen repo's first overview loads (gh calls can take seconds), so the view above
@@ -63,19 +71,30 @@ export function RepoPanel({ path }: { path: string }) {
     if (root) void loadRepo(root);
   }, [root, loadRepo]);
   useEffect(() => {
+    for (const r of otherKey ? otherKey.split("\n") : []) void loadRepo(r, false, false);
+  }, [otherKey, loadRepo]);
+  // The chosen repo with GitHub (forced on Refresh), the others' local side for the Worktrees column.
+  const loadAll = useCallback(
+    (force = false) => {
+      if (root) void loadRepo(root, force);
+      for (const r of otherKey ? otherKey.split("\n") : []) void loadRepo(r, false, false);
+    },
+    [root, otherKey, loadRepo],
+  );
+  useEffect(() => {
     const visible = () => document.visibilityState === "visible";
-    const iv = window.setInterval(() => visible() && root && void loadRepo(root), panel.open ? 30_000 : 120_000);
+    const iv = window.setInterval(() => visible() && loadAll(), panel.open ? 30_000 : 120_000);
     const onVis = () => {
       if (!visible()) return;
       void findRepos(path);
-      if (root) void loadRepo(root);
+      loadAll();
     };
     document.addEventListener("visibilitychange", onVis);
     return () => {
       clearInterval(iv);
       document.removeEventListener("visibilitychange", onVis);
     };
-  }, [path, root, panel.open, loadRepo, findRepos]);
+  }, [path, loadAll, panel.open, findRepos]);
 
   useEffect(() => {
     const el = rootRef.current;
@@ -85,13 +104,26 @@ export function RepoPanel({ path }: { path: string }) {
     return () => ro.disconnect();
   }, [data != null]);
 
-  const linked = useMemo(() => (data ? linkRepo(data, sessions) : null), [data, sessions]);
+  // Every loaded repo of the project, the chosen one included (its overview carries the GitHub data).
+  const entries = useMemo(
+    () => repos.flatMap((r): RepoEntry[] => {
+      const o = repoStates[r.root]?.data;
+      return o ? [{ ref: r, o }] : [];
+    }),
+    [repos, repoStates],
+  );
+  const linked = useMemo(() => (data ? linkProject(data, entries, sessions) : null), [data, entries, sessions]);
+  const multi = repos.length > 1;
 
   // Loaded, and the folder neither is in a git repo nor holds one (or the chosen one is gone).
   if (list && repos.length === 0) return null;
   if (st && st.at > 0 && data === null && repos.length <= 1) return null;
 
   const gh = data?.github ?? null;
+  // The chosen repo has local data (loaded while another was picked) but its GitHub data is still on the way.
+  const ghLoading = !gh && !!st && st.ghAt === 0 && (st.loading || !st.error);
+  const weekAgo = Date.now() - 7 * 864e5;
+  const mergedWeek = gh ? gh.recentPulls.filter((p) => p.state === "merged" && (p.mergedAt ?? 0) >= weekAgo).length : 0;
   const h = Math.max(MIN_H, dragH ?? panel.height);
 
   const onDividerDown = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -123,7 +155,7 @@ export function RepoPanel({ path }: { path: string }) {
   const toggle = () => {
     hc.hide();
     // Folded, it polls only every 2 min: refresh on unfolding.
-    if (!panel.open && root) void loadRepo(root);
+    if (!panel.open) loadAll();
     setRepoPanel({ open: !panel.open });
   };
 
@@ -190,7 +222,27 @@ export function RepoPanel({ path }: { path: string }) {
             {data.branch && data.branch !== data.base && (
               <span className="repo-branch" title={`The main checkout is on ${data.branch}, not ${data.base}`}>on {data.branch}</span>
             )}
-            <span className="repo-counts">{counts.join(" · ")}</span>
+            <span className="repo-counts">
+              {counts.join(" · ")}
+              {mergedWeek > 0 && (
+                <>
+                  {" · "}
+                  <button
+                    type="button"
+                    className="repo-merged-link"
+                    title="Show recently merged pull requests"
+                    onClick={() => {
+                      hc.hide();
+                      if (!panel.open) loadAll();
+                      setRepoPanel({ open: true, prView: "merged" });
+                      setTab("pulls");
+                    }}
+                  >
+                    {mergedWeek} merged this week
+                  </button>
+                </>
+              )}
+            </span>
           </>
         )}
         {!data && (
@@ -211,7 +263,7 @@ export function RepoPanel({ path }: { path: string }) {
             className={st?.loading ? "spin" : ""}
             onClick={() => {
               void findRepos(path);
-              if (root) void loadRepo(root, true);
+              loadAll(true);
             }}
           />
         </span>
@@ -222,7 +274,19 @@ export function RepoPanel({ path }: { path: string }) {
           linked={linked}
           gh={gh}
           githubError={data.githubError}
-          base={data.base}
+          ghLoading={ghLoading}
+          root={data.root}
+          multi={multi}
+          prView={prView}
+          setPrView={(v) => {
+            hc.hide();
+            setRepoPanel({ prView: v });
+          }}
+          mine={mine}
+          setMine={(b) => {
+            hc.hide();
+            setRepoPanel({ mine: b });
+          }}
           narrow={narrow}
           tab={tab}
           setTab={setTab}
@@ -235,7 +299,7 @@ export function RepoPanel({ path }: { path: string }) {
       {open && !data && <div className="repo-body is-loading"><div className="repo-note">Loading…</div></div>}
 
       {open && linked && hc.open && (
-        <CardFor k={hc.open.key} linked={linked} gh={gh} base={data!.base} rect={hc.open.rect} hc={hc} />
+        <CardFor k={hc.open.key} linked={linked} gh={gh} root={data!.root} multi={multi} rect={hc.open.rect} hc={hc} />
       )}
     </div>
   );
@@ -313,38 +377,67 @@ const overviewCounts = (o: RepoOverview) =>
     .join(" · ");
 
 function RepoBody({
-  linked, gh, githubError, base, narrow, tab, setTab, showDone, setShowDone, hc,
+  linked, gh, githubError, ghLoading, root, multi, prView, setPrView, mine, setMine, narrow, tab, setTab, showDone, setShowDone, hc,
 }: {
-  linked: LinkedRepo; gh: GitHubInfo | null; githubError: string | null; base: string; narrow: boolean;
-  tab: Col; setTab: (c: Col) => void; showDone: boolean; setShowDone: (b: boolean) => void; hc: HC;
+  linked: LinkedRepo; gh: GitHubInfo | null; githubError: string | null; ghLoading: boolean; root: string; multi: boolean;
+  prView: "open" | "merged"; setPrView: (v: "open" | "merged") => void; mine: boolean; setMine: (b: boolean) => void;
+  narrow: boolean; tab: Col; setTab: (c: Col) => void; showDone: boolean; setShowDone: (b: boolean) => void; hc: HC;
 }) {
-  const ghNote = !gh && <div className="repo-note">{githubError ?? "No GitHub data"}</div>;
-  const recent = gh?.recentPulls ?? [];
-  const cols: { id: Col; title: string; n: number | null; body: ReactNode }[] = [
+  const ghNote = !gh && <div className="repo-note">{ghLoading ? "Loading GitHub data…" : (githubError ?? "No GitHub data")}</div>;
+  const closed = (gh?.recentPulls ?? []).filter((p) => p.state === "closed");
+  const merged = (gh?.recentPulls ?? []).filter((p) => p.state === "merged");
+  const ownWt = (n: number) => linked.worktrees.find((w) => w.root === root && w.pr?.number === n) ?? null;
+  const viewer = gh?.viewer ?? null;
+  const prSwitch = gh && (
+    <span className="repo-prview">
+      <span className="seg seg-small" role="radiogroup" aria-label="Pull requests to list">
+        <button type="button" role="radio" aria-checked={prView === "open"} className={prView === "open" ? "is-on" : ""} onClick={() => setPrView("open")}>
+          Open <span className="count">{gh.pulls.length}</span>
+        </button>
+        <button type="button" role="radio" aria-checked={prView === "merged"} className={prView === "merged" ? "is-on" : ""} onClick={() => setPrView("merged")}>
+          Merged
+        </button>
+      </span>
+      {prView === "merged" && viewer && (
+        <button
+          type="button"
+          className={`repo-mine ${mine ? "is-on" : ""}`}
+          aria-pressed={mine}
+          title={mine ? `Showing only PRs by ${viewer}. Click to show everyone’s.` : `Show only PRs by ${viewer}`}
+          onClick={() => setMine(!mine)}
+        >
+          Mine
+        </button>
+      )}
+    </span>
+  );
+  const cols: { id: Col; title: string; short?: string; n: number | null; head?: ReactNode; body: ReactNode }[] = [
     {
       id: "pulls",
       title: "Pull requests",
+      short: "PRs",
       n: gh ? gh.pulls.length : null,
+      head: prSwitch,
       body:
-        ghNote || (
+        ghNote ||
+        (prView === "merged" && gh ? (
+          <MergedList prs={mine && viewer ? merged.filter((p) => p.author === viewer) : merged} gh={gh} mine={mine && !!viewer} ownWt={ownWt} hc={hc} />
+        ) : (
           <>
             {linked.pulls.length === 0 && <div className="repo-empty">No open pull requests</div>}
             {linked.pulls.map((lp) => (
               <PrRow key={lp.pr.number} lp={lp} hc={hc} />
             ))}
-            {recent.length > 0 && (
+            {closed.length > 0 && (
               <>
                 <button type="button" className="repo-sub-toggle" onClick={() => setShowDone(!showDone)}>
-                  <ChevronRight size={12} className={showDone ? "rot" : ""} /> Recently merged or closed <span className="count">{recent.length}</span>
+                  <ChevronRight size={12} className={showDone ? "rot" : ""} /> Recently closed <span className="count">{closed.length}</span>
                 </button>
-                {showDone &&
-                  recent.map((pr) => (
-                    <PrRow key={pr.number} lp={{ pr, worktree: linked.worktrees.find((w) => w.pr?.number === pr.number) ?? null }} hc={hc} done />
-                  ))}
+                {showDone && closed.map((pr) => <PrRow key={pr.number} lp={{ pr, worktree: ownWt(pr.number) }} hc={hc} done />)}
               </>
             )}
           </>
-        ),
+        )),
     },
     {
       id: "issues",
@@ -367,10 +460,10 @@ function RepoBody({
       body: (
         <>
           {linked.worktrees.length === 0 && (
-            <div className="repo-empty">No worktrees besides the main checkout</div>
+            <div className="repo-empty">No worktrees besides the main checkout{multi ? "s" : ""}</div>
           )}
           {linked.worktrees.map((lw) => (
-            <WorktreeRow key={lw.wt.path} lw={lw} base={base} hc={hc} />
+            <WorktreeRow key={lw.wt.path} lw={lw} multi={multi} hc={hc} />
           ))}
         </>
       ),
@@ -388,6 +481,7 @@ function RepoBody({
             </button>
           ))}
         </div>
+        {c.head && <div className="repo-subhead">{c.head}</div>}
         <div className="repo-list" onScroll={hc.hide}>{c.body}</div>
       </div>
     );
@@ -397,13 +491,74 @@ function RepoBody({
       {cols.map((x) => (
         <div key={x.id} className="repo-col">
           <div className="repo-col-head">
-            {x.title} {x.n != null && <span className="count">{x.n}</span>}
+            {x.head ? (
+              <>
+                {x.short ?? x.title}
+                {x.head}
+              </>
+            ) : (
+              <>
+                {x.title} {x.n != null && <span className="count">{x.n}</span>}
+              </>
+            )}
           </div>
           <div className="repo-list" onScroll={hc.hide}>{x.body}</div>
         </div>
       ))}
     </div>
   );
+}
+
+/** Recently merged PRs, grouped by the day they were merged: an overview of what got done. */
+function MergedList({
+  prs, gh, mine, ownWt, hc,
+}: { prs: PullRequest[]; gh: GitHubInfo; mine: boolean; ownWt: (n: number) => LinkedWorktree | null; hc: HC }) {
+  const act = useAct();
+  const groups: { label: string; prs: PullRequest[] }[] = [];
+  const now = Date.now();
+  for (const pr of [...prs].sort((a, b) => doneAt(b) - doneAt(a))) {
+    const label = dayLabel(doneAt(pr), now);
+    const last = groups[groups.length - 1];
+    if (last?.label === label) last.prs.push(pr);
+    else groups.push({ label, prs: [pr] });
+  }
+  const q = `is:pr is:merged${mine && gh.viewer ? ` author:${gh.viewer}` : ""}`;
+  return (
+    <>
+      {prs.length === 0 && <div className="repo-empty">{mine ? "None of your pull requests merged lately" : "No merged pull requests yet"}</div>}
+      {groups.map((g) => (
+        <div key={g.label} className="repo-day">
+          <div className="repo-day-head">
+            {g.label} <span className="count">{g.prs.length}</span>
+          </div>
+          {g.prs.map((pr) => (
+            <MergedRow key={pr.number} pr={pr} viewer={gh.viewer} worktree={ownWt(pr.number)} hc={hc} />
+          ))}
+        </div>
+      ))}
+      <button type="button" className="repo-sub-toggle repo-more" onClick={() => act(api.openUrl(`${gh.url}/pulls?q=${encodeURIComponent(q)}`))}>
+        <ExternalLink size={11} /> {prs.length > 0 ? "Older merged PRs" : "Merged PRs"} on GitHub
+      </button>
+    </>
+  );
+}
+
+const WEEKDAY = new Intl.DateTimeFormat(undefined, { weekday: "long" });
+const MONTH_DAY = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
+
+/** Today, Yesterday, a weekday within the last 7 days, Last week, then the date. */
+function dayLabel(ms: number, now: number): string {
+  const day = (t: number) => {
+    const d = new Date(t);
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  };
+  const days = Math.round((day(now) - day(ms)) / 864e5);
+  if (days <= 0) return "Today";
+  if (days === 1) return "Yesterday";
+  if (days < 7) return WEEKDAY.format(ms);
+  if (days < 14) return "Last week";
+  return MONTH_DAY.format(ms);
 }
 
 // ── rows ──
@@ -437,6 +592,41 @@ function PrRow({ lp, hc, done }: { lp: LinkedPull; hc: HC; done?: boolean }) {
             )}
             {!done && <ReviewMark pr={pr} />}
             {!done && pr.checksState && <CheckMark state={pr.checksState} title={checksSummary(pr.checks)} />}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MergedRow({ pr, viewer, worktree, hc }: { pr: PullRequest; viewer: string | null; worktree: LinkedWorktree | null; hc: HC }) {
+  const act = useAct();
+  const at = doneAt(pr);
+  return (
+    <div
+      className={`repo-row ${hc.open?.key === `pr:${pr.number}` ? "is-hovered" : ""}`}
+      role="link"
+      onClick={() => act(api.openUrl(pr.url))}
+      {...hc.row(`pr:${pr.number}`)}
+    >
+      <PrIcon pr={pr} />
+      <div className="rr-main">
+        <div className="rr-title">{pr.title}</div>
+        <div className="rr-sub">
+          <span className="rr-num">#{pr.number}</span>
+          {pr.author !== viewer && <span className="rr-author">{pr.author}</span>}
+          {pr.additions + pr.deletions > 0 && (
+            <span className="rr-diff" title={`${plural(pr.changedFiles, "file")} changed`}>
+              <span className="c-green">+{pr.additions.toLocaleString()}</span> <span className="c-red">−{pr.deletions.toLocaleString()}</span>
+            </span>
+          )}
+          {worktree && (
+            <span className="wt-chip" title={`Worktree ${worktree.name}`}>
+              <FolderGit2 size={11} /> {worktree.name}
+            </span>
+          )}
+          <span className="rr-marks">
+            <span className="muted" title={`Merged ${new Date(at).toLocaleString()}`}>{relTime(at)}</span>
           </span>
         </div>
       </div>
@@ -483,9 +673,9 @@ function IssueRow({ li, hc }: { li: LinkedIssue; hc: HC }) {
   );
 }
 
-function WorktreeRow({ lw, base, hc }: { lw: LinkedWorktree; base: string; hc: HC }) {
+function WorktreeRow({ lw, multi, hc }: { lw: LinkedWorktree; multi: boolean; hc: HC }) {
   const act = useAct();
-  const { wt, pr, sessions } = lw;
+  const { wt, pr, sessions, base } = lw;
   const key = `wt:${wt.path}`;
   return (
     <div
@@ -497,6 +687,7 @@ function WorktreeRow({ lw, base, hc }: { lw: LinkedWorktree; base: string; hc: H
       <FolderGit2 size={14} className={`ri-icon ${sessions.some((s) => s.status === "working") ? "c-blue" : "muted"}`} />
       <div className="rr-main">
         <div className="rr-title">
+          {multi && lw.repo && <span className="rr-repo" title={`In the repo ${lw.repo.root}`}>{lw.repo.name}</span>}
           {lw.name}
           {wt.branch && wt.branch !== lw.name && <span className="rr-branch">{wt.branch}</span>}
           {!wt.branch && <span className="rr-branch">detached {wt.head}</span>}
@@ -566,13 +757,13 @@ function WorktreeRow({ lw, base, hc }: { lw: LinkedWorktree; base: string; hc: H
 
 // ── hover cards ──
 
-function CardFor({ k, linked, gh, base, rect, hc }: { k: string; linked: LinkedRepo; gh: GitHubInfo | null; base: string; rect: DOMRect; hc: HC }) {
+function CardFor({ k, linked, gh, root, multi, rect, hc }: { k: string; linked: LinkedRepo; gh: GitHubInfo | null; root: string; multi: boolean; rect: DOMRect; hc: HC }) {
   let body: ReactNode = null;
   if (k.startsWith("pr:") && gh) {
     const n = Number(k.slice(3));
     const pr = gh.pulls.find((p) => p.number === n) ?? gh.recentPulls.find((p) => p.number === n);
     if (pr) {
-      const wt = linked.pulls.find((x) => x.pr.number === n)?.worktree ?? linked.worktrees.find((w) => w.pr?.number === n) ?? null;
+      const wt = linked.pulls.find((x) => x.pr.number === n)?.worktree ?? linked.worktrees.find((w) => w.root === root && w.pr?.number === n) ?? null;
       body = <PrCard pr={pr} gh={gh} wt={wt} />;
     }
   } else if (k.startsWith("is:") && gh) {
@@ -580,7 +771,7 @@ function CardFor({ k, linked, gh, base, rect, hc }: { k: string; linked: LinkedR
     if (li) body = <IssueCard issue={li.issue} gh={gh} />;
   } else if (k.startsWith("wt:")) {
     const lw = linked.worktrees.find((w) => w.wt.path === k.slice(3));
-    if (lw) body = <WorktreeCard lw={lw} base={base} />;
+    if (lw) body = <WorktreeCard lw={lw} multi={multi} />;
   }
   if (!body) return null;
   return (
@@ -607,7 +798,9 @@ function PrCard({ pr, gh, wt }: { pr: PullRequest; gh: GitHubInfo; wt: LinkedWor
       </div>
       <button type="button" className="hc-title" onClick={() => act(api.openUrl(pr.url))}>{pr.title}</button>
       <div className="hc-meta">
-        <strong>{pr.author}</strong> wants to merge {plural(pr.commits, "commit")} into <code>{pr.baseRef}</code> from <code>{pr.headRef}</code>
+        <strong>{pr.author}</strong>{" "}
+        {pr.state === "merged" ? `· ${plural(pr.commits, "commit")} merged` : pr.state === "closed" ? "wanted to merge" : "wants to merge"}
+        {pr.state !== "merged" && ` ${plural(pr.commits, "commit")}`} into <code>{pr.baseRef}</code> from <code>{pr.headRef}</code>
       </div>
       <div className="hc-meta">
         opened <When ms={pr.createdAt} /> · <span className="c-green">+{pr.additions.toLocaleString()}</span>{" "}
@@ -802,10 +995,10 @@ function IssueCard({ issue, gh }: { issue: Issue; gh: GitHubInfo }) {
   );
 }
 
-function WorktreeCard({ lw, base }: { lw: LinkedWorktree; base: string }) {
+function WorktreeCard({ lw, multi }: { lw: LinkedWorktree; multi: boolean }) {
   const act = useAct();
   const toast = useStore((s) => s.toast);
-  const { wt, pr } = lw;
+  const { wt, pr, base } = lw;
   const copy = (text: string, what: string) =>
     void navigator.clipboard.writeText(text).then(
       () => toast(`Copied the ${what}`),
@@ -824,6 +1017,11 @@ function WorktreeCard({ lw, base }: { lw: LinkedWorktree; base: string }) {
           </span>
         )}
         {wt.prunable && <span className="pill pill-closed">Folder missing</span>}
+        {multi && lw.repo && (
+          <span className="hc-repo is-plain" title={lw.repo.root}>
+            {lw.repo.name}
+          </span>
+        )}
         <When ms={lw.lastActivity} prefix="active" />
       </div>
       <div className="hc-title is-static">{lw.name}</div>

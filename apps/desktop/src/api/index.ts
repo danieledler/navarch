@@ -29,11 +29,14 @@ export interface Api {
   openNewSession(folder: string, prompt: string, taskId?: Id): Promise<void>;
   openSession(sessionId: string): Promise<void>;
   /** Worktrees of the git repo holding `path`, with its GitHub PRs and issues (via `gh`); null if `path` is in no
-   *  git repo. GitHub data is cached ~5 min per repo; `force` fetches it again now. */
-  getRepoOverview(path: string, force: boolean): Promise<RepoOverview | null>;
+   *  git repo. GitHub data is cached ~5 min per repo; `force` fetches it again now. `github: false` reads only
+   *  the local git side (no gh call; `github` and `githubError` come back null). */
+  getRepoOverview(path: string, force: boolean, github?: boolean): Promise<RepoOverview | null>;
   /** Git repos of a project folder: the repo it is in (first), then repos 1–2 folders below it (dot-folders,
-   *  node_modules and the like skipped; worktrees resolved to their main checkout; duplicates dropped), most
-   *  recent commit first, at most 12. Empty when there is none. Local only, no network. */
+   *  node_modules and the like skipped; worktrees resolved to their main checkout; duplicates dropped), plus the
+   *  repos of worktrees in `<path>/.claude/worktrees/*` (sessions start in the project folder, so their worktrees
+   *  may sit there even when the repo is elsewhere); most recent commit first, at most 12. Empty when there is
+   *  none. Local only, no network. */
   findRepos(path: string): Promise<RepoRef[]>;
   /** Opens a https://github.com/ link in the default browser. */
   openUrl(url: string): Promise<void>;
@@ -126,7 +129,7 @@ function tauriApi(): Api {
     openNewSession: (folder, prompt, taskId) => call("open_new_session", { folder, prompt, taskId: taskId ?? null }),
     openSession: (sessionId) => call("open_session", { sessionId }),
     revealPath: (path) => call("reveal_path", { path }),
-    getRepoOverview: (path, force) => call("get_repo_overview", { path, force }),
+    getRepoOverview: (path, force, github = true) => call("get_repo_overview", { path, force, github }),
     findRepos: (path) => call("find_repos", { path }),
     openUrl: (url) => call("open_url", { url }),
     getSessions: () => call("get_sessions"),

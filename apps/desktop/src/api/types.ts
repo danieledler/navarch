@@ -303,7 +303,9 @@ export interface GitHubInfo {
   repo: string; // "owner/name"
   url: string; // https://github.com/owner/name
   pulls: PullRequest[]; // open, most recently updated first
-  recentPulls: PullRequest[]; // the 15 most recently merged or closed, to label worktrees whose PR is done
+  recentPulls: PullRequest[]; // the 30 most recently merged or closed, newest mergedAt/closedAt first: the merged
+  // view ("what was worked on") and the PR of a worktree whose PR is done
+  viewer: string | null; // login of the account gh is signed in as
   issues: Issue[]; // open, most recently updated first
   fetchedAt: number; // unix ms of the gh calls behind this
 }

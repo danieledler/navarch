@@ -361,14 +361,16 @@ pub async fn open_tailscale_login(url: String) -> Res<()> {
 }
 
 /// The Repo panel's data for a project folder: its git worktrees and GitHub pull requests and issues;
-/// null when the folder isn't in a git repo. GitHub data is cached 5 min unless `force`.
+/// null when the folder isn't in a git repo. GitHub data is cached 5 min unless `force`; `github: false` reads
+/// only the local git side (no gh call).
 #[tauri::command]
-pub async fn get_repo_overview(path: String, force: bool) -> Res<Option<crate::repo::RepoOverview>> {
-    tauri::async_runtime::spawn_blocking(move || crate::repo::overview(&path, force)).await.map_err(db::err)
+pub async fn get_repo_overview(path: String, force: bool, github: Option<bool>) -> Res<Option<crate::repo::RepoOverview>> {
+    let github = github.unwrap_or(true);
+    tauri::async_runtime::spawn_blocking(move || crate::repo::overview(&path, force, github)).await.map_err(db::err)
 }
 
 /// The git repos of a project folder for the Repo panel's picker: the one it is in, then those 1–2 folders
-/// below it, most recent commit first. Local only.
+/// below it and those owning worktrees in its `.claude/worktrees`, most recent commit first. Local only.
 #[tauri::command]
 pub async fn find_repos(path: String) -> Res<Vec<crate::repo::RepoRef>> {
     tauri::async_runtime::spawn_blocking(move || crate::repo::find_repos(&path)).await.map_err(db::err)

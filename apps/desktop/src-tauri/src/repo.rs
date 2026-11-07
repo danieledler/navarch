@@ -40,6 +40,17 @@ const PR_FRAGMENT: &str = "fragment pr on PullRequest {
   lastCommit: commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
     __typename ... on CheckRun { name status conclusion } ... on StatusContext { context state } } } } } } }
 }";
+/// `PR_FRAGMENT` for merged and closed PRs: without checks, review requests and mergeability, which a done PR
+/// doesn't need and which cost the most (on cli/cli 50 PRs take ~2.5 s this way, ~7.5 s with them).
+const CLOSED_PR_FRAGMENT: &str = "fragment pr on PullRequest {
+  number title url author { login } isDraft state headRefName baseRefName createdAt updatedAt mergedAt closedAt
+  reviewDecision additions deletions changedFiles body
+  labels(first: 20) { nodes { name color } }
+  latestReviews(first: 20) { nodes { author { login } state } }
+  commits { totalCount }
+  comments { totalCount }
+  closingIssuesReferences(first: 10) { nodes { number } }
+}";
 const ISSUE_SELECTION: &str = "number title url author { login } createdAt updatedAt body
   labels(first: 20) { nodes { name color } }
   assignees(first: 10) { nodes { login } }
@@ -51,9 +62,10 @@ const ISSUE_SELECTION: &str = "number title url author { login } createdAt updat
 /// Open PRs asked for. GitHub gives a query about 10 s; on a busy repo (cli/cli) 40 open PRs take ~7 s,
 /// 50 sometimes time out (mergeability and diff stats are computed per PR).
 const OPEN_PRS: u32 = 40;
-/// Closed PRs asked for (most recently updated first), of which the `RECENT_PRS` last merged or closed are kept.
-const CLOSED_PRS: u32 = 30;
-const RECENT_PRS: usize = 15;
+/// Closed PRs asked for (most recently updated first, with `CLOSED_PR_FRAGMENT`), of which the `RECENT_PRS` last
+/// merged or closed are kept.
+const CLOSED_PRS: u32 = 50;
+const RECENT_PRS: usize = 30;
 const OPEN_ISSUES: u32 = 50;
 const BODY_MAX: usize = 600;
 const CHANGES_MAX: usize = 20;
@@ -217,6 +229,8 @@ pub struct GitHubInfo {
     pub url: String,
     pub pulls: Vec<PullRequest>,
     pub recent_pulls: Vec<PullRequest>,
+    /// Login of the account gh is signed in as.
+    pub viewer: Option<String>,
     pub issues: Vec<Issue>,
     pub fetched_at: i64,
 }
@@ -235,9 +249,10 @@ pub struct RepoOverview {
 // ── Overview ──
 
 /// The repo `path` is in: its linked worktrees and its GitHub data. `None` when `path` isn't in a git repo.
-/// `force` asks GitHub again even within the 5 min cache. Blocks: git calls take well under a second, gh up
-/// to 20 s (run alongside them).
-pub fn overview(path: &str, force: bool) -> Option<RepoOverview> {
+/// `force` asks GitHub again even within the 5 min cache; `with_github: false` skips GitHub (no gh, no cache;
+/// `github` and `github_error` are `None`). Blocks: git calls take well under a second, gh up to 20 s (run
+/// alongside them).
+pub fn overview(path: &str, force: bool, with_github: bool) -> Option<RepoOverview> {
     let entries = parse_worktrees(&git(path, &["worktree", "list", "--porcelain"])?);
     let main = entries.first()?;
     let root = main.path.clone();
@@ -245,7 +260,7 @@ pub fn overview(path: &str, force: bool) -> Option<RepoOverview> {
     let slug = git(&root, &["remote", "-v"]).and_then(|r| slug_from_remotes(&r));
     let procs = cwd_procs();
     let ((github, github_error), worktrees) = std::thread::scope(|s| {
-        let gh = s.spawn(|| github(&root, slug.as_deref(), force));
+        let gh = with_github.then(|| s.spawn(|| github(&root, slug.as_deref(), force)));
         let handles: Vec<_> = entries[1..]
             .iter()
             .filter(|e| !e.bare)
@@ -255,7 +270,8 @@ pub fn overview(path: &str, force: bool) -> Option<RepoOverview> {
             })
             .collect();
         let worktrees = handles.into_iter().filter_map(|h| h.join().ok()).collect::<Vec<_>>();
-        (gh.join().unwrap_or_else(|_| (None, Some("GitHub lookup failed".into()))), worktrees)
+        let gh = gh.map_or((None, None), |h| h.join().unwrap_or_else(|_| (None, Some("GitHub lookup failed".into()))));
+        (gh, worktrees)
     });
     Some(RepoOverview { root, base, branch: main.branch.clone(), worktrees, github, github_error })
 }
@@ -280,21 +296,37 @@ const SKIP_DIRS: &[&str] =
 const MAX_ENTRIES: usize = 2000;
 const MAX_REPOS: usize = 12;
 
-/// The git repos of a project folder: the one it is in (rel ""), then those 1–2 folders below it, worktrees
-/// resolved to their main checkout and duplicates dropped, most recent commit first, at most 12. Local only.
+/// The git repos of a project folder: the one it is in (rel ""), then those 1–2 folders below it and those owning
+/// the worktrees in `<path>/.claude/worktrees/*` (sessions start in the project folder, so their worktrees sit
+/// there even for a repo elsewhere), worktrees resolved to their main checkout and duplicates dropped, most
+/// recent commit first, at most 12 (the session-worktree repos always kept). Local only.
 pub fn find_repos(path: &str) -> Vec<RepoRef> {
     // Git reports real paths (/private/var/… for /var/…), so compare against the real folder.
     let base = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
     let (containing_id, containing) = main_checkout(path).unzip();
-    let candidates = repo_dirs(&base);
-    // (identity, root) pairs; worktrees of one bare repo share the identity, so keep one root per repo
+    // (dir, owns a worktree in <path>/.claude/worktrees): those repos are kept past the cap, or their worktrees
+    // would drop out of the Worktrees column.
+    let candidates: Vec<(PathBuf, bool)> = repo_dirs(&base)
+        .into_iter()
+        .map(|d| (d, false))
+        .chain(session_worktrees(&base).into_iter().map(|d| (d, true)))
+        .collect();
+    // (identity, root, session) triples; worktrees of one bare repo share the identity, so keep one root per repo
     // (the lexicographically first worktree).
-    let mut found: Vec<(String, String)> =
-        par_map(&candidates, |d| d.to_str().and_then(main_checkout)).into_iter().flatten().collect();
+    let mut found: Vec<(String, String, bool)> =
+        par_map(&candidates, |(d, s)| d.to_str().and_then(main_checkout).map(|(id, r)| (id, r, *s)))
+            .into_iter()
+            .flatten()
+            .collect();
     found.sort();
-    found.dedup_by(|a, b| a.0 == b.0);
-    found.retain(|(id, _)| Some(id) != containing_id.as_ref());
-    let roots: Vec<String> = found.into_iter().map(|(_, r)| r).collect();
+    found.dedup_by(|a, b| {
+        let same = a.0 == b.0;
+        if same {
+            b.2 |= a.2;
+        }
+        same
+    });
+    found.retain(|(id, _, _)| Some(id) != containing_id.as_ref());
     let home = std::env::var("HOME").ok().filter(|h| !h.is_empty());
     let rel_of = |root: &str| match Path::new(root).strip_prefix(&base) {
         Ok(r) => r.to_string_lossy().into_owned(),
@@ -303,22 +335,33 @@ pub fn find_repos(path: &str) -> Vec<RepoRef> {
             _ => root.to_string(),
         },
     };
-    let all: Vec<(String, String)> = containing
+    let all: Vec<(String, String, bool)> = containing
         .iter()
-        .map(|r| (r.clone(), String::new()))
-        .chain(roots.iter().map(|r| (r.clone(), rel_of(r))))
+        .map(|r| (r.clone(), String::new(), false))
+        .chain(found.iter().map(|(_, r, s)| (r.clone(), rel_of(r), *s)))
         .collect();
-    let mut out = par_map(&all, |(root, rel)| {
+    let mut out = par_map(&all, |(root, rel, session)| {
         let github = git(root, &["remote", "-v"]).and_then(|r| slug_from_remotes(&r));
         let committed_at =
             git(root, &["log", "-1", "--format=%ct"]).and_then(|s| s.trim().parse::<i64>().ok()).map_or(0, |s| s * 1000);
         let name = if rel.is_empty() { root.rsplit('/').next().unwrap_or(root).to_string() } else { rel.clone() };
-        RepoRef { root: root.clone(), rel: rel.clone(), name, github, committed_at }
+        (RepoRef { root: root.clone(), rel: rel.clone(), name, github, committed_at }, *session)
     });
     let first = (containing.is_some() as usize).min(out.len());
-    out[first..].sort_by(|a, b| b.committed_at.cmp(&a.committed_at).then_with(|| a.rel.cmp(&b.rel)));
-    out.truncate(MAX_REPOS);
-    out
+    out[first..].sort_by(|(a, _), (b, _)| b.committed_at.cmp(&a.committed_at).then_with(|| a.rel.cmp(&b.rel)));
+    // Cap the others at what is left after the containing and session-worktree repos.
+    let mut room = MAX_REPOS.saturating_sub(first + out.iter().filter(|(_, s)| *s).count());
+    out.into_iter()
+        .enumerate()
+        .filter(|(i, (_, session))| {
+            *i < first || *session || {
+                let keep = room > 0;
+                room = room.saturating_sub(1);
+                keep
+            }
+        })
+        .map(|(_, (r, _))| r)
+        .collect()
 }
 
 /// The repo `dir` is in, as (identity, root): the identity is the main entry's path (the bare repo when the main
@@ -366,6 +409,20 @@ fn repo_dirs(base: &Path) -> Vec<PathBuf> {
         found.extend(subdirs(&d1).into_iter().filter(|d2| is_repo(d2)));
     }
     found
+}
+
+/// Folders in `base/.claude/worktrees` that hold a `.git` file (linked worktrees), sorted.
+fn session_worktrees(base: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(base.join(".claude/worktrees")) else { return vec![] };
+    let mut out: Vec<PathBuf> = rd
+        .flatten()
+        .take(MAX_ENTRIES)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .filter(|d| d.join(".git").symlink_metadata().is_ok_and(|m| m.is_file()))
+        .collect();
+    out.sort();
+    out
 }
 
 /// `f` over `items` on up to 8 threads, results in order.
@@ -675,11 +732,12 @@ fn flatten_nodes(v: Value) -> Value {
     }
 }
 
-/// One connection of `owner/name` (`selection` is e.g. `pullRequests(...) { nodes { ...pr } }`), its nodes.
-fn gh_graphql(slug: &str, selection: &str, fragment: &str) -> Result<Vec<Value>, String> {
+/// One connection of `owner/name` (`selection` is e.g. `pullRequests(...) { nodes { ...pr } }`), its nodes, and
+/// the login gh is signed in as (asked along, free).
+fn gh_graphql(slug: &str, selection: &str, fragment: &str) -> Result<(Vec<Value>, Option<String>), String> {
     let (owner, name) = slug.split_once('/').ok_or_else(|| format!("Not a GitHub repo: {slug}"))?;
     let query = format!(
-        "query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ list: {selection} }} }}\n{fragment}"
+        "query($owner: String!, $name: String!) {{ viewer {{ login }} repository(owner: $owner, name: $name) {{ list: {selection} }} }}\n{fragment}"
     );
     let (q, o, n) = (format!("query={query}"), format!("owner={owner}"), format!("name={name}"));
     let out = gh(&["api", "graphql", "-f", &q, "-f", &o, "-f", &n])?;
@@ -687,9 +745,10 @@ fn gh_graphql(slug: &str, selection: &str, fragment: &str) -> Result<Vec<Value>,
     let repo = v.pointer("/data/repository").filter(|r| !r.is_null()).ok_or_else(|| {
         v.pointer("/errors/0/message").and_then(Value::as_str).unwrap_or("Repository not found on GitHub").to_string()
     })?;
+    let viewer = v.pointer("/data/viewer/login").and_then(Value::as_str).filter(|l| !l.is_empty()).map(String::from);
     match flatten_nodes(repo.get("list").cloned().unwrap_or_default()) {
-        Value::Array(a) => Ok(a),
-        _ => Ok(Vec::new()),
+        Value::Array(a) => Ok((a, viewer)),
+        _ => Ok((Vec::new(), viewer)),
     }
 }
 
@@ -698,26 +757,29 @@ fn fetch_github(slug: &str) -> Result<GitHubInfo, String> {
     let open = format!("pullRequests(states: OPEN, first: {OPEN_PRS}, {order}) {{ nodes {{ ...pr }} }}");
     let closed = format!("pullRequests(states: [CLOSED, MERGED], first: {CLOSED_PRS}, {order}) {{ nodes {{ ...pr }} }}");
     let issues = format!("issues(states: OPEN, first: {OPEN_ISSUES}, {order}) {{ nodes {{ {ISSUE_SELECTION} }} }}");
-    let lost = || Err::<Vec<Value>, _>("gh failed".to_string());
+    let lost = || Err::<(Vec<Value>, Option<String>), _>("gh failed".to_string());
     let (open, closed, issues) = std::thread::scope(|s| {
         let a = s.spawn(|| gh_graphql(slug, &open, PR_FRAGMENT));
-        let b = s.spawn(|| gh_graphql(slug, &closed, PR_FRAGMENT));
+        let b = s.spawn(|| gh_graphql(slug, &closed, CLOSED_PR_FRAGMENT));
         let c = s.spawn(|| gh_graphql(slug, &issues, ""));
         (a.join().unwrap_or_else(|_| lost()), b.join().unwrap_or_else(|_| lost()), c.join().unwrap_or_else(|_| lost()))
     });
-    let mut pulls: Vec<PullRequest> = open?.iter().map(parse_pr).collect();
+    let ((open, v1), (closed, v2), (issues, v3)) = (open?, closed?, issues?);
+    let viewer = v1.or(v2).or(v3);
+    let mut pulls: Vec<PullRequest> = open.iter().map(parse_pr).collect();
     pulls.sort_by_key(|p| std::cmp::Reverse(p.updated_at));
     // Asked for by last update (a late comment counts), kept by when they were merged or closed.
-    let mut recent_pulls: Vec<PullRequest> = closed?.iter().map(parse_pr).collect();
-    recent_pulls.sort_by_key(|p| std::cmp::Reverse(p.merged_at.or(p.closed_at).unwrap_or(0)));
+    let mut recent_pulls: Vec<PullRequest> = closed.iter().map(parse_pr).collect();
+    recent_pulls.sort_by_key(|p| std::cmp::Reverse(p.merged_at.max(p.closed_at).unwrap_or(0)));
     recent_pulls.truncate(RECENT_PRS);
-    let mut issues: Vec<Issue> = issues?.iter().map(parse_issue).collect();
+    let mut issues: Vec<Issue> = issues.iter().map(parse_issue).collect();
     issues.sort_by_key(|i| std::cmp::Reverse(i.updated_at));
     Ok(GitHubInfo {
         repo: slug.into(),
         url: format!("https://github.com/{slug}"),
         pulls,
         recent_pulls,
+        viewer,
         issues,
         fetched_at: chrono::Utc::now().timestamp_millis(),
     })
@@ -1147,8 +1209,11 @@ mod tests {
         sh(&done, &["commit", "-q", "-m", "done one"]);
         sh(&main, &["merge", "-q", "--ff-only", "done"]);
 
-        let o = overview(main.to_str().unwrap(), false);
+        let o = overview(main.to_str().unwrap(), false, true);
+        let local = overview(main.to_str().unwrap(), false, false);
         let _ = std::fs::remove_dir_all(&dir);
+        let local = local.expect("a git repo");
+        assert_eq!((local.github, local.github_error, local.worktrees.len()), (None, None, 2));
         let o = o.expect("a git repo");
         assert_eq!((o.base.as_str(), o.branch.as_deref()), ("main", Some("main")));
         assert!(o.root.ends_with("/main"), "{}", o.root);
@@ -1165,7 +1230,7 @@ mod tests {
         assert_eq!((d.ahead, d.behind, d.dirty, d.merged), (0, 0, 0, true));
         assert!(d.commits_ahead.is_empty());
 
-        assert!(overview(std::env::temp_dir().to_str().unwrap(), false).is_none());
+        assert!(overview(std::env::temp_dir().to_str().unwrap(), false, true).is_none());
     }
 
     #[test]
@@ -1185,6 +1250,12 @@ mod tests {
         // The project folder is itself inside a repo, with a repo below it.
         repo("outer");
         repo("outer/sub/g");
+        // A repo elsewhere with a worktree in the project's .claude/worktrees (where sessions put them); a plain
+        // repo there is no worktree and stays unlisted.
+        repo("elsewhere/r");
+        std::fs::create_dir_all(dir.join("project/.claude/worktrees")).unwrap();
+        sh(&dir.join("elsewhere/r"), &["worktree", "add", "-q", "-b", "x", "../../project/.claude/worktrees/x"]);
+        repo("project/.claude/worktrees/plain");
 
         let project = dir.join("project");
         let found = find_repos(project.to_str().unwrap());
@@ -1195,6 +1266,10 @@ mod tests {
 
         let mut rels: Vec<&str> = found.iter().map(|r| r.rel.as_str()).collect();
         rels.sort();
+        assert_eq!(found.len(), 3, "{found:?}");
+        let r = found.iter().find(|r| r.root.ends_with("/elsewhere/r")).expect("the worktree's repo");
+        assert!(r.rel.ends_with("/elsewhere/r") && r.name == r.rel, "{r:?}");
+        rels.retain(|&x| x != r.rel);
         assert_eq!(rels, vec!["a", "b/c"], "{found:?}");
         let a = found.iter().find(|r| r.rel == "a").unwrap();
         assert!(a.root.ends_with("/project/a") && a.name == "a" && a.github.is_none() && a.committed_at > 0, "{a:?}");
@@ -1219,7 +1294,7 @@ mod tests {
     #[test]
     #[ignore = "live: reads this Mac's Navarch checkout and calls GitHub through gh"]
     fn repo_live() {
-        let o = overview("/Users/daniel/dev/planning/Navarch", true).expect("a git repo");
+        let o = overview("/Users/daniel/dev/planning/Navarch", true, true).expect("a git repo");
         println!("root {} base {} branch {:?}", o.root, o.base, o.branch);
         for w in &o.worktrees {
             let name = w.path.rsplit('/').next().unwrap_or("");
@@ -1240,7 +1315,14 @@ mod tests {
         for slug in ["mapequation/bioregions", "cli/cli"] {
             match fetch_github(slug) {
                 Ok(g) => {
-                    println!("{slug}: pulls {} recent {} issues {}", g.pulls.len(), g.recent_pulls.len(), g.issues.len());
+                    let merged = g.recent_pulls.iter().filter(|p| p.state == PrState::Merged).count();
+                    println!(
+                        "{slug}: pulls {} recent {} (merged {merged}) issues {} viewer {:?}",
+                        g.pulls.len(),
+                        g.recent_pulls.len(),
+                        g.issues.len(),
+                        g.viewer
+                    );
                     for p in g.pulls.iter().chain(&g.recent_pulls).take(3) {
                         println!(
                             "  #{} {:?} checks {:?} ({}) commits {} comments {} merge {} {:?} reviewers {:?}",

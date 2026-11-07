@@ -724,7 +724,7 @@ button.repo-name:hover { color: var(--accent); text-decoration: underline; }
 .repo-col { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 .repo-col + .repo-col { border-left: 1px solid var(--border); }
 .repo-col-head {
-  display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 12px; flex-shrink: 0;
+  display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 12px; flex-shrink: 0; white-space: nowrap;
   font-size: 11px; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted);
 }
 .repo-col-head .count, .repo-tab .count { letter-spacing: 0; }
@@ -746,6 +746,38 @@ button.repo-name:hover { color: var(--accent); text-decoration: underline; }
   font-size: 11.5px; font-weight: 600; color: var(--muted);
 }
 .repo-sub-toggle:hover { color: var(--text-2); }
+.repo-more { margin-top: 6px; font-weight: 500; }
+.repo-merged-link { border: 0; background: none; padding: 0; font: inherit; color: var(--purple); cursor: pointer; }
+.repo-merged-link:hover { text-decoration: underline; }
+.repo-prview {
+  margin-left: auto; display: inline-flex; align-items: center; gap: 6px;
+  text-transform: none; letter-spacing: 0; font-weight: 500;
+}
+.repo-prview .seg { margin-left: 0; }
+.seg-small { padding: 1px; border-radius: 6px; }
+.seg-small button { display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px; font-size: 11px; height: 19px; }
+.seg-small .count { font-size: 10.5px; }
+.repo-mine {
+  height: 21px; padding: 0 7px; border-radius: 6px; border: 1px solid var(--border); background: none;
+  font-size: 11px; color: var(--text-2); cursor: pointer;
+}
+.repo-mine:hover { color: var(--text); }
+.repo-mine.is-on { background: var(--accent-soft); border-color: transparent; color: var(--accent); }
+.repo-subhead { display: flex; padding: 6px 12px 0; flex-shrink: 0; }
+.repo-subhead .repo-prview { margin-left: 0; }
+.repo-day-head {
+  position: sticky; top: 0; z-index: 1; display: flex; align-items: center; gap: 6px; padding: 7px 8px 3px;
+  font-size: 11px; font-weight: 600; color: var(--muted); background: var(--panel-2);
+}
+.repo-day + .repo-day .repo-day-head { padding-top: 9px; }
+.rr-author { color: var(--text-2); }
+.rr-diff { font-size: 11px; }
+.rr-repo {
+  display: inline-block; margin-right: 6px; padding: 0 5px; border-radius: 4px; vertical-align: 1px; line-height: 15px;
+  font-size: 10.5px; font-weight: 600; color: var(--muted); background: var(--hover);
+}
+.hc-repo.is-plain { cursor: default; }
+.hc-repo.is-plain:hover { color: var(--muted); text-decoration: none; }
 
 .repo-row {
   display: grid; grid-template-columns: 16px minmax(0, 1fr); gap: 8px; align-items: start;
