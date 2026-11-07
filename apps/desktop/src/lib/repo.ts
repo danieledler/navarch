@@ -1,5 +1,5 @@
-// Cross-links repo overviews (worktrees, PRs, issues) with Claude sessions, for the project's Repo panel.
-import type { GitHubInfo, Issue, PullRequest, RepoOverview, RepoRef, Session, Worktree } from "../api/types";
+// Cross-links repo overviews (worktrees, branches, PRs, issues) with Claude sessions, for the project's Repo panel.
+import type { Branch, GitHubInfo, Issue, PullRequest, RepoOverview, RepoRef, Session, Worktree } from "../api/types";
 
 export interface LinkedWorktree {
   wt: Worktree;
@@ -23,7 +23,24 @@ export interface LinkedIssue {
   pulls: PullRequest[]; // open PRs that close it
 }
 
+export interface LinkedBranch {
+  b: Branch;
+  pr: PullRequest | null; // open PR from it, else its most recently merged or closed one
+  worktree: LinkedWorktree | null; // the worktree or main checkout that has it checked out (wt.path === b.checkedOut)
+  stale: boolean; // see linkBranches
+}
+
+/** The Branches column, in the overview's order (base first, then newest tip first). */
+export interface LinkedBranches {
+  active: LinkedBranch[]; // base first, then local branches that aren't stale and local+remote ones
+  /** Local, not base, not checked out, and merged into base, its upstream gone, or its PR done with the branch
+   *  untouched since (no newer commit, nothing unpushed) and the PR merged or the branch has nothing beyond base. */
+  stale: LinkedBranch[];
+  remoteOnly: LinkedBranch[]; // only on the remote (e.g. other authors' PR branches), base aside
+}
+
 export interface LinkedRepo {
+  branches: LinkedBranches; // of the chosen repo only (empty while it isn't loaded)
   rows: LinkedWorktree[]; // the Worktrees column: main checkouts (see linkWorktrees), then active linked worktrees
   idle: LinkedWorktree[]; // idle linked worktrees, folded away below the rows
   worktrees: LinkedWorktree[]; // every linked worktree (rows and idle, main checkouts left out): the column's count
@@ -54,6 +71,30 @@ function prOf(branch: string | null, gh: GitHubInfo | null): PullRequest | null 
   if (!branch || !gh) return null;
   const done = gh.recentPulls.filter((p) => p.headRef === branch).sort((a, b) => doneAt(b) - doneAt(a));
   return gh.pulls.find((p) => p.headRef === branch) ?? done[0] ?? null;
+}
+
+/** The branches of one repo, each with its PR and the checkout that has it (from `worktrees`, the LinkedWorktree
+ *  rows of that repo, main checkout included), split into active, stale and remote-only. */
+export function linkBranches(o: RepoOverview, worktrees: LinkedWorktree[]): LinkedBranches {
+  const out: LinkedBranches = { active: [], stale: [], remoteOnly: [] };
+  const base: LinkedBranch[] = [];
+  for (const b of o.branches) {
+    const pr = b.name === o.base ? null : prOf(b.name, o.github);
+    const worktree = b.checkedOut ? (worktrees.find((w) => trim(w.wt.path) === trim(b.checkedOut!)) ?? null) : null;
+    // A finished PR counts only for a branch that hasn't moved since (a reused branch has new work), and a closed,
+    // unmerged one only when the branch has nothing beyond base (else its commits may exist nowhere else).
+    const prDone = !!pr && pr.state !== "open" && b.committedAt <= doneAt(pr) && !(b.unpushed ?? 0);
+    const stale =
+      b.local && b.name !== o.base && !b.checkedOut &&
+      (b.merged || b.upstreamGone || (prDone && (pr!.state === "merged" || b.ahead === 0)));
+    const lb: LinkedBranch = { b, pr, worktree, stale };
+    if (stale) out.stale.push(lb);
+    else if (b.name === o.base) base.push(lb);
+    else if (!b.local) out.remoteOnly.push(lb);
+    else out.active.push(lb);
+  }
+  out.active.unshift(...base);
+  return out;
 }
 
 /** The rows of the Worktrees column. */
@@ -149,7 +190,8 @@ export function linkProject(chosen: RepoOverview | null, entries: RepoEntry[], s
     issue,
     pulls: open.filter((p) => issue.linkedPulls.includes(p.number) || p.closingIssues.includes(issue.number)),
   }));
-  return { rows, idle, worktrees, pulls, issues };
+  const branches = chosen ? linkBranches(chosen, own) : { active: [], stale: [], remoteOnly: [] };
+  return { branches, rows, idle, worktrees, pulls, issues };
 }
 
 /** One repo's overview cross-linked with sessions. */

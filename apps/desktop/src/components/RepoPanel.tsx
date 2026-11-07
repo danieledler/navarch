@@ -1,24 +1,24 @@
-// The Repo panel at the bottom of a project: open PRs, issues and git worktrees of the project's folder, cross-linked
-// with Claude sessions. Rows are read-only (click opens on GitHub, reveals in Finder, or opens a session); hovering a
+// The Repo panel under a project (spanning the project view and the Focus column): open PRs, issues, branches and git
+// worktrees of the project's folder, cross-linked with Claude sessions. Rows are read-only (click opens on GitHub, reveals in Finder, or opens a session); hovering a
 // row shows a hover card with the details.
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
-  ArrowDown, ArrowUp, BadgeCheck, Check, ChevronDown, ChevronRight, CircleDot, Copy, Eye, ExternalLink, FileDiff, FolderGit2, FolderOpen,
-  GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft, Laptop, Lock, MessageSquare, Minus, RefreshCw, SquareTerminal,
+  ArrowDown, ArrowUp, BadgeCheck, Check, ChevronDown, ChevronRight, CircleDot, Cloud, Copy, Eye, ExternalLink, FileDiff, FolderGit2, FolderOpen,
+  GitBranch, GitCompare, GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft, Laptop, Lock, MessageSquare, Minus, RefreshCw, SquareTerminal,
   TriangleAlert, X, Zap,
 } from "lucide-react";
-import { api, type CheckState, type GitHubInfo, type Issue, type Label, type PullRequest, type RepoOverview, type RepoRef, type Reviewer, type Session } from "../api";
+import { api, type Branch, type CheckState, type GitHubInfo, type Issue, type Label, type PullRequest, type RepoOverview, type RepoRef, type Reviewer, type Session } from "../api";
 import { chosenRepo, useModel, useStore } from "../store";
 import { baseName, plainText, relTime, shortPath } from "../lib/format";
-import { doneAt, linkProject, type LinkedIssue, type LinkedPull, type LinkedRepo, type LinkedWorktree, type RepoEntry } from "../lib/repo";
+import { doneAt, linkProject, type LinkedBranch, type LinkedIssue, type LinkedPull, type LinkedRepo, type LinkedWorktree, type RepoEntry } from "../lib/repo";
 import { IconButton, Popover, STATUS_LABEL, StatusDot } from "./ui";
 import { HoverCard, useHoverCard } from "./HoverCard";
 
 const MIN_H = 120; // panel
-const MIN_TOP = 160; // task tree above it
-const NARROW = 760; // below this width the three columns become tabs
+const MIN_TOP = 160; // project view and Focus above it (styles.css caps .repo-panel's max-height to match)
+const NARROW = 1000; // below this width the columns become tabs
 
-type Col = "pulls" | "issues" | "worktrees";
+type Col = "pulls" | "issues" | "branches" | "worktrees";
 
 /** Fire-and-forget backend call that toasts its error (no snapshot reload, unlike `run`). */
 function useAct() {
@@ -52,6 +52,7 @@ export function RepoPanel({ path }: { path: string }) {
   const [narrow, setNarrow] = useState(false);
   const [tab, setTab] = useState<Col>("pulls");
   const [showDone, setShowDone] = useState(false);
+  const [showStale, setShowStale] = useState(false);
   const hc = useHoverCard();
   const prView = panel.prView ?? "open";
   const mine = panel.mine ?? false;
@@ -129,8 +130,9 @@ export function RepoPanel({ path }: { path: string }) {
   const onDividerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!open || !data || e.button !== 0) return;
     const root = rootRef.current;
-    const above = root?.previousElementSibling as HTMLElement | null;
     if (!root) return;
+    // The panel is a grid item of .app under the project view and Focus: the project view's height is the row above.
+    const above = root.parentElement?.querySelector<HTMLElement>(":scope > .main") ?? null;
     e.preventDefault();
     e.currentTarget.setPointerCapture(e.pointerId);
     hc.hide();
@@ -161,6 +163,17 @@ export function RepoPanel({ path }: { path: string }) {
 
   const fetchedAt = gh?.fetchedAt ?? st?.at ?? 0;
   const unpushed = data?.main?.unpushed ?? 0;
+  const staleN = linked?.branches.stale.length ?? 0;
+  const ctx: BrCtx | null = data ? { slug: gh?.repo ?? chosen?.github ?? null, remote: data.remote, base: data.base } : null;
+  const showStaleBranches = () => {
+    hc.hide();
+    if (!panel.open) loadAll();
+    setRepoPanel({ open: true });
+    setShowStale(true);
+    setTab("branches");
+    // After the section renders: bring its toggle to the top of the column.
+    window.setTimeout(() => rootRef.current?.querySelector(".br-stale-toggle")?.scrollIntoView({ block: "start" }), 60);
+  };
   const counts = linked
     ? [
         gh && plural(gh.pulls.length, "PR"),
@@ -254,6 +267,14 @@ export function RepoPanel({ path }: { path: string }) {
                   </span>
                 </>
               )}
+              {staleN > 0 && (
+                <>
+                  {" · "}
+                  <button type="button" className="repo-stale-link" title={STALE_HINT} onClick={showStaleBranches}>
+                    {staleN} stale branch{staleN === 1 ? "" : "es"}
+                  </button>
+                </>
+              )}
             </span>
           </>
         )}
@@ -281,9 +302,13 @@ export function RepoPanel({ path }: { path: string }) {
         </span>
       </div>
 
-      {open && linked && data && (
+      {open && linked && data && ctx && (
         <RepoBody
           linked={linked}
+          o={data}
+          ctx={ctx}
+          showStale={showStale}
+          setShowStale={setShowStale}
           gh={gh}
           githubError={data.githubError}
           ghLoading={ghLoading}
@@ -310,8 +335,8 @@ export function RepoPanel({ path }: { path: string }) {
 
       {open && !data && <div className="repo-body is-loading"><div className="repo-note">Loading…</div></div>}
 
-      {open && linked && hc.open && (
-        <CardFor k={hc.open.key} linked={linked} gh={gh} root={data!.root} multi={multi} rect={hc.open.rect} hc={hc} />
+      {open && linked && ctx && hc.open && (
+        <CardFor k={hc.open.key} linked={linked} gh={gh} root={data!.root} multi={multi} ctx={ctx} rect={hc.open.rect} hc={hc} />
       )}
     </div>
   );
@@ -389,13 +414,16 @@ const overviewCounts = (o: RepoOverview) =>
     .join(" · ");
 
 function RepoBody({
-  linked, gh, githubError, ghLoading, root, multi, prView, setPrView, mine, setMine, narrow, tab, setTab, showDone, setShowDone, hc,
+  linked, o, ctx, showStale, setShowStale, gh, githubError, ghLoading, root, multi, prView, setPrView, mine, setMine, narrow, tab, setTab,
+  showDone, setShowDone, hc,
 }: {
-  linked: LinkedRepo; gh: GitHubInfo | null; githubError: string | null; ghLoading: boolean; root: string; multi: boolean;
+  linked: LinkedRepo; o: RepoOverview; ctx: BrCtx; showStale: boolean; setShowStale: (b: boolean) => void; gh: GitHubInfo | null; githubError: string | null; ghLoading: boolean; root: string; multi: boolean;
   prView: "open" | "merged"; setPrView: (v: "open" | "merged") => void; mine: boolean; setMine: (b: boolean) => void;
   narrow: boolean; tab: Col; setTab: (c: Col) => void; showDone: boolean; setShowDone: (b: boolean) => void; hc: HC;
 }) {
   const [showIdle, setShowIdle] = useState(false);
+  const [showRemote, setShowRemote] = useState(false);
+  const br = linked.branches;
   const ghNote = !gh && <div className="repo-note">{ghLoading ? "Loading GitHub data…" : (githubError ?? "No GitHub data")}</div>;
   const closed = (gh?.recentPulls ?? []).filter((p) => p.state === "closed");
   const merged = (gh?.recentPulls ?? []).filter((p) => p.state === "merged");
@@ -465,6 +493,58 @@ function RepoBody({
             ))}
           </>
         ),
+    },
+    {
+      id: "branches",
+      title: "Branches",
+      n: o.branchCount,
+      body: (
+        <>
+          {br.active.map((lb) => (
+            <BranchRow key={lb.b.name} lb={lb} ctx={ctx} hc={hc} />
+          ))}
+          {br.active.length === 0 && <div className="repo-empty">No local branches</div>}
+          {br.remoteOnly.length > 0 && (
+            <>
+              <button
+                type="button"
+                className="repo-sub-toggle"
+                aria-expanded={showRemote}
+                title={`Branches only on ${o.remote ?? "the remote"}, with no local branch (e.g. other people’s PR branches)`}
+                onClick={() => {
+                  hc.hide();
+                  setShowRemote(!showRemote);
+                }}
+              >
+                <ChevronRight size={12} className={showRemote ? "rot" : ""} /> Remote only <span className="count">{br.remoteOnly.length}</span>
+              </button>
+              {showRemote && br.remoteOnly.map((lb) => <BranchRow key={lb.b.name} lb={lb} ctx={ctx} hc={hc} />)}
+            </>
+          )}
+          {br.stale.length > 0 && (
+            <>
+              <button
+                type="button"
+                className="repo-sub-toggle br-stale-toggle"
+                aria-expanded={showStale}
+                title={STALE_HINT}
+                onClick={() => {
+                  hc.hide();
+                  setShowStale(!showStale);
+                }}
+              >
+                <ChevronRight size={12} className={showStale ? "rot" : ""} /> Stale <span className="count">{br.stale.length}</span>
+              </button>
+              {showStale && br.stale.map((lb) => <BranchRow key={lb.b.name} lb={lb} ctx={ctx} hc={hc} />)}
+            </>
+          )}
+          {o.branchCount > o.branches.length && (
+            <div className="repo-empty">
+              Showing {o.branches.length} of {o.branchCount} branches
+            </div>
+          )}
+        </>
+      ),
     },
     {
       id: "worktrees",
@@ -868,9 +948,133 @@ function WorktreeRow({ lw, multi, hc }: { lw: LinkedWorktree; multi: boolean; hc
   );
 }
 
+/** What a branch row needs from its repo: the GitHub slug (links), the remote the remote side refers to, the base. */
+interface BrCtx {
+  slug: string | null;
+  remote: string | null;
+  base: string;
+}
+
+const STALE_HINT =
+  "Local branches that are merged, whose remote branch is gone, or whose PR merged with no commits since: safe to delete after a look";
+
+/** The branch's name on GitHub when it is there: its remote-tracking branch on the GitHub remote, without "<remote>/". */
+function ghBranch(b: Branch, ctx: BrCtx): string | null {
+  const { remote, slug } = ctx;
+  if (!slug || !remote || !b.remoteRef || b.upstreamGone || !b.remoteRef.startsWith(`${remote}/`)) return null;
+  return b.remoteRef.slice(remote.length + 1);
+}
+const refPath = (name: string) => name.split("/").map(encodeURIComponent).join("/");
+const treeUrl = (slug: string, name: string) => `https://github.com/${slug}/tree/${refPath(name)}`;
+const compareUrl = (slug: string, base: string, name: string) => `https://github.com/${slug}/compare/${refPath(base)}...${refPath(name)}`;
+
+/** Where a branch exists, for the row's presence icons. */
+function whereLabel(b: Branch, remote: string | null): string {
+  const onRemote = b.remoteRef && !b.upstreamGone;
+  if (b.local && onRemote) return `Local branch, tracking ${b.remoteRef}`;
+  if (b.local) return b.upstreamGone ? "Local branch; its remote branch was deleted" : `Local branch only, not on ${remote ?? "a remote"}`;
+  return `Only on ${b.remoteRef}, no local branch`;
+}
+
+function BranchRow({ lb, ctx, hc }: { lb: LinkedBranch; ctx: BrCtx; hc: HC }) {
+  const act = useAct();
+  const { b, pr, worktree, stale } = lb;
+  const key = `br:${b.name}`;
+  const isBase = b.name === ctx.base;
+  const gh = ghBranch(b, ctx);
+  const url = gh && ctx.slug ? treeUrl(ctx.slug, gh) : null;
+  const folder = b.checkedOut;
+  const onClick = url ? () => act(api.openUrl(url)) : folder ? () => act(api.revealPath(folder)) : undefined;
+  const up = b.unpushed ?? 0;
+  const down = b.unpulled ?? 0;
+  const remote = ctx.remote ?? "origin";
+  return (
+    <div
+      className={`repo-row br-row ${stale ? "is-done" : ""} ${onClick ? "" : "is-static"} ${hc.open?.key === key ? "is-hovered" : ""}`}
+      role={url ? "link" : onClick ? "button" : undefined}
+      onClick={onClick}
+      {...hc.row(key)}
+    >
+      <GitBranch size={14} className={`ri-icon ${isBase ? "c-accent" : "muted"}`} />
+      <div className="rr-main">
+        <div className="rr-title br-name">
+          <span className="br-name-text" title={b.name}>{b.name}</span>
+          {isBase && <span className="tag tag-base" title="The base branch: ahead, behind and merged compare with it">base</span>}
+          <span className="br-end">
+              {pr && (
+                <button
+                  type="button"
+                  className={`pr-chip pr-${prState(pr)}`}
+                  title={`${PR_LABEL[prState(pr)]}: ${pr.title}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    act(api.openUrl(pr.url));
+                  }}
+                >
+                  <PrIcon pr={pr} size={11} /> #{pr.number}
+                </button>
+              )}
+            <span className="br-when" title={`Last commit ${new Date(b.committedAt).toLocaleString()}`}>{relTime(b.committedAt)}</span>
+          </span>
+        </div>
+        <div className="rr-sub">
+          <span className="br-where" title={whereLabel(b, ctx.remote)}>
+            {b.local && <Laptop size={12} />}
+            {b.remoteRef && !b.upstreamGone && <Cloud size={12} />}
+          </span>
+          {up > 0 && (
+            <span className="rr-ab c-amber" title={`${plural(up, "commit")} not pushed to ${b.remoteRef}`}>
+              <span><ArrowUp size={10} />{up}</span> <span className="rr-ab-label">not pushed</span>
+            </span>
+          )}
+          {down > 0 && (
+            <span className="rr-ab" title={`${plural(down, "commit")} on ${b.remoteRef} not in the local branch, as of the last fetch`}>
+              <span><ArrowDown size={10} />{down}</span> <span className="rr-ab-label">behind {remote}</span>
+            </span>
+          )}
+          {b.upstreamGone && (
+            <span className="tag tag-red" title={`Deleted on GitHub${pr?.state === "merged" ? ` after #${pr.number} merged` : ""}; the local branch is still here`}>
+              gone
+            </span>
+          )}
+          {b.local && !b.remoteRef && !b.upstreamGone && ctx.remote && (
+            <span className="tag tag-amber" title={`Never pushed to ${ctx.remote}`}>not pushed</span>
+          )}
+          {!isBase && (b.ahead > 0 || b.behind > 0) && (
+            <span className="rr-ab rr-ab-base" title={`${b.ahead} ahead of, ${b.behind} behind ${ctx.base}`}>
+              {b.ahead > 0 && <span><ArrowUp size={10} />{b.ahead}</span>}
+              {b.behind > 0 && <span><ArrowDown size={10} />{b.behind}</span>}
+            </span>
+          )}
+          {b.merged && <span className="tag tag-merged" title={`All its commits are on ${ctx.base}`}>merged</span>}
+          {folder && (
+            <button
+              type="button"
+              className="wt-chip"
+              title={`Checked out in ${worktree?.isMain ? "the main checkout" : "the worktree"} ${folder}. Click to reveal.`}
+              onClick={(e) => {
+                e.stopPropagation();
+                act(api.revealPath(folder));
+              }}
+            >
+              {worktree?.isMain ? <Laptop size={11} /> : <FolderGit2 size={11} />}
+              {/* A worktree named after its branch shows as the icon alone. */}
+              {(worktree?.isMain || (worktree?.name ?? baseName(folder)) !== b.name) && (
+                <span className="wt-chip-text">{worktree?.isMain ? "main checkout" : (worktree?.name ?? baseName(folder))}</span>
+              )}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── hover cards ──
 
-function CardFor({ k, linked, gh, root, multi, rect, hc }: { k: string; linked: LinkedRepo; gh: GitHubInfo | null; root: string; multi: boolean; rect: DOMRect; hc: HC }) {
+function CardFor({
+  k, linked, gh, root, multi, ctx, rect, hc,
+}: { k: string; linked: LinkedRepo; gh: GitHubInfo | null; root: string; multi: boolean; ctx: BrCtx; rect: DOMRect; hc: HC }) {
   let body: ReactNode = null;
   if (k.startsWith("pr:") && gh) {
     const n = Number(k.slice(3));
@@ -885,6 +1089,10 @@ function CardFor({ k, linked, gh, root, multi, rect, hc }: { k: string; linked: 
   } else if (k.startsWith("wt:")) {
     const lw = [...linked.rows, ...linked.idle].find((w) => w.wt.path === k.slice(3));
     if (lw) body = <WorktreeCard lw={lw} multi={multi} />;
+  } else if (k.startsWith("br:")) {
+    const { active, remoteOnly, stale } = linked.branches;
+    const lb = [...active, ...remoteOnly, ...stale].find((x) => x.b.name === k.slice(3));
+    if (lb) body = <BranchCard lb={lb} ctx={ctx} />;
   }
   if (!body) return null;
   return (
@@ -1279,6 +1487,130 @@ function WorktreeCard({ lw, multi }: { lw: LinkedWorktree; multi: boolean }) {
         {wt.branch && (
           <button type="button" className="btn btn-small btn-ghost" onClick={() => copy(wt.branch!, "branch name")}>
             <Copy size={12} /> Branch
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function BranchCard({ lb, ctx }: { lb: LinkedBranch; ctx: BrCtx }) {
+  const act = useAct();
+  const toast = useStore((s) => s.toast);
+  const { b, pr, worktree, stale } = lb;
+  const isBase = b.name === ctx.base;
+  const gh = ghBranch(b, ctx);
+  const slug = ctx.slug;
+  const up = b.unpushed ?? 0;
+  const down = b.unpulled ?? 0;
+  const remoteLabel = slug ? "GitHub" : (ctx.remote ?? "a remote");
+  const sessions = worktree ? (worktree.isMain ? worktree.sessions.slice(0, 5) : worktree.sessions) : [];
+  const copy = () =>
+    void navigator.clipboard.writeText(b.name).then(
+      () => toast("Copied the branch name"),
+      (e) => toast(String(e), undefined, "error"),
+    );
+  return (
+    <div className="hc">
+      <div className="hc-top">
+        <span className="pill pill-wt">
+          <GitBranch size={12} /> {isBase ? "Base branch" : "Branch"}
+        </span>
+        {b.merged && <span className="pill pill-merged">Merged</span>}
+        {b.upstreamGone && <span className="pill pill-closed">Deleted on GitHub</span>}
+        {stale && !b.merged && !b.upstreamGone && <span className="pill pill-muted">Stale</span>}
+      </div>
+      <div className="hc-title is-static br-card-name">{b.name}</div>
+      <div className="hc-meta">
+        <strong>{b.author}</strong> committed <When ms={b.committedAt} />
+      </div>
+
+      <div className="hc-grid">
+        <span className="hc-k">{b.local ? "Local" : "Tip"}</span>
+        <span className="hc-v hc-nowrap">
+          <code>{b.head}</code> <span className="hc-ellipsis">{b.subject}</span>
+        </span>
+
+        <span className="hc-k">{slug ? "GitHub" : "Remote"}</span>
+        <span className="hc-v">
+          {b.upstreamGone ? (
+            <span className="c-red">Deleted on GitHub{pr?.state === "merged" ? ` after #${pr.number} merged` : ""}</span>
+          ) : b.remoteRef ? (
+            <>
+              <code>{b.remoteRef}</code>
+              {b.local &&
+                (up > 0 ? <span className="c-amber">{up} not pushed</span> : down === 0 && <span className="muted">in sync</span>)}
+              {down > 0 && (
+                <span title="Navarch never fetches: run git fetch to see newer commits">
+                  {down} behind <span className="muted">(as of the last fetch)</span>
+                </span>
+              )}
+              {!b.local && <span className="muted">no local branch</span>}
+            </>
+          ) : (
+            <span className={ctx.remote ? "c-amber" : "muted"}>Not on {remoteLabel}</span>
+          )}
+        </span>
+
+        {!isBase && (
+          <>
+            <span className="hc-k">vs {ctx.base}</span>
+            <span>
+              {b.ahead === 0 && b.behind === 0
+                ? "Up to date"
+                : [b.ahead > 0 && `${b.ahead} ahead`, b.behind > 0 && `${b.behind} behind`].filter(Boolean).join(", ")}
+              {b.merged && <span className="muted"> · all commits are on {ctx.base}</span>}
+            </span>
+          </>
+        )}
+
+        {b.checkedOut && (
+          <>
+            <span className="hc-k">Checked out</span>
+            <button type="button" className="hc-link" title={`Reveal ${b.checkedOut} in Finder`} onClick={() => act(api.revealPath(b.checkedOut!))}>
+              {worktree?.isMain ? <Laptop size={12} /> : <FolderGit2 size={12} />}
+              <span className="br-nowrap">{worktree?.isMain ? "Main checkout" : (worktree?.name ?? baseName(b.checkedOut))}</span>
+              <span className="hc-ellipsis muted">{shortPath(b.checkedOut)}</span>
+            </button>
+          </>
+        )}
+
+        {pr && (
+          <>
+            <span className="hc-k">PR</span>
+            <button type="button" className="hc-link" onClick={() => act(api.openUrl(pr.url))}>
+              <PrIcon pr={pr} size={12} /> #{pr.number} <span className="hc-ellipsis">{pr.title}</span>
+              <span className={`hc-state c-${PR_COLOR[prState(pr)]}`}>{PR_LABEL[prState(pr)]}</span>
+              {pr.state === "open" && pr.checksState && <CheckMark state={pr.checksState} title={checksSummary(pr.checks)} />}
+            </button>
+          </>
+        )}
+      </div>
+
+      {stale && <div className="hc-hint">{STALE_HINT}.</div>}
+
+      {worktree && sessions.length > 0 && (
+        <div className="hc-sec">
+          <div className="hc-sec-head">
+            {worktree.isMain && worktree.sessions.length > sessions.length ? "Latest Claude sessions" : "Claude sessions"}{" "}
+            <span className="count">{worktree.sessions.length}</span>
+          </div>
+          <SessionList sessions={sessions} />
+        </div>
+      )}
+
+      <div className="hc-actions">
+        <button type="button" className="btn btn-small" onClick={copy}>
+          <Copy size={12} /> Copy name
+        </button>
+        {gh && slug && (
+          <button type="button" className="btn btn-small btn-ghost" onClick={() => act(api.openUrl(treeUrl(slug, gh)))}>
+            <ExternalLink size={12} /> Open on GitHub
+          </button>
+        )}
+        {gh && slug && !isBase && !b.merged && (
+          <button type="button" className="btn btn-small btn-ghost" onClick={() => act(api.openUrl(compareUrl(slug, ctx.base, gh)))}>
+            <GitCompare size={12} /> Compare
           </button>
         )}
       </div>

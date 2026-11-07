@@ -250,29 +250,71 @@ pub struct RepoOverview {
     /// The main checkout; `None` when the repo's main entry is bare (a bare repo with worktrees only).
     pub main: Option<Worktree>,
     pub worktrees: Vec<Worktree>,
+    /// Local branches and `remote`'s, one entry per name: base first, then the newest tip; at most `BRANCHES_MAX`
+    /// (local ones kept before remote-only ones). Empty with `with_github: false`.
+    pub branches: Vec<Branch>,
+    /// Branches before the cap.
+    pub branch_count: usize,
+    /// The remote the branches' remote side refers to: the GitHub one (origin preferred), else origin.
+    pub remote: Option<String>,
     pub github: Option<GitHubInfo>,
     pub github_error: Option<String>,
 }
+
+/// A branch name with its local and remote side (`Branch` in types.ts).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Branch {
+    pub name: String,
+    pub local: bool,
+    /// The local branch's upstream (`origin/x`), else `<remote>/<name>` if that exists.
+    pub remote_ref: Option<String>,
+    /// The upstream is configured but no longer exists.
+    pub upstream_gone: bool,
+    pub head: String,
+    pub subject: String,
+    pub author: String,
+    pub committed_at: i64,
+    pub ahead: u32,
+    pub behind: u32,
+    pub merged: bool,
+    /// Local commits not on `remote_ref`; `None` without both sides.
+    pub unpushed: Option<u32>,
+    /// `remote_ref` commits not on the local branch; `None` without both sides.
+    pub unpulled: Option<u32>,
+    pub checked_out: Option<String>,
+}
+
+const BRANCHES_MAX: usize = 80;
 
 // ── Overview ──
 
 /// The repo `path` is in: its linked worktrees and its GitHub data. `None` when `path` isn't in a git repo.
 /// `force` asks GitHub again even within the 5 min cache; `with_github: false` skips GitHub (no gh, no cache;
-/// `github` and `github_error` are `None`). Blocks: git calls take well under a second, gh up to 20 s (run
+/// `github` and `github_error` are `None`) and the branches (empty, count 0: only the chosen repo shows them). Blocks: git calls take well under a second, gh up to 20 s (run
 /// alongside them).
 pub fn overview(path: &str, force: bool, with_github: bool) -> Option<RepoOverview> {
     let entries = parse_worktrees(&git(path, &["worktree", "list", "--porcelain"])?);
     let main = entries.first()?;
     let root = main.path.clone();
     let (base, base_ref) = base_branch(&root, main.branch.as_deref());
-    let slug = git(&root, &["remote", "-v"]).and_then(|r| slug_from_remotes(&r));
+    let remote_v = git(&root, &["remote", "-v"]);
+    let slug = remote_v.as_deref().and_then(slug_from_remotes);
+    let remote = remote_v.as_deref().and_then(github_remote);
     let procs = cwd_procs();
     let linked: Vec<&WtEntry> = entries[1..].iter().filter(|e| !e.bare).collect();
     // The main checkout leaves out the linked worktrees' folders (often inside it, in .claude/worktrees).
     let linked_dirs: Vec<PathBuf> = linked.iter().map(|e| canonical(&e.path)).collect();
-    let ((github, github_error), main_wt, worktrees) = std::thread::scope(|s| {
+    let checked_out: HashMap<String, String> = entries
+        .iter()
+        .filter(|e| !e.bare && !e.prunable)
+        .filter_map(|e| Some((e.branch.clone()?, e.path.clone())))
+        .collect();
+    let ((github, github_error), main_wt, worktrees, (mut branches, branch_count)) = std::thread::scope(|s| {
         let gh = with_github.then(|| s.spawn(|| github(&root, slug.as_deref(), force)));
         let (base, base_ref, procs, linked_dirs) = (&base, base_ref.as_deref(), &procs, &linked_dirs);
+        let (root, remote, checked_out) = (&root, remote.as_deref(), &checked_out);
+        let br = with_github.then(|| s.spawn(move || branches(root, base, base_ref, remote, checked_out)));
         let main_h = (!main.bare).then(|| {
             s.spawn(move || {
                 let mut w = worktree(main, base, base_ref, procs, linked_dirs);
@@ -284,9 +326,220 @@ pub fn overview(path: &str, force: bool, with_github: bool) -> Option<RepoOvervi
         let worktrees = handles.into_iter().filter_map(|h| h.join().ok()).collect::<Vec<_>>();
         let main_wt = main_h.and_then(|h| h.join().ok());
         let gh = gh.map_or((None, None), |h| h.join().unwrap_or_else(|_| (None, Some("GitHub lookup failed".into()))));
-        (gh, main_wt, worktrees)
+        (gh, main_wt, worktrees, br.map(|h| h.join().unwrap_or_default()).unwrap_or_default())
     });
-    Some(RepoOverview { root, base, branch: main.branch.clone(), main: main_wt, worktrees, github, github_error })
+    // A fresh branch with uncommitted work in its checkout is ahead 0 too: not merged (as for worktrees).
+    for b in branches.iter_mut().filter(|b| b.merged) {
+        let dirty = main_wt.iter().chain(&worktrees).any(|w| Some(&w.path) == b.checked_out.as_ref() && w.dirty > 0);
+        b.merged = !dirty;
+    }
+    Some(RepoOverview {
+        root,
+        base,
+        branch: main.branch.clone(),
+        main: main_wt,
+        worktrees,
+        branches,
+        branch_count,
+        remote,
+        github,
+        github_error,
+    })
+}
+
+// ── Branches ──
+
+/// One ref of the branches' `for-each-ref`.
+#[derive(Debug, Default, PartialEq)]
+struct RefRow {
+    refname: String,
+    head: String,
+    /// Unix ms of the tip commit.
+    at: i64,
+    author: String,
+    /// Full upstream ref (`refs/remotes/origin/x`), "" without one.
+    upstream: String,
+    /// `[ahead 1, behind 2]`, `[gone]`, or "" (in sync, or no upstream).
+    track: String,
+    /// Tip commits not on the base ref, and base commits not on the tip (0, 0 without a base ref).
+    ahead: u32,
+    behind: u32,
+    subject: String,
+}
+
+/// The `for-each-ref` format: NUL between fields, the subject last, RS (0x1e) after each record.
+fn branch_format(base_ref: Option<&str>) -> String {
+    let ab = base_ref.map_or(String::new(), |b| format!("%(ahead-behind:{b})"));
+    format!(
+        "--format=%(refname)%00%(objectname:short)%00%(committerdate:unix)%00%(authorname)%00%(upstream)%00\
+         %(upstream:track)%00{ab}%00%(subject)%1e"
+    )
+}
+
+fn parse_refs(out: &str) -> Vec<RefRow> {
+    out.split('\x1e')
+        .filter_map(|rec| {
+            let rec = rec.trim_start_matches(['\n', '\r']);
+            let mut f = rec.splitn(8, '\0');
+            let refname = f.next().filter(|r| r.starts_with("refs/"))?.to_string();
+            let head = f.next()?.to_string();
+            let at = f.next()?.trim().parse::<i64>().unwrap_or(0) * 1000;
+            let (author, upstream, track) = (f.next()?.to_string(), f.next()?.to_string(), f.next()?.to_string());
+            let (ahead, behind) = f.next()?.split_once(' ').map_or((0, 0), |(a, b)| {
+                (a.trim().parse().unwrap_or(0), b.trim().parse().unwrap_or(0))
+            });
+            let subject = f.next().unwrap_or("").to_string();
+            Some(RefRow { refname, head, at, author, upstream, track, ahead, behind, subject })
+        })
+        .collect()
+}
+
+/// `[ahead 1, behind 2]` → (1, 2); "" → (0, 0).
+fn parse_track(track: &str) -> (u32, u32) {
+    let (mut ahead, mut behind) = (0, 0);
+    for part in track.trim_matches(['[', ']']).split(',') {
+        let mut w = part.split_whitespace();
+        match (w.next(), w.next().and_then(|n| n.parse().ok())) {
+            (Some("ahead"), Some(v)) => ahead = v,
+            (Some("behind"), Some(v)) => behind = v,
+            _ => {}
+        }
+    }
+    (ahead, behind)
+}
+
+/// The branches of `rows` merged by name, sorted, uncapped. A local branch takes its remote upstream (or
+/// `<remote>/<name>`) as its remote side; unpushed/unpulled come from the upstream's track, and stay `None` when
+/// the remote side is not the upstream (counted afterwards).
+fn build_branches(
+    rows: Vec<RefRow>,
+    base: &str,
+    has_base: bool,
+    remote: Option<&str>,
+    checked_out: &HashMap<String, String>,
+) -> Vec<Branch> {
+    let prefix = remote.map(|r| format!("refs/remotes/{r}/"));
+    let remote_name = |refname: &str| prefix.as_deref().and_then(|p| refname.strip_prefix(p)).map(str::to_string);
+    let mut locals = Vec::new();
+    let mut remotes: HashMap<String, RefRow> = HashMap::new();
+    for row in rows {
+        if let Some(n) = row.refname.strip_prefix("refs/heads/") {
+            locals.push((n.to_string(), row));
+        } else if let Some(n) = remote_name(&row.refname).filter(|n| n != "HEAD") {
+            remotes.insert(n, row);
+        }
+    }
+    let mut used: std::collections::HashSet<String> = locals.iter().map(|(n, _)| n.clone()).collect();
+    let merged = |name: &str, ahead: u32| has_base && name != base && ahead == 0;
+    let mut out: Vec<Branch> = locals
+        .into_iter()
+        .map(|(name, r)| {
+            let upstream = r.upstream.strip_prefix("refs/remotes/").filter(|u| !u.is_empty());
+            let gone = upstream.is_some() && r.track.trim() == "[gone]";
+            let (remote_ref, counts) = match upstream.filter(|_| !gone) {
+                Some(u) => {
+                    used.extend(remote_name(&r.upstream));
+                    (Some(u.to_string()), Some(parse_track(&r.track)))
+                }
+                None => (remotes.contains_key(&name).then(|| format!("{}/{name}", remote.unwrap_or_default())), None),
+            };
+            Branch {
+                local: true,
+                remote_ref,
+                upstream_gone: gone,
+                merged: merged(&name, r.ahead),
+                unpushed: counts.map(|c| c.0),
+                unpulled: counts.map(|c| c.1),
+                checked_out: checked_out.get(&name).cloned(),
+                head: r.head,
+                subject: r.subject,
+                author: r.author,
+                committed_at: r.at,
+                ahead: r.ahead,
+                behind: r.behind,
+                name,
+            }
+        })
+        .collect();
+    out.extend(remotes.into_iter().filter(|(n, _)| !used.contains(n)).map(|(name, r)| Branch {
+        local: false,
+        remote_ref: Some(format!("{}/{name}", remote.unwrap_or_default())),
+        upstream_gone: false,
+        merged: merged(&name, r.ahead),
+        unpushed: None,
+        unpulled: None,
+        checked_out: None,
+        head: r.head,
+        subject: r.subject,
+        author: r.author,
+        committed_at: r.at,
+        ahead: r.ahead,
+        behind: r.behind,
+        name,
+    }));
+    out.sort_by(|a, b| {
+        (a.name != base).cmp(&(b.name != base)).then(b.committed_at.cmp(&a.committed_at)).then_with(|| a.name.cmp(&b.name))
+    });
+    out
+}
+
+/// Base and the local branches first, then the newest remote-only ones, at most `BRANCHES_MAX` (so the stale local
+/// ones and those checked out survive a crowd of others' branches); `all` sorted as `build_branches` leaves it.
+fn cap_branches(mut all: Vec<Branch>, base: &str) -> Vec<Branch> {
+    let keep = |b: &Branch| b.local || b.name == base;
+    let mut room = BRANCHES_MAX.saturating_sub(all.iter().filter(|b| keep(b)).count());
+    all.retain(|b| {
+        keep(b) || {
+            let k = room > 0;
+            room = room.saturating_sub(1);
+            k
+        }
+    });
+    all.truncate(BRANCHES_MAX);
+    all
+}
+
+/// The repo's local branches and `remote`'s, with one `for-each-ref`, plus one `rev-list` per shown local branch
+/// whose remote side is not its upstream (pushed without `-u`). (branches, count before the cap). A git without
+/// `%(ahead-behind:)` (before 2.41) gets a second `for-each-ref` without it: ahead/behind 0, nothing merged.
+fn branches(
+    root: &str,
+    base: &str,
+    base_ref: Option<&str>,
+    remote: Option<&str>,
+    checked_out: &HashMap<String, String>,
+) -> (Vec<Branch>, usize) {
+    let remote_pat = remote.map(|r| format!("refs/remotes/{r}"));
+    let refs = |base_ref: Option<&str>| {
+        let format = branch_format(base_ref);
+        let mut args = vec!["for-each-ref", format.as_str(), "refs/heads"];
+        args.extend(remote_pat.as_deref());
+        git(root, &args)
+    };
+    let (out, has_base) = match refs(base_ref) {
+        Some(out) => (out, base_ref.is_some()),
+        None if base_ref.is_some() => match refs(None) {
+            Some(out) => (out, false),
+            None => return (Vec::new(), 0),
+        },
+        None => return (Vec::new(), 0),
+    };
+    let all = build_branches(parse_refs(&out), base, has_base, remote, checked_out);
+    let count = all.len();
+    let mut all = cap_branches(all, base);
+    let todo: Vec<usize> =
+        (0..all.len()).filter(|&i| all[i].local && all[i].remote_ref.is_some() && all[i].unpushed.is_none()).collect();
+    let counts = par_map(&todo, |&i| {
+        let b = &all[i];
+        let range = format!("refs/heads/{}...refs/remotes/{}", b.name, b.remote_ref.as_deref().unwrap_or_default());
+        git(root, &["rev-list", "--left-right", "--count", &range]).and_then(|c| left_right(&c))
+    });
+    for (i, c) in todo.into_iter().zip(counts) {
+        if let Some((unpushed, unpulled)) = c {
+            (all[i].unpushed, all[i].unpulled) = (Some(unpushed), Some(unpulled));
+        }
+    }
+    (all, count)
 }
 
 // ── Repos of a project folder ──
@@ -745,6 +998,26 @@ pub fn slug_from_remotes(remote_v: &str) -> Option<String> {
         }
     }
     first
+}
+
+/// The remote whose branches the overview lists, from `git remote -v` output: origin if it is on GitHub, else the
+/// first GitHub remote, else origin; `None` without either.
+pub fn github_remote(remote_v: &str) -> Option<String> {
+    let (mut first, mut origin) = (None, false);
+    for line in remote_v.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(name), Some(url)) = (parts.next(), parts.next()) else { continue };
+        let gh = github_slug(url).is_some();
+        if name == "origin" {
+            if gh {
+                return Some(name.into());
+            }
+            origin = true;
+        } else if gh {
+            first.get_or_insert_with(|| name.to_string());
+        }
+    }
+    first.or_else(|| origin.then(|| "origin".into()))
 }
 
 #[derive(Clone)]
@@ -1384,6 +1657,172 @@ mod tests {
         assert_eq!((x.branch.as_deref(), x.upstream.as_deref(), x.behind_upstream), (Some("x"), None, None));
         let m = with_other.expect("a git repo").main.expect("main checkout");
         assert_eq!((m.dirty, m.changes), (1, vec!["?? .claude/other.txt".to_string()]));
+    }
+
+    #[test]
+    fn branch_refs_parse_and_merge_by_name() {
+        let rec = |f: [&str; 8]| format!("{}\x1e\n", f.join("\0"));
+        let out = [
+            rec(["refs/heads/main", "aaa1111", "100", "Ann", "refs/remotes/origin/main", "", "0 0", "base"]),
+            rec(["refs/heads/feat", "bbb2222", "300", "Bo", "refs/remotes/origin/feat", "[ahead 2, behind 1]", "3 1", "say \"hi\"\tand\ttabs; [x]"]),
+            rec(["refs/heads/old", "ccc3333", "50", "Cy", "refs/remotes/origin/old", "[gone]", "0 4", "merged one"]),
+            rec(["refs/heads/solo", "ddd4444", "200", "Di", "", "", "1 0", ""]),
+            rec(["refs/remotes/origin/HEAD", "aaa1111", "100", "Ann", "", "", "0 0", "base"]),
+            rec(["refs/remotes/origin/main", "aaa1111", "100", "Ann", "", "", "0 0", "base"]),
+            rec(["refs/remotes/origin/feat", "eee5555", "250", "Bo", "", "", "1 1", "x"]),
+            rec(["refs/remotes/origin/theirs", "fff6666", "400", "Ed", "", "", "2 0", "their work"]),
+        ]
+        .concat();
+        let rows = parse_refs(&out);
+        assert_eq!(rows.len(), 8);
+        assert_eq!(rows[1].subject, "say \"hi\"\tand\ttabs; [x]");
+        assert_eq!((rows[1].at, rows[1].ahead, rows[1].behind), (300_000, 3, 1));
+        assert_eq!(parse_track("[ahead 2, behind 1]"), (2, 1));
+        assert_eq!(parse_track("[behind 5]"), (0, 5));
+        assert_eq!(parse_track(""), (0, 0));
+        let co = HashMap::from([("feat".to_string(), "/w/feat".to_string())]);
+        let b = build_branches(rows, "main", true, Some("origin"), &co);
+        let names: Vec<&str> = b.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["main", "theirs", "feat", "solo", "old"]);
+        let get = |n: &str| b.iter().find(|b| b.name == n).unwrap();
+        let f = get("feat");
+        assert_eq!((f.remote_ref.as_deref(), f.unpushed, f.unpulled), (Some("origin/feat"), Some(2), Some(1)));
+        assert_eq!((f.checked_out.as_deref(), f.head.as_str(), f.merged), (Some("/w/feat"), "bbb2222", false));
+        let o = get("old");
+        assert_eq!((o.upstream_gone, o.remote_ref.as_deref(), o.unpushed, o.merged), (true, None, None, true));
+        let t = get("theirs");
+        assert_eq!((t.local, t.remote_ref.as_deref(), t.unpushed, t.merged), (false, Some("origin/theirs"), None, false));
+        let s = get("solo");
+        assert_eq!((s.local, s.remote_ref.as_deref(), s.unpushed, s.merged), (true, None, None, false));
+        assert!(!get("main").merged);
+        // Without a remote, remote refs are ignored; without a base ref nothing counts as merged.
+        let b = build_branches(parse_refs(&out), "main", false, None, &HashMap::new());
+        assert_eq!(b.len(), 4);
+        assert!(b.iter().all(|b| b.local && !b.merged));
+        let j = serde_json::to_value(&b[0]).unwrap();
+        for k in ["remoteRef", "upstreamGone", "committedAt", "checkedOut", "unpulled"] {
+            assert!(j.get(k).is_some(), "{k}");
+        }
+        // Over the cap, remote-only branches go first: every local one stays, however old.
+        let mut many = vec![rec(["refs/heads/main", "aaa1111", "100", "Ann", "", "", "0 0", "base"])];
+        many.extend((0..5).map(|i| rec([format!("refs/heads/old{i}").as_str(), "ccc3333", "1", "Cy", "", "", "0 0", "old"])));
+        let theirs: Vec<String> = (0..100).map(|i| format!("refs/remotes/origin/t{i:03}")).collect();
+        let ats: Vec<String> = (0..100).map(|i| (1000 + i).to_string()).collect();
+        many.extend((0..100).map(|i| rec([theirs[i].as_str(), "fff6666", ats[i].as_str(), "Ed", "", "", "1 0", "theirs"])));
+        let all = build_branches(parse_refs(&many.concat()), "main", true, Some("origin"), &HashMap::new());
+        assert_eq!(all.len(), 106);
+        let kept = cap_branches(all, "main");
+        assert_eq!(kept.len(), BRANCHES_MAX);
+        assert_eq!(kept[0].name, "main");
+        assert_eq!(kept.iter().filter(|b| b.local).count(), 6);
+        assert_eq!(kept[1].name, "t099"); // newest remote-only first, the old locals last
+        assert!(kept[BRANCHES_MAX - 5..].iter().all(|b| b.local && b.name.starts_with("old")));
+        assert!(!kept.iter().any(|b| b.name == "t025"));
+        assert_eq!(github_remote("up\tgit@github.com:a/b.git (fetch)\norigin\thttps://gitlab.com/a/b (fetch)").as_deref(), Some("up"));
+        assert_eq!(github_remote("origin\thttps://gitlab.com/a/b (fetch)").as_deref(), Some("origin"));
+        assert_eq!(github_remote("other\thttps://gitlab.com/a/b (fetch)"), None);
+    }
+
+    #[test]
+    fn branches_of_a_real_repo() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("navarch-branches-test-{}-{nanos}", std::process::id()));
+        let (origin, main, other) = (dir.join("origin.git"), dir.join("main"), dir.join("other"));
+        for d in [&origin, &main] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let commit = |m: &str| sh(&main, &["commit", "-q", "--allow-empty", "-m", m]);
+        sh(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        sh(&main, &["init", "-q", "-b", "main"]);
+        commit("one");
+        sh(&main, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        sh(&main, &["push", "-q", "-u", "origin", "main"]);
+        // merged: landed on main by fast-forward.
+        sh(&main, &["checkout", "-q", "-b", "merged"]);
+        commit("m");
+        sh(&main, &["checkout", "-q", "main"]);
+        sh(&main, &["merge", "-q", "--ff-only", "merged"]);
+        sh(&main, &["push", "-q", "origin", "main"]);
+        // pushed: pushed with -u, then one more local commit.
+        sh(&main, &["checkout", "-q", "-b", "pushed", "main"]);
+        commit("p1");
+        sh(&main, &["push", "-q", "-u", "origin", "pushed"]);
+        commit("p2");
+        // local: never pushed.
+        sh(&main, &["checkout", "-q", "-b", "local", "main"]);
+        commit("l1");
+        // gone: pushed, then deleted on the remote and pruned.
+        sh(&main, &["checkout", "-q", "-b", "gone", "main"]);
+        commit("g1");
+        sh(&main, &["push", "-q", "-u", "origin", "gone"]);
+        sh(&main, &["push", "-q", "origin", "--delete", "gone"]);
+        sh(&main, &["fetch", "-q", "--prune"]);
+        // noup: pushed without -u, then one more local commit.
+        sh(&main, &["checkout", "-q", "-b", "noup", "main"]);
+        commit("n1");
+        sh(&main, &["push", "-q", "origin", "noup"]);
+        commit("n2");
+        sh(&main, &["checkout", "-q", "main"]);
+        // theirs: pushed from another clone, fetched here.
+        sh(&dir, &["clone", "-q", origin.to_str().unwrap(), "other"]);
+        sh(&other, &["checkout", "-q", "-b", "theirs"]);
+        sh(&other, &["commit", "-q", "--allow-empty", "-m", "t1"]);
+        sh(&other, &["push", "-q", "origin", "theirs"]);
+        sh(&main, &["fetch", "-q"]);
+        sh(&main, &["worktree", "add", "-q", "-b", "wt", "../wt"]);
+        // dirty: a fresh branch with uncommitted work, so not merged.
+        sh(&main, &["worktree", "add", "-q", "-b", "dirty", "../dirty"]);
+        std::fs::write(dir.join("dirty/x.txt"), "x").unwrap();
+        // Branches come only with with_github (the remote is a local path, so no gh runs).
+        let o = overview(main.to_str().unwrap(), false, true);
+        let local = overview(main.to_str().unwrap(), false, false);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let local = local.expect("a git repo");
+        assert_eq!((local.branches.len(), local.branch_count), (0, 0));
+        let o = o.expect("a git repo");
+        assert_eq!(o.remote.as_deref(), Some("origin"));
+        let names: Vec<&str> = o.branches.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(o.branch_count, 9, "{names:?}");
+        assert_eq!(names[0], "main");
+        let get = |n: &str| o.branches.iter().find(|b| b.name == n).unwrap_or_else(|| panic!("{n} in {names:?}"));
+        let m = get("main");
+        assert_eq!((m.local, m.remote_ref.as_deref(), m.unpushed, m.unpulled, m.merged), (true, Some("origin/main"), Some(0), Some(0), false));
+        assert!(m.checked_out.as_deref().is_some_and(|p| p.ends_with("/main")), "{m:?}");
+        let p = get("pushed");
+        assert_eq!((p.remote_ref.as_deref(), p.unpushed, p.unpulled, p.ahead, p.behind), (Some("origin/pushed"), Some(1), Some(0), 2, 0));
+        assert_eq!((p.subject.as_str(), p.author.as_str(), p.checked_out.as_deref()), ("p2", "t", None));
+        let l = get("local");
+        assert_eq!((l.remote_ref.as_deref(), l.unpushed, l.unpulled, l.upstream_gone, l.ahead), (None, None, None, false, 1));
+        let g = get("gone");
+        assert_eq!((g.upstream_gone, g.remote_ref.as_deref(), g.unpushed), (true, None, None));
+        let n = get("noup");
+        assert_eq!((n.remote_ref.as_deref(), n.unpushed, n.unpulled), (Some("origin/noup"), Some(1), Some(0)));
+        let t = get("theirs");
+        assert_eq!((t.local, t.remote_ref.as_deref(), t.ahead, t.unpushed, t.merged), (false, Some("origin/theirs"), 1, None, false));
+        let md = get("merged");
+        assert_eq!((md.merged, md.ahead, md.local), (true, 0, true));
+        let w = get("wt");
+        assert!(w.checked_out.as_deref().is_some_and(|p| p.ends_with("/wt")) && w.merged, "{w:?}");
+        let d = get("dirty");
+        assert!(d.checked_out.as_deref().is_some_and(|p| p.ends_with("/dirty")) && !d.merged, "{d:?}");
+    }
+
+    #[test]
+    #[ignore = "live: reads this Mac's infomap and Navarch branches (and their GitHub data, which branches need)"]
+    fn branches_live() {
+        for root in ["/Users/daniel/dev/projects/icelab/paper-projects/generative-mapequation/infomap", "/Users/daniel/dev/planning/Navarch"] {
+            let t = Instant::now();
+            let o = overview(root, false, true).expect("a git repo");
+            println!("{root}: remote {:?} branchCount {} ({} ms)", o.remote, o.branch_count, t.elapsed().as_millis());
+            for b in o.branches.iter().take(8) {
+                let co = b.checked_out.as_deref().map(|p| p.rsplit('/').next().unwrap_or(p));
+                println!(
+                    "  {} local={} {:?} +{}/-{} push={:?} pull={:?} gone={} merged={} co={co:?}",
+                    b.name, b.local, b.remote_ref, b.ahead, b.behind, b.unpushed, b.unpulled, b.upstream_gone, b.merged
+                );
+            }
+        }
     }
 
     #[test]

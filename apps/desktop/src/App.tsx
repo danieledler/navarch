@@ -3,6 +3,7 @@ import { useModel, useStore } from "./store";
 import { SpaceRail } from "./components/SpaceRail";
 import { ProjectList } from "./components/ProjectList";
 import { ProjectView } from "./components/ProjectView";
+import { RepoPanel } from "./components/RepoPanel";
 import { FocusPanel } from "./components/FocusPanel";
 import { Dashboard } from "./components/Dashboard";
 import { StatusBar } from "./components/StatusBar";
@@ -39,7 +40,11 @@ function SpaceView({ spaceId }: { spaceId: number }) {
     <>
       <ProjectList spaceId={spaceId} />
       {projectId != null ? (
-        <ProjectView key={projectId} projectId={projectId} />
+        <>
+          <ProjectView key={projectId} projectId={projectId} />
+          {/* A grid item of its own: spans under the project view and the Focus column (see .app in styles.css). */}
+          <RepoPanel key={`repo-${projectId}`} path={m.project.get(projectId)!.path} />
+        </>
       ) : (
         <section className="main">
           <header className="main-head" data-tauri-drag-region />

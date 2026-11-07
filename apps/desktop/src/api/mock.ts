@@ -245,7 +245,7 @@ export function mockApi(): Api {
     getRepoOverview: async (path, force, github = true) => {
       await new Promise((r) => setTimeout(r, github ? 150 : 60));
       const o = demoRepoOverview(path);
-      if (o && !github) return { ...o, github: null, githubError: null };
+      if (o && !github) return { ...o, github: null, githubError: null, branches: [], branchCount: 0 };
       if (o?.github && force) o.github.fetchedAt = Date.now();
       return o;
     },

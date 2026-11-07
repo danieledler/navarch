@@ -290,6 +290,26 @@ export interface Worktree {
   // never Claude's own `claude` processes (those are sessions)
 }
 
+/** A branch name with its local and remote side (`remote` = RepoOverview.remote). */
+export interface Branch {
+  name: string; // e.g. "feat/x": the local name, or the remote branch without "<remote>/"
+  local: boolean; // a local branch exists
+  remoteRef: string | null; // its remote-tracking branch, e.g. "origin/feat/x": the local branch's upstream, else
+  // <remote>/<name> if that exists; null when there is none
+  upstreamGone: boolean; // the local branch's upstream is configured but no longer exists (deleted on GitHub, e.g. after its PR merged)
+  head: string; // short hash of the tip (the local tip when local)
+  subject: string; // tip commit subject
+  author: string; // tip commit author name
+  committedAt: number; // unix ms of the tip commit
+  ahead: number; // tip commits not on the base branch
+  behind: number; // base commits not on the tip
+  merged: boolean; // not the base branch, all its commits on base (ahead == 0), and not checked out with uncommitted
+  // changes (a new branch with work in progress isn't merged); squash merges don't count
+  unpushed: number | null; // local commits not on remoteRef; null without both sides
+  unpulled: number | null; // remoteRef commits not on the local branch, as of the last fetch; null without both sides
+  checkedOut: string | null; // folder of the worktree or main checkout that has it checked out
+}
+
 export interface WorktreeCommit {
   hash: string; // short
   subject: string;
@@ -333,6 +353,12 @@ export interface RepoOverview {
    *  repo's main entry is bare (a bare repo used only through worktrees). */
   main: Worktree | null;
   worktrees: Worktree[]; // linked worktrees, main checkout excluded
+  /** Local branches and the GitHub remote's branches, one entry per branch name: base first, then the newest tip
+   *  commit first; at most 80, local branches kept before remote-only ones (branchCount has the total). Read with
+   *  one `git for-each-ref`; no fetch. Only full loads (github: true) read them; local-only loads return []. */
+  branches: Branch[];
+  branchCount: number; // branches before the cap
+  remote: string | null; // the remote the remote-side fields refer to: the GitHub one (origin preferred), else origin
   github: GitHubInfo | null; // last good GitHub data (may be older than a failed refresh)
   githubError: string | null; // why there is no fresh GitHub data: gh missing, not signed in, no GitHub remote, or gh's error
 }

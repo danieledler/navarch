@@ -3,7 +3,6 @@ import { ChevronRight, Eye, EyeOff, FolderOpen, MessageSquarePlus } from "lucide
 import { api, type Id } from "../api";
 import { useModel, useStore } from "../store";
 import { baseName, fmtDuration, fmtTokens, shortPath } from "../lib/format";
-import { RepoPanel } from "./RepoPanel";
 import { SessionRow } from "./SessionRow";
 import { TaskTree, visibleRows } from "./TaskTree";
 import { useTaskActions } from "./taskActions";
@@ -130,8 +129,6 @@ export function ProjectView({ projectId }: { projectId: Id }) {
           </div>
         )}
       </div>
-
-      <RepoPanel path={p.path} />
     </section>
   );
 }

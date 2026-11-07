@@ -1,7 +1,7 @@
 // The demo dataset: one fictional developer, Robin, with work, open-source and personal projects.
 // Shared by the mock backend (`pnpm dev`), the landing page's live demo and the UI walkthrough/e2e tests.
 // Everything here is invented; dates are relative to today so deadlines, the week log and the OKR period stay current.
-import type { CheckState, Id, Issue, Label, Period, PullRequest, RepoOverview, RepoRef, Session, SessionStatus, Snapshot, Task, Worktree } from "./types";
+import type { Branch, CheckState, Id, Issue, Label, Period, PullRequest, RepoOverview, RepoRef, Session, SessionStatus, Snapshot, Task, Worktree } from "./types";
 import { addDays, dayStr, isoWeek, parseDay, today, weekStart } from "../lib/dates";
 
 export const DEMO_HOME = "/Users/robin";
@@ -413,6 +413,31 @@ export function demoRepoOverview(path: string): RepoOverview | null {
   const main = (w: Partial<Worktree> = {}): Worktree =>
     wt({ head: "9e4b1a7", subject: "Update dependencies", committedAt: now - known[2] * 36e5, path: root, branch: "main", upstream: "origin/main", ...w }, "main");
 
+  /** A branch as get_repo_overview reports it: local, tracking origin/<name> and in sync with it, unless `b` says
+   *  otherwise. */
+  const br = (name: string, head: string, subject: string, committedAt: number, b: Partial<Branch> = {}): Branch => {
+    const remoteRef = b.remoteRef !== undefined ? b.remoteRef : `origin/${name}`;
+    const both = (b.local ?? true) && remoteRef != null;
+    return {
+      name, local: true, remoteRef, upstreamGone: false, head, subject, author: "Robin Vale", committedAt, ahead: 0, behind: 0,
+      merged: false, unpushed: both ? 0 : null, unpulled: both ? 0 : null, checkedOut: null, ...b,
+    };
+  };
+  /** The overview with its branches: those checked out in the main checkout and worktrees, plus `extra` (not checked
+   *  out), base first, then newest tip first. `remote` is null for a repo without any remote. */
+  const withBranches = (o: Omit<RepoOverview, "branches" | "branchCount" | "remote">, extra: Branch[], remote: string | null = "origin"): RepoOverview => {
+    const out = [o.main, ...o.worktrees].flatMap((w): Branch[] =>
+      w?.branch
+        ? [br(w.branch, w.head, w.subject, w.committedAt, {
+            remoteRef: w.upstream, ahead: w.ahead, behind: w.behind, merged: w.merged, unpushed: w.unpushed,
+            unpulled: w.upstream ? w.behindUpstream : null, checkedOut: w.path,
+          })]
+        : [],
+    );
+    const branches = [...out, ...extra].sort((a, b) => Number(b.name === o.base) - Number(a.name === o.base) || b.committedAt - a.committedAt);
+    return { ...o, branches, branchCount: branches.length, remote };
+  };
+
   if (name === "shiftwren-web") {
     const pulls = [
       pr({
@@ -551,7 +576,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
       // A build checkout detached at origin/main: idle, folded away.
       wt({ head: "6d0f2c8", subject: "Show the week number in the grid header", committedAt: h(2.5), branch: null, upstream: null, unpushed: null }, "release"),
     ];
-    return {
+    return withBranches({
       root, base: "main", branch: "main", worktrees, githubError: null,
       main: main({
         head: "b85e3f0", subject: "Bump vite to 7.1", committedAt: h(0.4), unpushed: 2,
@@ -562,7 +587,17 @@ export function demoRepoOverview(path: string): RepoOverview | null {
         changes: [" M .env.example"],
       }),
       github: { repo: slug, url: gh, pulls, recentPulls, viewer: ME, issues, fetchedAt: m(1) },
-    };
+    }, [
+      br("grid-keyboard", "3c8d1e2", "Shift+arrow extends the selected range", h(5), { ahead: 2, behind: 3 }),
+      // Other authors' PR branches and an abandoned experiment: only on origin.
+      br("next-15", "f0a7b93", "Drop the legacy auth middleware", h(9), { local: false, author: "Mika Tan", ahead: 9, behind: 12 }),
+      br("snap-slots", "8a1e4c6", "Round range ends to the nearest slot", h(3), { local: false, author: "Lena Voss", ahead: 4, behind: 2 }),
+      br("rsc-settings", "2e9b0f4", "Move /settings to server components", d(7), { local: false, ahead: 5, behind: 31 }),
+      br("lena/tz-docs", "c51d8a0", "Document how the grid picks a time zone", d(5), { local: false, author: "Lena Voss", ahead: 1, behind: 18 }),
+      // Stale: squash-merged as #206 and deleted on GitHub; merged as #197 with its commits on main.
+      br("grid-empty-states", "7f3a2d9", "Skeleton rows while the grid loads", d(3.1), { remoteRef: null, upstreamGone: true, ahead: 3, behind: 9 }),
+      br("availability-table", "4d6e8b1", "Availability table and migrations", d(11.3), { merged: true, behind: 22 }),
+    ]);
   }
 
   if (name === "knotfile") {
@@ -670,11 +705,16 @@ export function demoRepoOverview(path: string): RepoOverview | null {
       ),
       wt({ head: "c9e14b8", subject: "Coalesce FSEvents bursts on macOS", committedAt: d(1.6), behind: 2, merged: true }, "fsevents-coalesce"),
     ];
-    return {
+    return withBranches({
       root, base: "main", branch: "main", worktrees, githubError: null,
       main: main({ head: "52d8e1b", subject: "Release 0.9.2", behindUpstream: 3 }),
       github: { repo: slug, url: gh, pulls, recentPulls, viewer: ME, issues, fetchedAt: m(3) },
-    };
+    }, [
+      br("docs-migration", "61b2f07", "Migration guide: config keys renamed in 1.0", d(2), { ahead: 2, behind: 4 }),
+      br("gitignore-watch", "a9e04d3", "Skip ignored paths before stat", h(6), { local: false, author: "Ana Sousa", ahead: 5, behind: 1 }),
+      br("dependabot/cargo/notify-7.0.0", "3f7c2b8", "Bump notify from 6.1.1 to 7.0.0", d(1), { local: false, author: "dependabot[bot]", ahead: 1, behind: 3 }),
+      br("xdg-cache", "e20d9a6", "Keep the cache under XDG_CACHE_HOME", d(8.3), { merged: true, behind: 11 }),
+    ]);
   }
 
   if (name === "demo-app") {
@@ -706,7 +746,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
       issue({ number: 13, title: "Conflicting edits flash on reconnect", createdAt: d(3), updatedAt: h(7), labels: [L.bug], comments: 2 }),
       issue({ number: 9, title: "QR code so the audience can join the demo", createdAt: d(12), updatedAt: d(5), labels: [L.feature] }),
     ];
-    return {
+    return withBranches({
       root, base: "main", branch: "main", githubError: null, main: main(),
       worktrees: [
         wt(
@@ -723,7 +763,10 @@ export function demoRepoOverview(path: string): RepoOverview | null {
         ),
       ],
       github: { repo: slug, url: gh, pulls, recentPulls, viewer: ME, issues, fetchedAt: m(2) },
-    };
+    }, [
+      br("peer-cursors", "d7a3e51", "Cursor colour from the peer id", d(1), { local: false, author: "Ana Sousa", ahead: 2, behind: 1 }),
+      br("crdt-text", "84c1f6e", "Shared text demo on Automerge", d(2.1), { remoteRef: null, upstreamGone: true, ahead: 6, behind: 2 }),
+    ]);
   }
 
   if (name === "slides") {
@@ -740,7 +783,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
       "sync-diagram",
     );
     diagram.path = `${TALK}/.claude/worktrees/sync-diagram`;
-    return {
+    return withBranches({
       root, base: "main", branch: "main", githubError: null, worktrees: [diagram], main: main(),
       github: {
         repo: slug, url: gh, pulls: [], viewer: ME, fetchedAt: m(4),
@@ -750,15 +793,19 @@ export function demoRepoOverview(path: string): RepoOverview | null {
         ],
         issues: [issue({ number: 3, title: "Diagram for the three sync strategies", createdAt: d(6), updatedAt: d(1), labels: [L.docs] })],
       },
-    };
+    }, [br("outline", "a1f5c08", "Outline and title slide", d(9.3), { merged: true, behind: 3 })]);
   }
 
   if (name === "notes") {
-    return { root, base: "main", branch: "main", github: null, githubError: "No GitHub remote", worktrees: [], main: main({ upstream: null, unpushed: null }) };
+    return withBranches(
+      { root, base: "main", branch: "main", github: null, githubError: "No GitHub remote", worktrees: [], main: main({ upstream: null, unpushed: null }) },
+      [],
+      null,
+    );
   }
 
   // pixel-orchard: a local repo with no GitHub remote.
-  return {
+  return withBranches({
     root, base: "main", branch: "main", github: null, githubError: "No GitHub remote", main: main({ upstream: null, unpushed: null }),
     worktrees: [
       wt(
@@ -775,5 +822,5 @@ export function demoRepoOverview(path: string): RepoOverview | null {
       ),
       wt({ head: "d41c0e9", subject: "Extrude atlas tiles by 1 px", committedAt: d(3.2), merged: true, upstream: null, unpushed: null }, "atlas-extrude"),
     ],
-  };
+  }, [br("tilemap-v2", "5c0e7a2", "Chunked tilemap, 32×32 per chunk", d(9), { remoteRef: null, ahead: 4, behind: 6 })], null);
 }

@@ -326,13 +326,17 @@ export const useStore = create<State>((set, get) => ({
       patch((cur) =>
         github
           ? { data, loading: false, error: null, at: now, ghAt: now }
-          : // Local only: keep the GitHub side of the last full load while it is fresh (the backend's 5-min cache),
-            // so a repo picked once and left doesn't show stale PRs on its worktrees for the rest of the run.
+          : // Local only: keep the GitHub side and the branches (only full loads read them) of the last full load
+            // while it is fresh (the backend's 5-min cache), so a repo picked once and left doesn't show stale PRs
+            // on its worktrees for the rest of the run, and picking it again doesn't flash an empty Branches column.
             (() => {
               const fresh = now - cur.ghAt < 5 * 60_000;
-              const github = fresh ? (cur.data?.github ?? null) : null;
-              const githubError = fresh ? (cur.data?.githubError ?? null) : null;
-              return { data: data && { ...data, github, githubError }, error: null, at: now };
+              const prev = fresh ? cur.data : null;
+              const github = prev?.github ?? null;
+              const githubError = prev?.githubError ?? null;
+              const branches = prev?.branches ?? [];
+              const branchCount = prev?.branchCount ?? 0;
+              return { data: data && { ...data, github, githubError, branches, branchCount }, error: null, at: now };
             })(),
       );
     } catch (e) {
