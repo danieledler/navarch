@@ -4,7 +4,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ArrowDown, ArrowUp, BadgeCheck, Check, ChevronDown, ChevronRight, CircleDot, Copy, Eye, ExternalLink, FileDiff, FolderGit2, FolderOpen,
-  GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft, Lock, MessageSquare, Minus, RefreshCw, SquareTerminal,
+  GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft, Laptop, Lock, MessageSquare, Minus, RefreshCw, SquareTerminal,
   TriangleAlert, X, Zap,
 } from "lucide-react";
 import { api, type CheckState, type GitHubInfo, type Issue, type Label, type PullRequest, type RepoOverview, type RepoRef, type Reviewer, type Session } from "../api";
@@ -160,6 +160,7 @@ export function RepoPanel({ path }: { path: string }) {
   };
 
   const fetchedAt = gh?.fetchedAt ?? st?.at ?? 0;
+  const unpushed = data?.main?.unpushed ?? 0;
   const counts = linked
     ? [
         gh && plural(gh.pulls.length, "PR"),
@@ -240,6 +241,17 @@ export function RepoPanel({ path }: { path: string }) {
                   >
                     {mergedWeek} merged this week
                   </button>
+                </>
+              )}
+              {unpushed > 0 && (
+                <>
+                  {" · "}
+                  <span
+                    className="c-amber"
+                    title={`The main checkout has ${plural(unpushed, "local commit")} not pushed to ${data.main?.upstream ?? "its upstream"}`}
+                  >
+                    {unpushed} unpushed
+                  </span>
                 </>
               )}
             </span>
@@ -383,6 +395,7 @@ function RepoBody({
   prView: "open" | "merged"; setPrView: (v: "open" | "merged") => void; mine: boolean; setMine: (b: boolean) => void;
   narrow: boolean; tab: Col; setTab: (c: Col) => void; showDone: boolean; setShowDone: (b: boolean) => void; hc: HC;
 }) {
+  const [showIdle, setShowIdle] = useState(false);
   const ghNote = !gh && <div className="repo-note">{ghLoading ? "Loading GitHub data…" : (githubError ?? "No GitHub data")}</div>;
   const closed = (gh?.recentPulls ?? []).filter((p) => p.state === "closed");
   const merged = (gh?.recentPulls ?? []).filter((p) => p.state === "merged");
@@ -459,12 +472,29 @@ function RepoBody({
       n: linked.worktrees.length,
       body: (
         <>
+          {linked.rows.map((lw) => (
+            <WorktreeRow key={lw.wt.path} lw={lw} multi={multi} hc={hc} />
+          ))}
           {linked.worktrees.length === 0 && (
             <div className="repo-empty">No worktrees besides the main checkout{multi ? "s" : ""}</div>
           )}
-          {linked.worktrees.map((lw) => (
-            <WorktreeRow key={lw.wt.path} lw={lw} multi={multi} hc={hc} />
-          ))}
+          {linked.idle.length > 0 && (
+            <>
+              <button
+                type="button"
+                className="repo-sub-toggle"
+                aria-expanded={showIdle}
+                title="Worktrees on the base branch or a detached HEAD with no changes, commits, processes or sessions"
+                onClick={() => {
+                  hc.hide();
+                  setShowIdle(!showIdle);
+                }}
+              >
+                <ChevronRight size={12} className={showIdle ? "rot" : ""} /> Idle <span className="count">{linked.idle.length}</span>
+              </button>
+              {showIdle && linked.idle.map((lw) => <WorktreeRow key={lw.wt.path} lw={lw} multi={multi} hc={hc} />)}
+            </>
+          )}
         </>
       ),
     },
@@ -673,8 +703,104 @@ function IssueRow({ li, hc }: { li: LinkedIssue; hc: HC }) {
   );
 }
 
+/** Session dots that open the session on click. */
+function SessionDots({ sessions }: { sessions: Session[] }) {
+  const act = useAct();
+  if (sessions.length === 0) return null;
+  return (
+    <span className="rr-dots">
+      {sessions.slice(0, 4).map((s) => (
+        <button
+          key={s.id}
+          type="button"
+          className="dot-btn"
+          title={`${s.title || "Untitled session"} — ${STATUS_LABEL[s.status]}. Click to open.`}
+          onClick={(e) => {
+            e.stopPropagation();
+            act(api.openSession(s.id));
+          }}
+        >
+          <StatusDot status={s.status} />
+        </button>
+      ))}
+      {sessions.length > 4 && <span className="muted">+{sessions.length - 4}</span>}
+    </span>
+  );
+}
+
+/** ↑ commits not pushed and ↓ commits behind the upstream (as of the last fetch). */
+function UpstreamMarks({ lw }: { lw: LinkedWorktree }) {
+  const { wt } = lw;
+  const up = wt.unpushed ?? 0;
+  const down = wt.behindUpstream ?? 0;
+  if (up === 0 && down === 0) return null;
+  return (
+    <>
+      {up > 0 && (
+        <span className="rr-ab c-amber" title={`${plural(up, "commit")} not pushed to ${wt.upstream}`}>
+          <span><ArrowUp size={10} />{up}</span> <span className="rr-ab-label">not pushed</span>
+        </span>
+      )}
+      {down > 0 && (
+        <span className="rr-ab" title={`${plural(down, "commit")} on ${wt.upstream} not here, as of the last fetch`}>
+          <span><ArrowDown size={10} />{down}</span> <span className="rr-ab-label">behind origin</span>
+        </span>
+      )}
+    </>
+  );
+}
+
+/** The main checkout's row: pinned first; its many idle sessions show only in the hover card. */
+function MainRow({ lw, multi, hc }: { lw: LinkedWorktree; multi: boolean; hc: HC }) {
+  const act = useAct();
+  const { wt, sessions, base } = lw;
+  const key = `wt:${wt.path}`;
+  const running = sessions.filter((s) => s.running || s.status === "working" || s.status === "needs_input");
+  const offBase = wt.branch !== base;
+  return (
+    <div
+      className={`repo-row is-main ${hc.open?.key === key ? "is-hovered" : ""}`}
+      role="button"
+      onClick={() => act(api.revealPath(wt.path))}
+      {...hc.row(key)}
+    >
+      <Laptop size={14} className={`ri-icon ${running.some((s) => s.status === "working") ? "c-blue" : "muted"}`} />
+      <div className="rr-main">
+        <div className="rr-title">
+          {multi && lw.repo && lw.repo.name !== lw.name && <span className="rr-repo" title={`In the repo ${lw.repo.root}`}>{lw.repo.name}</span>}
+          {lw.name}
+          <span className="tag tag-main" title={`The repo’s main checkout, ${wt.path}`}>main checkout</span>
+        </div>
+        <div className="rr-sub">
+          {offBase ? (
+            <span className="tag tag-amber" title={wt.branch ? `On ${wt.branch}, not ${base}` : `HEAD is detached at ${wt.head}, not on ${base}`}>
+              {wt.branch ?? `detached ${wt.head}`}
+            </span>
+          ) : (
+            <span className="muted">{wt.branch}</span>
+          )}
+          <UpstreamMarks lw={lw} />
+          {wt.dirty > 0 && <span className="c-amber" title={`${plural(wt.dirty, "uncommitted change")}`}>+{wt.dirty}</span>}
+          {wt.procs.length > 0 && (
+            <span className="mark c-blue" title={`Running: ${wt.procs.map((p) => p.name).join(", ")}`}>
+              <SquareTerminal size={12} /> {wt.procs.length}
+            </span>
+          )}
+          {!offBase && !wt.dirty && !wt.unpushed && !wt.behindUpstream && wt.upstream && (
+            <span className="muted">· in sync with {wt.upstream}</span>
+          )}
+          <span className="rr-marks">
+            <SessionDots sessions={running} />
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function WorktreeRow({ lw, multi, hc }: { lw: LinkedWorktree; multi: boolean; hc: HC }) {
   const act = useAct();
+  if (lw.isMain) return <MainRow lw={lw} multi={multi} hc={hc} />;
   const { wt, pr, sessions, base } = lw;
   const key = `wt:${wt.path}`;
   return (
@@ -706,6 +832,11 @@ function WorktreeRow({ lw, multi, hc }: { lw: LinkedWorktree; multi: boolean; hc
               )}
               {wt.merged && <span className="tag tag-merged">merged</span>}
               {!wt.upstream && wt.ahead > 0 && <span className="tag tag-amber" title="This branch was never pushed">not pushed</span>}
+              {(wt.behindUpstream ?? 0) > 0 && (
+                <span className="rr-ab" title={`${plural(wt.behindUpstream!, "commit")} on ${wt.upstream} not here, as of the last fetch`}>
+                  <span><ArrowDown size={10} />{wt.behindUpstream}</span> <span className="rr-ab-label">behind origin</span>
+                </span>
+              )}
               {wt.locked && <Lock size={11} className="muted" aria-label="Locked" />}
               {wt.procs.length > 0 && (
                 <span className="mark c-blue" title={`Running: ${wt.procs.map((p) => p.name).join(", ")}`}>
@@ -729,25 +860,7 @@ function WorktreeRow({ lw, multi, hc }: { lw: LinkedWorktree; multi: boolean; hc
                 <PrIcon pr={pr} size={11} /> #{pr.number}
               </button>
             )}
-            {sessions.length > 0 && (
-              <span className="rr-dots">
-                {sessions.slice(0, 4).map((s) => (
-                  <button
-                    key={s.id}
-                    type="button"
-                    className="dot-btn"
-                    title={`${s.title || "Untitled session"} — ${STATUS_LABEL[s.status]}. Click to open.`}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      act(api.openSession(s.id));
-                    }}
-                  >
-                    <StatusDot status={s.status} />
-                  </button>
-                ))}
-                {sessions.length > 4 && <span className="muted">+{sessions.length - 4}</span>}
-              </span>
-            )}
+            <SessionDots sessions={sessions} />
           </span>
         </div>
       </div>
@@ -770,7 +883,7 @@ function CardFor({ k, linked, gh, root, multi, rect, hc }: { k: string; linked: 
     const li = linked.issues.find((x) => x.issue.number === Number(k.slice(3)));
     if (li) body = <IssueCard issue={li.issue} gh={gh} />;
   } else if (k.startsWith("wt:")) {
-    const lw = linked.worktrees.find((w) => w.wt.path === k.slice(3));
+    const lw = [...linked.rows, ...linked.idle].find((w) => w.wt.path === k.slice(3));
     if (lw) body = <WorktreeCard lw={lw} multi={multi} />;
   }
   if (!body) return null;
@@ -998,7 +1111,10 @@ function IssueCard({ issue, gh }: { issue: Issue; gh: GitHubInfo }) {
 function WorktreeCard({ lw, multi }: { lw: LinkedWorktree; multi: boolean }) {
   const act = useAct();
   const toast = useStore((s) => s.toast);
-  const { wt, pr, base } = lw;
+  const { wt, pr, base, isMain } = lw;
+  const behindUp = wt.behindUpstream ?? 0;
+  // The main checkout keeps many idle sessions: the card lists the most recent ones.
+  const sessions = isMain ? lw.sessions.slice(0, 5) : lw.sessions;
   const copy = (text: string, what: string) =>
     void navigator.clipboard.writeText(text).then(
       () => toast(`Copied the ${what}`),
@@ -1007,9 +1123,15 @@ function WorktreeCard({ lw, multi }: { lw: LinkedWorktree; multi: boolean }) {
   return (
     <div className="hc">
       <div className="hc-top">
-        <span className="pill pill-wt">
-          <FolderGit2 size={12} /> Worktree
-        </span>
+        {isMain ? (
+          <span className="pill pill-wt">
+            <Laptop size={12} /> Main checkout
+          </span>
+        ) : (
+          <span className="pill pill-wt">
+            <FolderGit2 size={12} /> Worktree
+          </span>
+        )}
         {wt.merged && <span className="pill pill-merged">Merged</span>}
         {wt.locked && (
           <span className="pill pill-muted">
@@ -1037,19 +1159,28 @@ function WorktreeCard({ lw, multi }: { lw: LinkedWorktree; multi: boolean }) {
             (wt.upstream ? (
               <>
                 → <code>{wt.upstream}</code>
-                {wt.unpushed ? <span className="c-amber">{wt.unpushed} not pushed</span> : <span className="muted">pushed</span>}
+                {wt.unpushed ? <span className="c-amber">{wt.unpushed} unpushed</span> : <span className="muted">pushed</span>}
+                {behindUp > 0 && (
+                  <span title="Navarch never fetches: run git fetch to see newer commits">
+                    {behindUp} behind origin <span className="muted">(as of the last fetch)</span>
+                  </span>
+                )}
               </>
             ) : (
               <span className="c-amber">not pushed</span>
             ))}
         </span>
-        <span className="hc-k">vs {base}</span>
-        <span>
-          {wt.ahead === 0 && wt.behind === 0
-            ? "Up to date"
-            : [wt.ahead > 0 && `${wt.ahead} ahead`, wt.behind > 0 && `${wt.behind} behind`].filter(Boolean).join(", ")}
-          {wt.merged && <span className="muted"> · all commits are on {base}</span>}
-        </span>
+        {!(isMain && wt.branch === base) && (
+          <>
+            <span className="hc-k">vs {base}</span>
+            <span>
+              {wt.ahead === 0 && wt.behind === 0
+                ? "Up to date"
+                : [wt.ahead > 0 && `${wt.ahead} ahead`, wt.behind > 0 && `${wt.behind} behind`].filter(Boolean).join(", ")}
+              {wt.merged && <span className="muted"> · all commits are on {base}</span>}
+            </span>
+          </>
+        )}
         <span className="hc-k">HEAD</span>
         <span className="hc-v hc-nowrap">
           <code>{wt.head}</code> <span className="hc-ellipsis">{wt.subject}</span> <When ms={wt.committedAt} />
@@ -1073,6 +1204,22 @@ function WorktreeCard({ lw, multi }: { lw: LinkedWorktree; multi: boolean }) {
           </div>
           <ul className="hc-commits">
             {wt.commitsAhead.slice(0, 10).map((c) => (
+              <li key={c.hash}>
+                <code>{c.hash}</code> <span className="hc-ellipsis">{c.subject}</span>
+                <span className="muted" title={new Date(c.at).toLocaleString()}>{relTime(c.at)}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {(wt.unpushed ?? 0) > 0 && wt.commitsUnpushed.length > 0 && (
+        <div className="hc-sec">
+          <div className="hc-sec-head">
+            Not pushed to {wt.upstream} <span className="count c-amber">{wt.unpushed}</span>
+          </div>
+          <ul className="hc-commits">
+            {wt.commitsUnpushed.slice(0, 10).map((c) => (
               <li key={c.hash}>
                 <code>{c.hash}</code> <span className="hc-ellipsis">{c.subject}</span>
                 <span className="muted" title={new Date(c.at).toLocaleString()}>{relTime(c.at)}</span>
@@ -1106,16 +1253,17 @@ function WorktreeCard({ lw, multi }: { lw: LinkedWorktree; multi: boolean }) {
               </li>
             ))}
           </ul>
-          <div className="hc-hint">Stop these before removing the worktree.</div>
+          {!isMain && <div className="hc-hint">Stop these before removing the worktree.</div>}
         </div>
       )}
 
-      {lw.sessions.length > 0 && (
+      {sessions.length > 0 && (
         <div className="hc-sec">
           <div className="hc-sec-head">
-            Claude sessions <span className="count">{lw.sessions.length}</span>
+            {isMain && lw.sessions.length > sessions.length ? "Latest Claude sessions" : "Claude sessions"}{" "}
+            <span className="count">{lw.sessions.length}</span>
           </div>
-          <SessionList sessions={lw.sessions} />
+          <SessionList sessions={sessions} />
         </div>
       )}
 

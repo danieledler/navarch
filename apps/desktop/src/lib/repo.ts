@@ -10,6 +10,7 @@ export interface LinkedWorktree {
   pr: PullRequest | null; // open PR from its branch, else its most recent merged/closed one (from its own repo's GitHub data)
   sessions: Session[]; // non-archived sessions working in it, newest lastActivityAt first
   lastActivity: number; // max of its HEAD commit time and its sessions' last activity (shown, not sorted by: it moves every scan)
+  isMain: boolean; // the repo's main checkout (wt.path = root), not a linked worktree
 }
 
 export interface LinkedPull {
@@ -23,7 +24,9 @@ export interface LinkedIssue {
 }
 
 export interface LinkedRepo {
-  worktrees: LinkedWorktree[];
+  rows: LinkedWorktree[]; // the Worktrees column: main checkouts (see linkWorktrees), then active linked worktrees
+  idle: LinkedWorktree[]; // idle linked worktrees, folded away below the rows
+  worktrees: LinkedWorktree[]; // every linked worktree (rows and idle, main checkouts left out): the column's count
   pulls: LinkedPull[];
   issues: LinkedIssue[];
 }
@@ -53,18 +56,38 @@ function prOf(branch: string | null, gh: GitHubInfo | null): PullRequest | null 
   return gh.pulls.find((p) => p.headRef === branch) ?? done[0] ?? null;
 }
 
-/** The worktrees of several repos (duplicates by path dropped), each with its sessions and its own repo's PR. A
- *  session goes to the worktree of the last folder it worked in that lies in one (deepest worktree wins, across all
- *  repos). Ordered so rows hold still while sessions run (their lastActivityAt moves every 3 s scan): worktrees with
- *  a working or waiting session first, then by last commit, then by path. */
-export function linkWorktrees(entries: RepoEntry[], sessions: Session[]): LinkedWorktree[] {
+/** The rows of the Worktrees column. */
+export interface WorktreeRows {
+  rows: LinkedWorktree[];
+  idle: LinkedWorktree[];
+  worktrees: LinkedWorktree[]; // the linked worktrees among rows and idle
+}
+
+/** A main checkout worth a row when its repo isn't the picked one: uncommitted changes, unpushed commits, behind its
+ *  upstream, or not on the base branch. */
+export const mainNotable = (lw: LinkedWorktree) =>
+  lw.wt.dirty > 0 || (lw.wt.unpushed ?? 0) > 0 || (lw.wt.behindUpstream ?? 0) > 0 || lw.wt.branch !== lw.base;
+
+/** A linked worktree with nothing going on: detached or on the base branch, clean, no commits beyond base, nothing
+ *  running, no sessions, not locked (e.g. a build checkout like `.claude/worktrees/release`). */
+export const isIdle = (lw: LinkedWorktree) =>
+  !lw.isMain && !lw.wt.prunable && !lw.wt.locked && (lw.wt.branch == null || lw.wt.branch === lw.base) &&
+  lw.wt.dirty === 0 && lw.wt.ahead === 0 && lw.wt.procs.length === 0 && lw.sessions.length === 0;
+
+/** The main checkouts and worktrees of several repos (duplicates by path dropped), each with its sessions and its own
+ *  repo's PR. A session goes to the checkout of the last folder it worked in that lies in one (deepest wins, across
+ *  all repos, main checkouts included). Rows: the main checkout of `picked` (a repo root) first, then other repos'
+ *  main checkouts that are notable (mainNotable), then the linked worktrees that aren't idle (isIdle), ordered so
+ *  rows hold still while sessions run (their lastActivityAt moves every 3 s scan): worktrees with a working or
+ *  waiting session first, then by last commit, then by path. Idle ones come apart, in the same order. */
+export function linkWorktrees(entries: RepoEntry[], sessions: Session[], picked: string | null = null): WorktreeRows {
   const seen = new Set<string>();
-  const all: { wt: Worktree; e: RepoEntry }[] = [];
+  const all: { wt: Worktree; e: RepoEntry; isMain: boolean }[] = [];
   for (const e of entries)
-    for (const wt of e.o.worktrees) {
-      if (seen.has(wt.path)) continue;
+    for (const [wt, isMain] of [[e.o.main, true] as const, ...e.o.worktrees.map((w) => [w, false] as const)]) {
+      if (!wt || seen.has(wt.path)) continue;
       seen.add(wt.path);
-      all.push({ wt, e });
+      all.push({ wt, e, isMain });
     }
 
   const bySession = new Map<Worktree, Session[]>();
@@ -81,7 +104,7 @@ export function linkWorktrees(entries: RepoEntry[], sessions: Session[]): Linked
     }
   }
 
-  const worktrees: LinkedWorktree[] = all.map(({ wt, e }) => {
+  const linked: LinkedWorktree[] = all.map(({ wt, e, isMain }) => {
     const ss = (bySession.get(wt) ?? []).sort((a, b) => b.lastActivityAt - a.lastActivityAt);
     return {
       wt,
@@ -89,29 +112,44 @@ export function linkWorktrees(entries: RepoEntry[], sessions: Session[]): Linked
       root: e.o.root,
       repo: e.ref,
       base: e.o.base,
-      pr: prOf(wt.branch, e.o.github),
+      // A main checkout on the base branch has no PR of its own.
+      pr: isMain && wt.branch === e.o.base ? null : prOf(wt.branch, e.o.github),
       sessions: ss,
       lastActivity: Math.max(wt.committedAt, ...ss.map((s) => s.lastActivityAt)),
+      isMain,
     };
   });
   const live = (w: LinkedWorktree) => (w.sessions.some((s) => s.status === "working" || s.status === "needs_input") ? 0 : 1);
-  worktrees.sort((a, b) => live(a) - live(b) || b.wt.committedAt - a.wt.committedAt || a.wt.path.localeCompare(b.wt.path));
-  return worktrees;
+  const order = (a: LinkedWorktree, b: LinkedWorktree) =>
+    live(a) - live(b) || b.wt.committedAt - a.wt.committedAt || a.wt.path.localeCompare(b.wt.path);
+  const mains = linked.filter((w) => w.isMain);
+  const worktrees = linked.filter((w) => !w.isMain).sort(order);
+  const own = mains.find((w) => w.root === picked);
+  return {
+    rows: [
+      ...(own ? [own] : []),
+      ...mains.filter((w) => w !== own && mainNotable(w)),
+      ...worktrees.filter((w) => !isIdle(w)),
+    ],
+    idle: worktrees.filter(isIdle),
+    worktrees,
+  };
 }
 
 /** The Repo panel's rows for a project: PRs and issues of the chosen repo (`chosen`, null while it isn't loaded),
  *  worktrees of all its repos (`entries`, which should include the chosen one). */
 export function linkProject(chosen: RepoOverview | null, entries: RepoEntry[], sessions: Session[]): LinkedRepo {
-  const worktrees = linkWorktrees(entries, sessions);
+  const { rows, idle, worktrees } = linkWorktrees(entries, sessions, chosen?.root ?? null);
   const gh = chosen?.github ?? null;
   const open = gh?.pulls ?? [];
-  const own = chosen ? worktrees.filter((w) => w.root === chosen.root) : [];
+  // A PR's head branch may be checked out in a linked worktree or in the main checkout.
+  const own = chosen ? [...rows, ...idle].filter((w) => w.root === chosen.root) : [];
   const pulls: LinkedPull[] = open.map((pr) => ({ pr, worktree: own.find((w) => w.wt.branch === pr.headRef) ?? null }));
   const issues: LinkedIssue[] = (gh?.issues ?? []).map((issue) => ({
     issue,
     pulls: open.filter((p) => issue.linkedPulls.includes(p.number) || p.closingIssues.includes(issue.number)),
   }));
-  return { worktrees, pulls, issues };
+  return { rows, idle, worktrees, pulls, issues };
 }
 
 /** One repo's overview cross-linked with sessions. */

@@ -284,7 +284,10 @@ export interface Worktree {
   commitsAhead: WorktreeCommit[]; // the commits on HEAD not on base, newest first, at most 10
   upstream: string | null; // tracking branch, e.g. "origin/repo-panel"; null when the branch was never pushed
   unpushed: number | null; // commits not on upstream; null without upstream
-  procs: WorktreeProc[]; // processes whose working folder is inside it (dev servers, watchers), at most 10
+  behindUpstream: number | null; // upstream commits not on HEAD, as of the last fetch (Navarch never fetches); null without upstream
+  commitsUnpushed: WorktreeCommit[]; // the commits on HEAD not on upstream, newest first, at most 10; [] without upstream
+  procs: WorktreeProc[]; // processes whose working folder is inside it (dev servers, watchers), at most 10;
+  // never Claude's own `claude` processes (those are sessions)
 }
 
 export interface WorktreeCommit {
@@ -324,6 +327,11 @@ export interface RepoOverview {
   root: string; // the repo's main checkout
   base: string; // branch worktrees are compared with: origin's default branch if known, else main/master
   branch: string | null; // the main checkout's current branch
+  /** The main checkout itself (path = root): local commits not pushed, behind its upstream, uncommitted changes.
+   *  Its dirty/changes leave out the linked worktrees' folders (e.g. an untracked `.claude/` that only holds
+   *  worktrees), and its procs leave out processes inside linked worktrees. merged is always false. Null when the
+   *  repo's main entry is bare (a bare repo used only through worktrees). */
+  main: Worktree | null;
   worktrees: Worktree[]; // linked worktrees, main checkout excluded
   github: GitHubInfo | null; // last good GitHub data (may be older than a failed refresh)
   githubError: string | null; // why there is no fresh GitHub data: gh missing, not signed in, no GitHub remote, or gh's error

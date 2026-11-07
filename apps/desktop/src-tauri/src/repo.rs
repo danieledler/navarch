@@ -205,6 +205,10 @@ pub struct Worktree {
     pub commits_ahead: Vec<WorktreeCommit>,
     pub upstream: Option<String>,
     pub unpushed: Option<u32>,
+    /// Upstream commits not on HEAD, as of the last fetch (Navarch never fetches); `None` without upstream.
+    pub behind_upstream: Option<u32>,
+    /// The commits on HEAD not on upstream, newest first, at most `COMMITS_MAX`; empty without upstream.
+    pub commits_unpushed: Vec<WorktreeCommit>,
     pub procs: Vec<WorktreeProc>,
 }
 
@@ -241,6 +245,10 @@ pub struct RepoOverview {
     pub root: String,
     pub base: String,
     pub branch: Option<String>,
+    /// The main checkout itself; its dirty/changes leave out linked worktree folders, its procs the processes
+    /// inside them, and it is never merged.
+    /// The main checkout; `None` when the repo's main entry is bare (a bare repo with worktrees only).
+    pub main: Option<Worktree>,
     pub worktrees: Vec<Worktree>,
     pub github: Option<GitHubInfo>,
     pub github_error: Option<String>,
@@ -259,21 +267,26 @@ pub fn overview(path: &str, force: bool, with_github: bool) -> Option<RepoOvervi
     let (base, base_ref) = base_branch(&root, main.branch.as_deref());
     let slug = git(&root, &["remote", "-v"]).and_then(|r| slug_from_remotes(&r));
     let procs = cwd_procs();
-    let ((github, github_error), worktrees) = std::thread::scope(|s| {
+    let linked: Vec<&WtEntry> = entries[1..].iter().filter(|e| !e.bare).collect();
+    // The main checkout leaves out the linked worktrees' folders (often inside it, in .claude/worktrees).
+    let linked_dirs: Vec<PathBuf> = linked.iter().map(|e| canonical(&e.path)).collect();
+    let ((github, github_error), main_wt, worktrees) = std::thread::scope(|s| {
         let gh = with_github.then(|| s.spawn(|| github(&root, slug.as_deref(), force)));
-        let handles: Vec<_> = entries[1..]
-            .iter()
-            .filter(|e| !e.bare)
-            .map(|e| {
-                let (base, base_ref, procs) = (&base, base_ref.as_deref(), &procs);
-                s.spawn(move || worktree(e, base, base_ref, procs))
+        let (base, base_ref, procs, linked_dirs) = (&base, base_ref.as_deref(), &procs, &linked_dirs);
+        let main_h = (!main.bare).then(|| {
+            s.spawn(move || {
+                let mut w = worktree(main, base, base_ref, procs, linked_dirs);
+                w.merged = false;
+                w
             })
-            .collect();
+        });
+        let handles: Vec<_> = linked.iter().map(|&e| s.spawn(move || worktree(e, base, base_ref, procs, &[]))).collect();
         let worktrees = handles.into_iter().filter_map(|h| h.join().ok()).collect::<Vec<_>>();
+        let main_wt = main_h.and_then(|h| h.join().ok());
         let gh = gh.map_or((None, None), |h| h.join().unwrap_or_else(|_| (None, Some("GitHub lookup failed".into()))));
-        (gh, worktrees)
+        (gh, main_wt, worktrees)
     });
-    Some(RepoOverview { root, base, branch: main.branch.clone(), worktrees, github, github_error })
+    Some(RepoOverview { root, base, branch: main.branch.clone(), main: main_wt, worktrees, github, github_error })
 }
 
 // ── Repos of a project folder ──
@@ -517,8 +530,15 @@ fn parse_commit(line: &str) -> Option<WorktreeCommit> {
 
 const LOG_FORMAT: &str = "--format=%h%x1f%s%x1f%ct";
 
-fn worktree(e: &WtEntry, base: &str, base_ref: Option<&str>, procs: &[Proc]) -> Worktree {
-    let canon = std::fs::canonicalize(&e.path).unwrap_or_else(|_| PathBuf::from(&e.path));
+/// Git reports real paths (/private/var/… for /var/…); processes' cwds are real paths too.
+fn canonical(p: &str) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p))
+}
+
+/// One worktree's state. `exclude`: folders of linked worktrees, for the main checkout (empty for linked ones),
+/// whose processes and untracked entries it leaves out.
+fn worktree(e: &WtEntry, base: &str, base_ref: Option<&str>, procs: &[Proc], exclude: &[PathBuf]) -> Worktree {
+    let canon = canonical(&e.path);
     let mut w = Worktree {
         path: e.path.clone(),
         branch: e.branch.clone(),
@@ -535,9 +555,11 @@ fn worktree(e: &WtEntry, base: &str, base_ref: Option<&str>, procs: &[Proc]) -> 
         commits_ahead: Vec::new(),
         upstream: None,
         unpushed: None,
+        behind_upstream: None,
+        commits_unpushed: Vec::new(),
         procs: procs
             .iter()
-            .filter(|p| p.cwd.starts_with(&canon))
+            .filter(|p| p.cwd.starts_with(&canon) && !exclude.iter().any(|x| p.cwd.starts_with(x)))
             .take(PROCS_MAX)
             .map(|p| WorktreeProc { pid: p.pid, name: p.name.clone(), cmd: p.cmd.clone() })
             .collect(),
@@ -547,10 +569,9 @@ fn worktree(e: &WtEntry, base: &str, base_ref: Option<&str>, procs: &[Proc]) -> 
     }
     let dir = e.path.as_str();
     // When status fails or times out the worktree may be dirty: it then never counts as merged.
-    let status_ok = if let Some(st) = git(dir, &["status", "--porcelain=v1"]) {
-        let lines: Vec<&str> = st.lines().filter(|l| !l.is_empty()).collect();
+    let status_ok = if let Some(lines) = status(dir, &canon, exclude) {
         w.dirty = lines.len() as u32;
-        w.changes = lines.iter().take(CHANGES_MAX).map(|l| l.to_string()).collect();
+        w.changes = lines.into_iter().take(CHANGES_MAX).collect();
         true
     } else {
         false
@@ -559,10 +580,7 @@ fn worktree(e: &WtEntry, base: &str, base_ref: Option<&str>, procs: &[Proc]) -> 
         (w.head, w.subject, w.committed_at) = (c.hash, c.subject, c.at);
     }
     if let Some(b) = base_ref {
-        let counts = git(dir, &["rev-list", "--left-right", "--count", &format!("{b}...HEAD")]).and_then(|c| {
-            let (l, r) = c.trim().split_once(char::is_whitespace)?;
-            Some((l.trim().parse::<u32>().ok()?, r.trim().parse::<u32>().ok()?))
-        });
+        let counts = git(dir, &["rev-list", "--left-right", "--count", &format!("{b}...HEAD")]).and_then(|c| left_right(&c));
         if let Some((behind, ahead)) = counts {
             (w.behind, w.ahead) = (behind, ahead);
             // A fresh branch with uncommitted work is ahead 0 too: only a clean one counts as merged.
@@ -580,10 +598,71 @@ fn worktree(e: &WtEntry, base: &str, base_ref: Option<&str>, procs: &[Proc]) -> 
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         if w.upstream.is_some() {
-            w.unpushed = git(dir, &["rev-list", "--count", "@{u}..HEAD"]).and_then(|s| s.trim().parse().ok());
+            if let Some((behind, ahead)) = git(dir, &["rev-list", "--left-right", "--count", "@{u}...HEAD"])
+                .and_then(|c| left_right(&c))
+            {
+                (w.behind_upstream, w.unpushed) = (Some(behind), Some(ahead));
+                if ahead > 0 {
+                    let n = COMMITS_MAX.to_string();
+                    w.commits_unpushed = git(dir, &["log", LOG_FORMAT, "-n", &n, "@{u}..HEAD"])
+                        .map(|l| l.lines().filter_map(parse_commit).collect())
+                        .unwrap_or_default();
+                }
+            }
         }
     }
     w
+}
+
+/// `rev-list --left-right --count` output → (left, right).
+fn left_right(out: &str) -> Option<(u32, u32)> {
+    let (l, r) = out.trim().split_once(char::is_whitespace)?;
+    Some((l.trim().parse().ok()?, r.trim().parse().ok()?))
+}
+
+/// The lines of `git status --porcelain=v1` in `dir` (canonical `canon`), leaving out the `exclude` folders that
+/// are inside it. Those are linked worktrees: a nested checkout shows as one untracked `?? <folder>/` entry, and
+/// when its parent folder is untracked too (an unignored `.claude/` holding `.claude/worktrees/*`) as that parent.
+/// Pathspec excludes (`:(exclude,literal)<rel>`) drop the worktree entries themselves; an untracked parent that
+/// holds anything else still shows, collapsed (`?? .claude/`), so each such parent is listed again with `-uall`
+/// (its untracked files one by one, worktrees still excluded). An untracked parent holding only worktrees is
+/// gone either way. `None` when git fails.
+fn status(dir: &str, canon: &Path, exclude: &[PathBuf]) -> Option<Vec<String>> {
+    let rels: Vec<String> = exclude
+        .iter()
+        .filter_map(|x| x.strip_prefix(canon).ok())
+        .filter(|r| !r.as_os_str().is_empty())
+        .map(|r| r.to_string_lossy().into_owned())
+        .collect();
+    let excludes: Vec<String> = rels.iter().map(|r| format!(":(exclude,literal){r}")).collect();
+    let run = |extra: &[&str], paths: &[&str]| -> Option<Vec<String>> {
+        let mut args = vec!["status", "--porcelain=v1"];
+        args.extend_from_slice(extra);
+        if !excludes.is_empty() {
+            args.push("--");
+            args.extend_from_slice(paths);
+            args.extend(excludes.iter().map(String::as_str));
+        }
+        Some(git(dir, &args)?.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
+    };
+    let lines = run(&[], &["."])?;
+    if rels.is_empty() {
+        return Some(lines);
+    }
+    let mut out = Vec::with_capacity(lines.len());
+    for l in lines {
+        // An untracked folder that holds a worktree: list what else is in it.
+        let holds_worktree = l
+            .strip_prefix("?? ")
+            .map(|p| p.trim_matches('"'))
+            .filter(|p| p.ends_with('/'))
+            .filter(|p| rels.iter().any(|r| r.starts_with(p)));
+        match holds_worktree {
+            Some(p) => out.extend(run(&["-uall"], &[&format!(":(literal){}", p.trim_end_matches('/'))])?),
+            None => out.push(l),
+        }
+    }
+    Some(out)
 }
 
 // ── Processes working inside a worktree ──
@@ -611,6 +690,11 @@ fn cwd_procs() -> Vec<Proc> {
             let cwd = p.cwd().filter(|c| c != &Path::new("/"))?.to_path_buf();
             let name = p.name().to_string_lossy().into_owned();
             let cmd = p.cmd().iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" ");
+            // Claude's own processes are sessions, shown as such: `claude`, and the desktop app's `disclaimer`
+            // wrapper that launches it.
+            if name == "claude" || (name == "disclaimer" && cmd.contains("/claude")) {
+                return None;
+            }
             let cmd = if cmd.is_empty() { name.clone() } else { cmd.chars().take(CMD_MAX).collect() };
             Some(Proc { pid: pid.as_u32(), name, cmd, cwd })
         })
@@ -1229,8 +1313,77 @@ mod tests {
         let d = o.worktrees.iter().find(|w| w.branch.as_deref() == Some("done")).unwrap();
         assert_eq!((d.ahead, d.behind, d.dirty, d.merged), (0, 0, 0, true));
         assert!(d.commits_ahead.is_empty());
+        // The main checkout: clean (its sibling worktrees aren't inside it), never merged, no upstream.
+        let m = o.main.as_ref().expect("main checkout");
+        assert!(m.path.ends_with("/main") && m.branch.as_deref() == Some("main"), "{m:?}");
+        assert_eq!((m.dirty, m.merged, m.subject.as_str()), (0, false, "done one"));
+        assert_eq!((m.upstream.as_deref(), m.unpushed, m.behind_upstream), (None, None, None));
+        assert!(m.commits_unpushed.is_empty());
+        let (jm, jw) = (serde_json::to_value(m).unwrap(), serde_json::to_value(&o.worktrees[0]).unwrap());
+        for k in ["behindUpstream", "commitsUnpushed"] {
+            assert!(jm.get(k).is_some() && jw.get(k).is_some(), "{k}");
+        }
 
         assert!(overview(std::env::temp_dir().to_str().unwrap(), false, true).is_none());
+    }
+
+    #[test]
+    fn a_bare_main_entry_has_no_main_checkout() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("navarch-bare-test-{}-{nanos}", std::process::id()));
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        sh(&src, &["init", "-q", "-b", "main"]);
+        sh(&src, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        sh(&dir, &["clone", "-q", "--bare", src.to_str().unwrap(), "b.git"]);
+        sh(&dir.join("b.git"), &["worktree", "add", "-q", "-b", "x", "../w1"]);
+        let o = overview(dir.join("w1").to_str().unwrap(), false, false).expect("overview");
+        assert!(o.main.is_none());
+        assert_eq!(o.worktrees.len(), 1);
+        assert_eq!(o.worktrees[0].branch.as_deref(), Some("x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn main_checkout_vs_upstream_and_inner_worktrees() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("navarch-main-test-{}-{nanos}", std::process::id()));
+        let (origin, main, other) = (dir.join("origin.git"), dir.join("main"), dir.join("other"));
+        for d in [&origin, &main] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        sh(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        sh(&main, &["init", "-q", "-b", "main"]);
+        sh(&main, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        sh(&main, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        sh(&main, &["push", "-q", "-u", "origin", "main"]);
+        // Someone else pushes a commit; the main checkout fetches it but doesn't merge.
+        sh(&dir, &["clone", "-q", origin.to_str().unwrap(), "other"]);
+        sh(&other, &["commit", "-q", "--allow-empty", "-m", "theirs"]);
+        sh(&other, &["push", "-q", "origin", "main"]);
+        sh(&main, &["fetch", "-q"]);
+        // Two local commits not pushed.
+        sh(&main, &["commit", "-q", "--allow-empty", "-m", "mine 1"]);
+        sh(&main, &["commit", "-q", "--allow-empty", "-m", "mine 2"]);
+        // A worktree in an unignored .claude/worktrees: not the main checkout's change.
+        std::fs::create_dir_all(main.join(".claude/worktrees")).unwrap();
+        sh(&main, &["worktree", "add", "-q", "-b", "x", ".claude/worktrees/x"]);
+        let only_worktrees = overview(main.to_str().unwrap(), false, false);
+        // An untracked file beside it is.
+        std::fs::write(main.join(".claude/other.txt"), "o").unwrap();
+        let with_other = overview(main.to_str().unwrap(), false, false);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let o = only_worktrees.expect("a git repo");
+        let m = o.main.as_ref().expect("main checkout");
+        assert_eq!(m.upstream.as_deref(), Some("origin/main"));
+        assert_eq!((m.unpushed, m.behind_upstream, m.dirty), (Some(2), Some(1), 0), "{:?}", m.changes);
+        assert_eq!(m.commits_unpushed.iter().map(|c| c.subject.as_str()).collect::<Vec<_>>(), vec!["mine 2", "mine 1"]);
+        assert_eq!(o.worktrees.len(), 1);
+        let x = &o.worktrees[0];
+        assert_eq!((x.branch.as_deref(), x.upstream.as_deref(), x.behind_upstream), (Some("x"), None, None));
+        let m = with_other.expect("a git repo").main.expect("main checkout");
+        assert_eq!((m.dirty, m.changes), (1, vec!["?? .claude/other.txt".to_string()]));
     }
 
     #[test]
@@ -1289,6 +1442,27 @@ mod tests {
                 println!("  {:?} name {} github {:?} committed {}", r.rel, r.name, r.github, r.committed_at > 0);
             }
         }
+    }
+
+    #[test]
+    #[ignore = "live: reads this Mac's Navarch and bioregions checkouts, no GitHub"]
+    fn main_checkout_live() {
+        let o = overview("/Users/daniel/dev/planning/Navarch", false, false).expect("a git repo");
+        let m = o.main.as_ref().expect("main checkout");
+        println!(
+            "Navarch main {:?} unpushed {:?} behindUpstream {:?} dirty {} commitsUnpushed {} procs {:?}",
+            m.branch,
+            m.unpushed,
+            m.behind_upstream,
+            m.dirty,
+            m.commits_unpushed.len(),
+            m.procs.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+        let names: Vec<&str> = o.worktrees.iter().map(|w| w.path.rsplit('/').next().unwrap_or("")).collect();
+        println!("  worktrees {names:?}");
+        let b = overview("/Users/daniel/dev/projects/icelab/paper-projects/bioregions2/bioregions", false, false)
+            .expect("a git repo");
+        println!("bioregions main dirty {:?} changes {:?} worktrees {}", b.main.as_ref().map(|m| m.dirty), b.main.as_ref().map(|m| &m.changes), b.worktrees.len());
     }
 
     #[test]

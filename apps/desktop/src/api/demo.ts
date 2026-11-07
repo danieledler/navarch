@@ -406,8 +406,12 @@ export function demoRepoOverview(path: string): RepoOverview | null {
   });
   const wt = (w: Partial<Worktree> & Pick<Worktree, "head" | "subject" | "committedAt">, folder: string): Worktree => ({
     path: `${root}/.claude/worktrees/${folder}`, branch: folder, ahead: 0, behind: 0, dirty: w.changes?.length ?? 0, changes: [],
-    merged: false, locked: false, prunable: false, commitsAhead: [], upstream: `origin/${folder}`, unpushed: 0, procs: [], ...w,
+    merged: false, locked: false, prunable: false, commitsAhead: [], upstream: `origin/${folder}`, unpushed: 0,
+    behindUpstream: w.upstream === null ? null : 0, commitsUnpushed: [], procs: [], ...w,
   });
+  /** The repo's main checkout, on main and in sync with origin/main unless `w` says otherwise. */
+  const main = (w: Partial<Worktree> = {}): Worktree =>
+    wt({ head: "9e4b1a7", subject: "Update dependencies", committedAt: now - known[2] * 36e5, path: root, branch: "main", upstream: "origin/main", ...w }, "main");
 
   if (name === "shiftwren-web") {
     const pulls = [
@@ -511,6 +515,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
       wt(
         {
           head: "a3f9c21", subject: "Roll back optimistic toggles on 409", committedAt: m(25), ahead: 3, behind: 1, unpushed: 1,
+          commitsUnpushed: [{ hash: "a3f9c21", subject: "Roll back optimistic toggles on 409", at: m(25) }],
           changes: [" M src/features/availability/AvailabilityGrid.tsx", " M src/features/availability/useAvailability.ts", "?? src/features/availability/concurrentEdit.test.ts", " M src/api/availability.ts"],
           commitsAhead: [
             { hash: "a3f9c21", subject: "Roll back optimistic toggles on 409", at: m(25) },
@@ -543,9 +548,19 @@ export function demoRepoOverview(path: string): RepoOverview | null {
         },
         "e2e-drag-flake",
       ),
+      // A build checkout detached at origin/main: idle, folded away.
+      wt({ head: "6d0f2c8", subject: "Show the week number in the grid header", committedAt: h(2.5), branch: null, upstream: null, unpushed: null }, "release"),
     ];
     return {
       root, base: "main", branch: "main", worktrees, githubError: null,
+      main: main({
+        head: "b85e3f0", subject: "Bump vite to 7.1", committedAt: h(0.4), unpushed: 2,
+        commitsUnpushed: [
+          { hash: "b85e3f0", subject: "Bump vite to 7.1", at: h(0.4) },
+          { hash: "1f6a9c2", subject: "Note the availability_v2 flag in the README", at: h(1.2) },
+        ],
+        changes: [" M .env.example"],
+      }),
       github: { repo: slug, url: gh, pulls, recentPulls, viewer: ME, issues, fetchedAt: m(1) },
     };
   }
@@ -657,6 +672,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
     ];
     return {
       root, base: "main", branch: "main", worktrees, githubError: null,
+      main: main({ head: "52d8e1b", subject: "Release 0.9.2", behindUpstream: 3 }),
       github: { repo: slug, url: gh, pulls, recentPulls, viewer: ME, issues, fetchedAt: m(3) },
     };
   }
@@ -691,7 +707,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
       issue({ number: 9, title: "QR code so the audience can join the demo", createdAt: d(12), updatedAt: d(5), labels: [L.feature] }),
     ];
     return {
-      root, base: "main", branch: "main", githubError: null,
+      root, base: "main", branch: "main", githubError: null, main: main(),
       worktrees: [
         wt(
           {
@@ -725,7 +741,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
     );
     diagram.path = `${TALK}/.claude/worktrees/sync-diagram`;
     return {
-      root, base: "main", branch: "main", githubError: null, worktrees: [diagram],
+      root, base: "main", branch: "main", githubError: null, worktrees: [diagram], main: main(),
       github: {
         repo: slug, url: gh, pulls: [], viewer: ME, fetchedAt: m(4),
         recentPulls: [
@@ -738,12 +754,12 @@ export function demoRepoOverview(path: string): RepoOverview | null {
   }
 
   if (name === "notes") {
-    return { root, base: "main", branch: "main", github: null, githubError: "No GitHub remote", worktrees: [] };
+    return { root, base: "main", branch: "main", github: null, githubError: "No GitHub remote", worktrees: [], main: main({ upstream: null, unpushed: null }) };
   }
 
   // pixel-orchard: a local repo with no GitHub remote.
   return {
-    root, base: "main", branch: "main", github: null, githubError: "No GitHub remote",
+    root, base: "main", branch: "main", github: null, githubError: "No GitHub remote", main: main({ upstream: null, unpushed: null }),
     worktrees: [
       wt(
         {
