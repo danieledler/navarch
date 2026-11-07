@@ -69,6 +69,8 @@ interface State extends UIPrefs {
   repoLists: Record<string, { repos: RepoRef[]; at: number } | undefined>;
   /** Repo roots with a `git fetch` running (fetchRepo). */
   fetching: Record<string, true | undefined>;
+  /** Branches with a `git push` running (pushBranch), by `pushKey(root, branch)`. */
+  pushing: Record<string, true | undefined>;
   init: () => Promise<void>;
   reload: () => Promise<void>;
   /** Run a backend mutation, reload the snapshot, and surface errors as toasts. */
@@ -97,12 +99,18 @@ interface State extends UIPrefs {
   /** `git fetch --prune` the repo whose main checkout is `root` (one at a time per repo), toast what it brought,
    *  then reload its overview: the local remote-tracking refs changed, the cached GitHub data didn't. */
   fetchRepo: (root: string) => Promise<void>;
+  /** Push local branch `branch` of the repo whose main checkout is `root` to its upstream (fast-forward only; one
+   *  at a time per branch), toast the outcome, then reload the overview. */
+  pushBranch: (root: string, branch: string) => Promise<void>;
   setRepoPanel: (p: Partial<RepoPanelPrefs>) => void;
   /** Look for the git repos of a project folder. Fails silently (the old list stays); one at a time per folder. */
   findRepos: (projectPath: string) => Promise<void>;
   /** Pick which of a project folder's repos the Repo panel shows. */
   selectRepo: (projectPath: string, root: string) => void;
 }
+
+/** Key of a branch in `pushing`. */
+export const pushKey = (root: string, branch: string) => `${root}\n${branch}`;
 
 /** The repo the panel shows: the saved choice while the folder still holds it, else the first one. */
 export function chosenRepo(list: RepoRef[], saved: string | undefined): RepoRef | undefined {
@@ -166,6 +174,7 @@ export const useStore = create<State>((set, get) => ({
   repos: {},
   repoLists: {},
   fetching: {},
+  pushing: {},
 
   init: async () => {
     if (started) return; // StrictMode runs effects twice in dev
@@ -367,6 +376,20 @@ export const useStore = create<State>((set, get) => ({
       await get().loadRepo(root, true);
     } catch (e) {
       get().toast(`Couldn’t fetch ${name}: ${e}`, undefined, "error");
+    } finally {
+      busy(false);
+    }
+  },
+  pushBranch: async (root, branch) => {
+    const key = pushKey(root, branch);
+    if (get().pushing[key]) return;
+    const busy = (on: boolean) => set((s) => ({ pushing: { ...s.pushing, [key]: on || undefined } }));
+    busy(true);
+    try {
+      get().toast(await api.gitPush(root, branch));
+      await get().loadRepo(root, true);
+    } catch (e) {
+      get().toast(`Couldn’t push ${branch}: ${e}`, undefined, "error");
     } finally {
       busy(false);
     }

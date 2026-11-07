@@ -314,6 +314,7 @@ pub fn run() {
             commands::get_repo_overview,
             commands::find_repos,
             commands::git_fetch,
+            commands::git_push,
             commands::open_url,
             set_undo_menu,
         ])

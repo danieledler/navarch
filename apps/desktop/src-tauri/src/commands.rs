@@ -385,6 +385,14 @@ pub async fn git_fetch(root: String) -> Res<String> {
     tauri::async_runtime::spawn_blocking(move || crate::repo::git_fetch(&root)).await.map_err(db::err)?
 }
 
+/// Pushes local branch `branch` of the repo whose main checkout is `root` to its upstream (or the GitHub remote's
+/// branch of that name): fast-forward only, that ref only, no tags. "Pushed 3 commits to origin/x", or git's error.
+/// No prompts, 60 s timeout.
+#[tauri::command]
+pub async fn git_push(root: String, branch: String) -> Res<String> {
+    tauri::async_runtime::spawn_blocking(move || crate::repo::git_push(&root, &branch)).await.map_err(db::err)?
+}
+
 /// Opens a GitHub page (a pull request, an issue) in the browser.
 #[tauri::command]
 pub async fn open_url(url: String) -> Res<()> {

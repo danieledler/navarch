@@ -43,6 +43,11 @@ export interface Api {
    *  password or passphrase would be needed); 60 s timeout. Resolves with a one-line summary of what changed, e.g.
    *  "main +3 · 2 new branches · 1 deleted", or "Already up to date"; rejects with git's error. */
   gitFetch(root: string): Promise<string>;
+  /** Pushes local branch `branch` of the repo whose main checkout is `root` to its remote side (Branch.remoteRef):
+   *  its upstream, else the GitHub remote's branch of the same name. That ref only, fast-forward only (never forced),
+   *  no tags. Refuses a branch never pushed, one whose upstream is gone, and one behind its remote side. No prompts;
+   *  60 s timeout. Resolves with e.g. "Pushed 3 commits to origin/x"; rejects with git's error. */
+  gitPush(root: string, branch: string): Promise<string>;
   /** Opens a https://github.com/ link in the default browser. */
   openUrl(url: string): Promise<void>;
   revealPath(path: string): Promise<void>;
@@ -137,6 +142,7 @@ function tauriApi(): Api {
     getRepoOverview: (path, force, github = true) => call("get_repo_overview", { path, force, github }),
     findRepos: (path) => call("find_repos", { path }),
     gitFetch: (root) => call("git_fetch", { root }),
+    gitPush: (root, branch) => call("git_push", { root, branch }),
     openUrl: (url) => call("open_url", { url }),
     getSessions: () => call("get_sessions"),
     getSystemStats: () => call("get_system_stats"),

@@ -780,37 +780,118 @@ fn compare_github(
 
 // ── Fetch ──
 
-const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+const NET_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// `git fetch --prune` of the GitHub remote (as `RepoOverview.remote`) in the repo whose main checkout is `root`:
-/// only remote-tracking refs (and tags) change. Never prompts: ssh in batch mode (unless the repo or user configures
-/// its own ssh command), no credential prompts; 60 s timeout. A one-line summary of what changed, or git's error.
-pub fn git_fetch(root: &str) -> Result<String, String> {
+/// Errs unless `root` is the main checkout of a (non-bare) repo.
+fn ensure_main_checkout(root: &str) -> Result<(), String> {
     let wt = git(root, &["worktree", "list", "--porcelain"]).ok_or("Not a git repo")?;
-    let entries = parse_worktrees(&wt);
-    entries
+    parse_worktrees(&wt)
         .first()
         .filter(|e| !e.bare && canonical(&e.path) == canonical(root))
-        .ok_or("Not the main checkout of a repo")?;
-    let remote = git(root, &["remote", "-v"]).as_deref().and_then(github_remote).ok_or("No remote to fetch from")?;
+        .map(|_| ())
+        .ok_or_else(|| "Not the main checkout of a repo".into())
+}
+
+/// Runs a git command that talks to a remote (`cmd`, e.g. `["fetch", …]`) in `root`, never prompting: ssh in batch
+/// mode (unless the repo or user configures its own ssh command), no credential prompts; 60 s timeout.
+fn net_git(root: &str, cmd: &[&str]) -> Result<crate::tailscale::Output, String> {
     let own_ssh = git(root, &["config", "core.sshCommand"]).is_some_and(|c| !c.trim().is_empty())
         || ["GIT_SSH_COMMAND", "GIT_SSH"].iter().any(|v| std::env::var_os(v).is_some());
     let mut args = vec!["-C", root, "-c", "credential.interactive=never"];
     if !own_ssh {
         args.extend(["-c", "core.sshCommand=ssh -o BatchMode=yes -o ConnectTimeout=15"]);
     }
-    args.extend(["fetch", "--prune", "--porcelain", "--no-recurse-submodules", "--", remote.as_str()]);
+    args.extend_from_slice(cmd);
     let env = [("GIT_TERMINAL_PROMPT", "0"), ("SSH_ASKPASS_REQUIRE", "never")];
-    let o = exec_env(GIT, &args, &env, FETCH_TIMEOUT, |_| false).map_err(|e| format!("git didn't start: {e}"))?;
-    match o.status {
-        None => Err(format!("git fetch timed out after {} s", FETCH_TIMEOUT.as_secs())),
-        Some(st) if st.success() => {
-            let updates = parse_fetch(&o.out, &remote);
-            let count = |old: &str, new: &str| git(root, &["rev-list", "--count", &format!("{old}..{new}")]).and_then(|c| c.trim().parse().ok());
-            Ok(fetch_summary(&updates, count))
-        }
-        Some(_) => Err(fetch_error(&o.err)),
+    let o = exec_env(GIT, &args, &env, NET_TIMEOUT, |_| false).map_err(|e| format!("git didn't start: {e}"))?;
+    if o.status.is_none() {
+        return Err(format!("git {} timed out after {} s", cmd[0], NET_TIMEOUT.as_secs()));
     }
+    Ok(o)
+}
+
+/// `git fetch --prune` of the GitHub remote (as `RepoOverview.remote`) in the repo whose main checkout is `root`:
+/// only remote-tracking refs (and tags) change. No prompts, 60 s timeout (`net_git`). A one-line summary of what
+/// changed, or git's error.
+pub fn git_fetch(root: &str) -> Result<String, String> {
+    ensure_main_checkout(root)?;
+    let remote = git(root, &["remote", "-v"]).as_deref().and_then(github_remote).ok_or("No remote to fetch from")?;
+    let o = net_git(root, &["fetch", "--prune", "--porcelain", "--no-recurse-submodules", "--", remote.as_str()])?;
+    if !o.status.is_some_and(|s| s.success()) {
+        return Err(git_error(&o.err, "git fetch failed"));
+    }
+    let updates = parse_fetch(&o.out, &remote);
+    let count = |old: &str, new: &str| git(root, &["rev-list", "--count", &format!("{old}..{new}")]).and_then(|c| c.trim().parse().ok());
+    Ok(fetch_summary(&updates, count))
+}
+
+// ── Push ──
+
+/// Pushes local branch `branch` to its remote side, as the overview's `Branch.remoteRef` has it: its upstream
+/// (`branch.<b>.remote` + `.merge`), else the GitHub remote's branch of the same name when this clone tracks one.
+/// That one ref only, fast-forward only (never forced: a remote that has commits the branch doesn't rejects it),
+/// no tags; hooks run as usual. `root` is the repo's main checkout. No prompts, 60 s timeout (`net_git`).
+/// "Pushed 3 commits to origin/x", or git's error.
+pub fn git_push(root: &str, branch: &str) -> Result<String, String> {
+    ensure_main_checkout(root)?;
+    let local = format!("refs/heads/{branch}");
+    let exists = |r: &str| git(root, &["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")]).is_some();
+    if branch.is_empty() || !exists(&local) {
+        return Err(format!("No local branch {branch}"));
+    }
+    // The upstream's remote-tracking ref; empty without one.
+    let upstream = git(root, &["for-each-ref", "--format=%(upstream)", &local]).unwrap_or_default().trim().to_string();
+    let cfg = |k: &str| git(root, &["config", &format!("branch.{branch}.{k}")]).map(|s| s.trim().to_string());
+    let (remote, dst, tracking) = match (upstream.is_empty(), cfg("remote"), cfg("merge")) {
+        (false, Some(remote), Some(merge)) if remote != "." => {
+            if !exists(&upstream) {
+                let short = upstream.strip_prefix("refs/remotes/").unwrap_or(&upstream);
+                return Err(format!("{short} is gone (deleted on the remote?); not pushing {branch} there again"));
+            }
+            (remote, merge, upstream)
+        }
+        _ => {
+            let remote = git(root, &["remote", "-v"]).as_deref().and_then(github_remote).ok_or("No remote to push to")?;
+            let tracking = format!("refs/remotes/{remote}/{branch}");
+            if !exists(&tracking) {
+                return Err(format!("{branch} was never pushed: no {remote}/{branch} here"));
+            }
+            (remote, local.clone(), tracking)
+        }
+    };
+    let short = tracking.strip_prefix("refs/remotes/").unwrap_or(&tracking).to_string();
+    let count = |range: String| git(root, &["rev-list", "--count", &range]).and_then(|c| c.trim().parse::<u32>().ok());
+    let n = count(format!("{tracking}..{local}")).unwrap_or(0);
+    if n == 0 {
+        return Ok(format!("Nothing to push: {short} has every commit of {branch}"));
+    }
+    let behind = count(format!("{local}..{tracking}")).unwrap_or(0);
+    if behind > 0 {
+        let commits = if behind == 1 { "a commit" } else { "commits" };
+        return Err(format!("{short} has {commits} that {branch} doesn't: pull or rebase first"));
+    }
+    let refspec = format!("{local}:{dst}");
+    let o = net_git(
+        root,
+        &["push", "--porcelain", "--no-follow-tags", "--recurse-submodules=no", "--", remote.as_str(), refspec.as_str()],
+    )?;
+    if !o.status.is_some_and(|s| s.success()) {
+        return Err(push_rejection(&o.out, &short).unwrap_or_else(|| git_error(&o.err, "git push failed")));
+    }
+    let commits = if n == 1 { "1 commit".to_string() } else { format!("{n} commits") };
+    Ok(format!("Pushed {commits} to {short}"))
+}
+
+/// `git push --porcelain`'s reason for a rejected ref (`!\t<src>:<dst>\t[rejected] (fetch first)`) as a sentence;
+/// `None` when no ref was rejected (the push failed some other way). `to`: the remote side, e.g. "origin/x".
+fn push_rejection(out: &str, to: &str) -> Option<String> {
+    let line = out.lines().find(|l| l.starts_with('!'))?;
+    let summary = line.splitn(3, '\t').nth(2)?.trim();
+    let reason = summary.rsplit_once('(').map_or(summary, |(_, r)| r.trim_end_matches(')')).trim_matches(['[', ']', ' ']);
+    Some(match reason {
+        "fetch first" | "non-fast-forward" => format!("{to} has moved on since the last fetch: fetch, then pull or rebase"),
+        _ => format!("Rejected by the remote: {reason}"),
+    })
 }
 
 /// One ref update of `git fetch --porcelain`.
@@ -873,14 +954,14 @@ fn fetch_summary(updates: &[RefUpdate], count: impl Fn(&str, &str) -> Option<u64
 }
 
 /// git's stderr → its first two meaningful lines (no hints), at most 300 characters.
-fn fetch_error(stderr: &str) -> String {
+fn git_error(stderr: &str, fallback: &str) -> String {
     let lines: Vec<&str> = stderr
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with("hint:"))
         .take(2)
         .collect();
-    let msg = if lines.is_empty() { "git fetch failed".to_string() } else { lines.join(" ") };
+    let msg = if lines.is_empty() { fallback.to_string() } else { lines.join(" ") };
     msg.chars().take(300).collect()
 }
 
@@ -2323,6 +2404,76 @@ mod tests {
     }
 
     #[test]
+    fn push_fast_forwards_one_branch_only() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("navarch-push-test-{}-{nanos}", std::process::id()));
+        let (origin, main, other) = (dir.join("origin.git"), dir.join("main"), dir.join("other"));
+        for d in [&origin, &main] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let root = main.to_str().unwrap();
+        sh(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        sh(&main, &["init", "-q", "-b", "main"]);
+        sh(&main, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        sh(&main, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        sh(&main, &["push", "-q", "-u", "origin", "main"]);
+        // feat: tracks origin/remote-feat (another name), two commits ahead. side: no upstream but origin/side exists.
+        sh(&main, &["branch", "feat"]);
+        sh(&main, &["push", "-q", "origin", "feat:remote-feat", "main:side"]);
+        sh(&main, &["branch", "-q", "--set-upstream-to=origin/remote-feat", "feat"]);
+        sh(&main, &["branch", "side"]);
+        sh(&main, &["branch", "never"]);
+        sh(&main, &["checkout", "-q", "feat"]);
+        sh(&main, &["commit", "-q", "--allow-empty", "-m", "f1"]);
+        sh(&main, &["commit", "-q", "--allow-empty", "-m", "f2"]);
+        sh(&main, &["checkout", "-q", "side"]);
+        sh(&main, &["commit", "-q", "--allow-empty", "-m", "s1"]);
+        sh(&main, &["checkout", "-q", "main"]);
+        sh(&main, &["commit", "-q", "--allow-empty", "-m", "m1"]);
+        sh(&main, &["tag", "v1"]);
+
+        let feat = git_push(root, "feat");
+        let side = git_push(root, "side");
+        let again = git_push(root, "feat");
+        let never = git_push(root, "never");
+        let missing = git_push(root, "nope");
+        // Someone else pushes to main; after a fetch, main is behind and isn't pushed.
+        sh(&dir, &["clone", "-q", origin.to_str().unwrap(), "other"]);
+        sh(&other, &["commit", "-q", "--allow-empty", "-m", "theirs"]);
+        sh(&other, &["push", "-q", "origin", "main"]);
+        let stale = git_push(root, "main");
+        sh(&main, &["fetch", "-q"]);
+        let behind = git_push(root, "main");
+        let remote_head = |r: &str| git(origin.to_str().unwrap(), &["rev-parse", "--verify", "--quiet", r]);
+        let (feat_tip, side_tip, tag) = (remote_head("refs/heads/remote-feat"), remote_head("refs/heads/side"), remote_head("refs/tags/v1"));
+        let local_tip = |r: &str| git(root, &["rev-parse", r]);
+        let (feat_local, side_local) = (local_tip("feat"), local_tip("side"));
+        let tracking = local_tip("refs/remotes/origin/remote-feat");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(feat, Ok("Pushed 2 commits to origin/remote-feat".into()));
+        assert_eq!(side, Ok("Pushed 1 commit to origin/side".into()));
+        assert_eq!((feat_tip, side_tip), (feat_local.clone(), side_local));
+        assert_eq!(tracking, feat_local, "the remote-tracking branch follows the push");
+        assert_eq!(tag, None, "tags stay local");
+        assert_eq!(again, Ok("Nothing to push: origin/remote-feat has every commit of feat".into()));
+        assert_eq!(never, Err("never was never pushed: no origin/never here".into()));
+        assert_eq!(missing, Err("No local branch nope".into()));
+        assert_eq!(stale, Err("origin/main has moved on since the last fetch: fetch, then pull or rebase".into()));
+        assert_eq!(behind, Err("origin/main has a commit that main doesn't: pull or rebase first".into()));
+        assert!(git_push(dir.join("missing").to_str().unwrap(), "main").is_err());
+    }
+
+    #[test]
+    fn push_rejections_read() {
+        let out = "To github.com:a/b.git\n!\trefs/heads/x:refs/heads/x\t[remote rejected] (protected branch hook declined)\nDone\n";
+        assert_eq!(push_rejection(out, "origin/x"), Some("Rejected by the remote: protected branch hook declined".into()));
+        let out = "!\trefs/heads/x:refs/heads/x\t[rejected] (fetch first)\n";
+        assert_eq!(push_rejection(out, "origin/x"), Some("origin/x has moved on since the last fetch: fetch, then pull or rebase".into()));
+        assert_eq!(push_rejection("=\trefs/heads/x:refs/heads/x\t[up to date]\n", "origin/x"), None);
+    }
+
+    #[test]
     fn fetch_output_summarized() {
         let z = "0".repeat(40);
         let (a, b) = ("a".repeat(40), "b".repeat(40));
@@ -2338,8 +2489,8 @@ mod tests {
         assert_eq!(fetch_summary(&u, |_, _| Some(3)), "main +3 · wip rewritten · 2 new branches · 1 deleted · 1 new tag");
         assert_eq!(fetch_summary(&[], |_, _| None), "Already up to date");
         let err = "hint: x\ngit@github.com: Permission denied (publickey).\r\nfatal: Could not read from remote repository.\n\nPlease make sure";
-        assert_eq!(fetch_error(err), "git@github.com: Permission denied (publickey). fatal: Could not read from remote repository.");
-        assert_eq!(fetch_error(&"x".repeat(500)).len(), 300);
+        assert_eq!(git_error(err, "x"), "git@github.com: Permission denied (publickey). fatal: Could not read from remote repository.");
+        assert_eq!(git_error(&"x".repeat(500), "x").len(), 300);
     }
 
     #[test]

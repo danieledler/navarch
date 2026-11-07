@@ -371,6 +371,19 @@ export function demoFetch(root: string): string {
   return first && root.endsWith("/knotfile") ? "main +3 · 1 new branch · 1 deleted" : "Already up to date";
 }
 
+/** Demo branches pushed in this page load, as `${root}\n${branch}` (demoPush). */
+const demoPushed = new Set<string>();
+
+/** A `git push` of a demo branch (dev mock only): its unpushed commits are on the remote from then on. */
+export function demoPush(root: string, branch: string): string {
+  const b = demoRepoOverview(root)?.branches.find((x) => x.name === branch);
+  if (!b?.local || !b.remoteRef) throw `${branch} was never pushed`;
+  if (b.unpulled) throw `${b.remoteRef} has commits that ${branch} doesn’t: pull or rebase first`;
+  demoPushed.add(`${root}\n${branch}`);
+  const n = b.unpushed ?? 0;
+  return n ? `Pushed ${n === 1 ? "1 commit" : `${n} commits`} to ${b.remoteRef}` : `Nothing to push: ${b.remoteRef} has every commit of ${branch}`;
+}
+
 /** The repo behind a demo project folder (or a folder inside it), as `get_repo_overview` would report it. */
 export function demoRepoOverview(path: string): RepoOverview | null {
   const now = Date.now();
@@ -444,6 +457,9 @@ export function demoRepoOverview(path: string): RepoOverview | null {
     extra: Branch[],
     remote: string | null = "origin",
   ): RepoOverview => {
+    const pushed = (w: Worktree): Worktree =>
+      w.branch && demoPushed.has(`${root}\n${w.branch}`) ? { ...w, unpushed: 0, commitsUnpushed: [] } : w;
+    o = { ...o, main: o.main && pushed(o.main), worktrees: o.worktrees.map(pushed) };
     const out = [o.main, ...o.worktrees].flatMap((w): Branch[] =>
       w?.branch
         ? [br(w.branch, w.head, w.subject, w.committedAt, {

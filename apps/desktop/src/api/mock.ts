@@ -3,7 +3,7 @@
 // Add ?reset to the URL to reseed.
 import type { Api } from "./index";
 import type { CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Tailscale, TailscaleServe, Session, Snapshot, SystemStats, Task, Usage } from "./types";
-import { DEMO_PICK_FOLDER, demoFetch, demoFindRepos, demoRepoOverview, demoSessions, demoSnapshot } from "./demo";
+import { DEMO_PICK_FOLDER, demoFetch, demoPush, demoFindRepos, demoRepoOverview, demoSessions, demoSnapshot } from "./demo";
 
 const KEY = "navarch-mock-v2";
 
@@ -253,6 +253,11 @@ export function mockApi(): Api {
       if (import.meta.env.PROD) throw "In the app this runs git fetch. The demo has no real repos.";
       await new Promise((r) => setTimeout(r, 700));
       return demoFetch(root);
+    },
+    gitPush: async (root, branch) => {
+      if (import.meta.env.PROD) throw "In the app this runs git push. The demo has no real repos.";
+      await new Promise((r) => setTimeout(r, 700));
+      return demoPush(root, branch);
     },
     findRepos: async (path) => {
       await new Promise((r) => setTimeout(r, 80));

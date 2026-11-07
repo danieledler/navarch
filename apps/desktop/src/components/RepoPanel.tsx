@@ -3,12 +3,12 @@
 // row shows a hover card with the details.
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
-  ArrowDown, ArrowUp, BadgeCheck, Check, ChevronDown, ChevronRight, CircleDot, Cloud, CloudDownload, Copy, Eye, ExternalLink, FileDiff, FolderGit2, FolderOpen,
+  ArrowDown, ArrowUp, BadgeCheck, Check, ChevronDown, ChevronRight, CircleDot, Cloud, CloudDownload, CloudUpload, Copy, Eye, ExternalLink, FileDiff, FolderGit2, FolderOpen,
   GitBranch, GitCompare, GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft, Laptop, Lock, MessageSquare, Minus, RefreshCw, SquareTerminal,
   TriangleAlert, X, Zap,
 } from "lucide-react";
 import { api, type Branch, type CheckState, type GitHubInfo, type Issue, type Label, type PullRequest, type RepoOverview, type RepoRef, type Reviewer, type Session } from "../api";
-import { chosenRepo, useModel, useStore } from "../store";
+import { chosenRepo, pushKey, useModel, useStore } from "../store";
 import { baseName, plainText, relTime, shortPath } from "../lib/format";
 import { branchOf, deletedOnGitHub, doneAt, linkProject, newerOnGitHub, newOnGitHub, remoteNews, type LinkedBranch, type LinkedIssue, type LinkedPull, type LinkedRepo, type LinkedWorktree, type RepoEntry } from "../lib/repo";
 import { IconButton, Popover, STATUS_LABEL, StatusDot } from "./ui";
@@ -882,6 +882,36 @@ function FetchButton({ root }: { root: string }) {
   );
 }
 
+/** Push button for a branch card: pushes its unpushed commits to its remote side (fast-forward only). Nothing for a
+ *  branch with none, never pushed, or deleted on GitHub; disabled while the remote side has commits it doesn't. */
+function PushButton({ root, b }: { root: string; b: Branch }) {
+  const pushing = useStore((s) => !!s.pushing[pushKey(root, b.name)]);
+  const fetching = useStore((s) => !!s.fetching[root]);
+  const pushBranch = useStore((s) => s.pushBranch);
+  const up = b.unpushed ?? 0;
+  if (!b.local || !b.remoteRef || b.upstreamGone || deletedOnGitHub(b) || up === 0) return null;
+  const blocked =
+    (b.unpulled ?? 0) > 0
+      ? `${b.remoteRef} has ${plural(b.unpulled!, "commit")} that ${b.name} doesn’t: pull or rebase first`
+      : newerOnGitHub(b)
+        ? `GitHub’s ${b.name} has commits that aren’t fetched yet: Fetch, then pull or rebase first`
+        : null;
+  return (
+    <button
+      type="button"
+      className={`btn btn-small btn-ghost ${pushing ? "spin" : ""}`}
+      title={
+        blocked ??
+        `Push ${plural(up, "commit")} to ${b.remoteRef}: git push of ${b.name} only, fast-forward (never forced), no tags`
+      }
+      disabled={pushing || fetching || !!blocked}
+      onClick={() => void pushBranch(root, b.name)}
+    >
+      <CloudUpload size={12} /> {pushing ? "Pushing…" : "Push"}
+    </button>
+  );
+}
+
 /** "↓N on GitHub": commits on GitHub that this clone's remote-tracking branch doesn't have (not fetched yet). */
 function GitHubNewsMark({ b, remote }: { b: Branch; remote: string | null }) {
   const ref = b.remoteRef ?? `${remote ?? "origin"}/${b.name}`;
@@ -1743,6 +1773,7 @@ function BranchCard({ lb, ctx }: { lb: LinkedBranch; ctx: BrCtx }) {
           <Copy size={12} /> Copy name
         </button>
         {ctx.root && b.onGitHub !== null && <FetchButton root={ctx.root} />}
+        {ctx.root && <PushButton root={ctx.root} b={b} />}
         {gh && slug && (
           <button type="button" className="btn btn-small btn-ghost" onClick={() => act(api.openUrl(treeUrl(slug, gh)))}>
             <ExternalLink size={12} /> Open on GitHub
