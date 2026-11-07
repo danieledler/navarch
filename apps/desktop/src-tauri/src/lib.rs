@@ -61,8 +61,8 @@ pub(crate) fn dev_name() -> Option<String> {
     Some(checkout.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect())
 }
 
-/// Keeps the usage-limit alert file in step with plan usage: read every 10 minutes, or sooner when a
-/// window is on course to reach its threshold (`limits::max_age`). Tells the UI when a new alert goes
+/// Keeps the usage-limit alert file in step with plan usage: read every 10 minutes, or every 1 to 5
+/// near or past a threshold (`limits::max_age`). Tells the UI when a new alert goes
 /// out to sessions. Dev builds keep the 10 minutes: their alerts go to a file no hook reads.
 fn start_limit_watch(app: tauri::AppHandle) {
     let installed = dev_name().is_none();

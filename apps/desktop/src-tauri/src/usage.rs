@@ -35,8 +35,6 @@ pub const MIN_AGE_MS: i64 = 60_000;
 /// doesn't come back the moment a request gets through.
 const CALM_FOR_MS: i64 = 60 * 60_000;
 const CALM_MIN_AGE_MS: i64 = 5 * 60_000;
-/// A 429 isn't reported while the last good numbers are younger than this: they're still good enough.
-const QUIET_429_MS: i64 = 15 * 60_000;
 /// Backoff after 429s in a row: 5, 10, 20, then 30 minutes. A longer Retry-After wins; a shorter one
 /// doesn't, since the endpoint has kept answering 429 for many minutes while asking for under a minute.
 const BACKOFF_FIRST_MS: i64 = 5 * 60_000;
@@ -125,17 +123,6 @@ fn should_fetch(s: &Shared, max_age: i64, now: i64) -> bool {
     }
     let floor = if now - s.limited_at < CALM_FOR_MS { CALM_MIN_AGE_MS } else { MIN_AGE_MS };
     now - s.asked_at >= max_age.max(floor)
-}
-
-/// The usage to show: a 429 goes unmentioned while the numbers from before it are still recent.
-fn shown(s: &Shared, now: i64) -> Usage {
-    let mut u = s.usage.clone();
-    let has_numbers = u.five_hour.is_some() || u.seven_day.is_some();
-    // Only a 429 sets `retry_at`, and the next answer of any kind clears it.
-    if s.retry_at > 0 && has_numbers && now - u.fetched_at < QUIET_429_MS {
-        u.error = None;
-    }
-    u
 }
 
 /// Wait after the n-th 429 in a row (n ≥ 1), unless Retry-After asks for longer.
@@ -259,7 +246,7 @@ impl UsageCache {
                 }
                 *shared = record(shared.clone(), outcome, now);
             }
-            shown(shared, now)
+            shared.usage.clone()
         })
     }
 
@@ -543,28 +530,13 @@ mod tests {
     }
 
     #[test]
-    fn a_429_with_recent_numbers_goes_unmentioned() {
-        let now = 1_000 * MIN;
-        let good = record(Shared::default(), ok(42.0), now);
-        let s = record(good, Outcome::RateLimited(None), now + 10 * MIN);
-        assert_eq!(s.limited_at, now + 10 * MIN);
-        assert_eq!(shown(&s, now + 14 * MIN).error, None);
-        assert!(shown(&s, now + 15 * MIN).error.is_some_and(|e| e.contains("HTTP 429")));
-        // Other errors always show, and so does a 429 with no numbers to fall back on.
-        assert!(shown(&record(s.clone(), Outcome::Failed("x".into()), now + 11 * MIN), now + 11 * MIN).error.is_some());
-        assert!(shown(&record(Shared::default(), Outcome::RateLimited(None), now), now).error.is_some());
-        // The calm hour outlasts the success that follows.
-        assert_eq!(record(s, ok(50.0), now + 20 * MIN).limited_at, now + 10 * MIN);
-    }
-
-    #[test]
     fn backoff_after_429() {
         assert_eq!((1..=5).map(backoff_ms).map(|ms| ms / MIN).collect::<Vec<_>>(), [5, 10, 20, 30, 30]);
         assert_eq!(backoff_ms(u32::MAX), BACKOFF_MAX_MS);
         let now = 1_000 * MIN;
         let good = record(Shared::default(), ok(42.0), now - 10 * MIN);
         let s = record(good.clone(), Outcome::RateLimited(None), now);
-        assert_eq!((s.rate_limited, s.retry_at, s.asked_at), (1, now + 5 * MIN, now));
+        assert_eq!((s.rate_limited, s.retry_at, s.asked_at, s.limited_at), (1, now + 5 * MIN, now, now));
         // The last good numbers stay, with their time, beside the error.
         assert_eq!(s.usage.five_hour, good.usage.five_hour);
         assert_eq!(s.usage.fetched_at, now - 10 * MIN);
@@ -577,9 +549,9 @@ mod tests {
         // Other failures keep the numbers and the count but don't hold requests back.
         let f = record(s.clone(), Outcome::Failed("x".into()), now);
         assert_eq!((f.rate_limited, f.retry_at, f.usage.five_hour.is_some()), (2, 0, true));
-        // Success clears it all.
+        // Success clears it all, except the time of the 429, which keeps requests slow for an hour.
         let s = record(s, ok(50.0), now + 20 * MIN);
-        assert_eq!((s.rate_limited, s.retry_at, s.usage.error), (0, 0, None));
+        assert_eq!((s.rate_limited, s.retry_at, s.usage.error, s.limited_at), (0, 0, None, now + 5 * MIN));
         // Without earlier numbers, the error carries the time of the attempt.
         assert_eq!(record(Shared::default(), Outcome::Failed("x".into()), now).usage.fetched_at, now);
     }
@@ -706,11 +678,10 @@ mod tests {
         assert_eq!(calls.get(), 1);
         // A 429 seen by B holds A back too, and both keep showing the numbers.
         let u = get(&b, MAX_AGE_MS, now + 10 * MIN, Outcome::RateLimited(None));
-        assert_eq!((u.error, u.five_hour.map(|w| w.percent)), (None, Some(10.0)));
+        assert!(u.error.is_some() && u.five_hour.is_some());
         let u = get(&a, MIN_AGE_MS, now + 14 * MIN, ok(99.0));
         assert_eq!((calls.get(), u.five_hour.unwrap().percent), (2, 10.0));
-        // Past the backoff the numbers are old enough for the error to show, until a request works.
-        assert!(get(&a, MAX_AGE_MS, now + 16 * MIN, ok(20.0)).error.is_some());
+        // Past the backoff the next read asks again, and the error clears.
         assert_eq!(get(&a, MIN_AGE_MS, now + 16 * MIN, ok(20.0)).error, None);
         // Then the calm hour: B can't ask again within 5 minutes.
         assert_eq!(get(&b, MIN_AGE_MS, now + 20 * MIN, ok(30.0)).five_hour.unwrap().percent, 20.0);

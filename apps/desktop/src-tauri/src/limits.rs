@@ -9,11 +9,12 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const SETTING_KEY: &str = "limit_thresholds";
-/// Within this many points of a threshold, with no rise to go by, usage is read every 5 minutes.
+/// Within this many points of a threshold, with no rise to go by, usage is read every 2 minutes.
 const NEAR_POINTS: f64 = 10.0;
-const NEAR_AGE_MS: i64 = 5 * 60_000;
-/// The limit watch never reads usage more often than this, however fast it rises.
-const FASTEST_AGE_MS: i64 = 2 * 60_000;
+const NEAR_AGE_MS: i64 = 2 * 60_000;
+/// A rising window near its threshold (or past it) is read every 1 to 5 minutes.
+const FASTEST_AGE_MS: i64 = 60_000;
+const RISING_MAX_AGE_MS: i64 = 5 * 60_000;
 /// Sessions resume this long after the reset, so the new window has surely started.
 const RESUME_AFTER_MIN: i64 = 5;
 
@@ -67,26 +68,29 @@ fn windows<'a>(u: &'a Usage, t: &Thresholds) -> impl Iterator<Item = (&'static s
 }
 
 /// How old usage may get before the limit watch reads it again: the base pace (10 minutes), unless a
-/// window under its threshold is on course to reach it. Then half the time that would take at its rise
-/// since `prev`, the reading before, so the crossing is caught within a few minutes; with no rise to go
-/// by, 5 minutes within `NEAR_POINTS`. Over a threshold the alert is out already: no hurry.
+/// window nears its threshold. Its target is the threshold, or 100% once past it (the alert is out, but
+/// it can still climb to the limit). Rising, it's read after half the time it would take to get there at
+/// its rise since `prev` (the reading before), 1 to 5 minutes, so the crossing is caught in time; that
+/// holds further out too, when the target is under 20 minutes away. Within `NEAR_POINTS` with no rise
+/// to go by (a first reading, idle, a reset), 2 minutes. A window at 100% can't climb: base pace.
 pub fn max_age(prev: Option<&Usage>, u: &Usage, t: &Thresholds) -> i64 {
     windows(u, t)
-        .filter(|(_, w, limit)| w.percent < *limit)
+        .filter(|(_, w, _)| w.percent < 100.0)
         .map(|(key, w, limit)| {
-            let gap = limit - w.percent;
-            // Time to the threshold at the rise since `prev`; none after a drop (a reset) or no change.
+            let over = w.percent >= limit;
+            let gap = if over { 100.0 } else { limit } - w.percent;
+            let near = over || gap <= NEAR_POINTS;
+            // Time to the target at the rise since `prev`; none after a drop (a reset) or no change.
             let eta = prev.and_then(|p| {
                 let (_, pw, _) = windows(p, t).find(|(k, _, _)| *k == key)?;
                 let (rise, dt) = (w.percent - pw.percent, u.fetched_at - p.fetched_at);
-                (rise > 0.0 && dt > 0).then(|| gap * dt as f64 / rise)
+                (rise > 0.0 && dt > 0).then(|| (gap * dt as f64 / rise / 2.0) as i64)
             });
             match eta {
-                Some(eta) => (eta / 2.0) as i64,
-                None if gap <= NEAR_POINTS => NEAR_AGE_MS,
-                None => MAX_AGE_MS,
+                Some(half) if near || half < MAX_AGE_MS => half.clamp(FASTEST_AGE_MS, RISING_MAX_AGE_MS),
+                None if near => NEAR_AGE_MS,
+                _ => MAX_AGE_MS,
             }
-            .clamp(FASTEST_AGE_MS, MAX_AGE_MS)
         })
         .min()
         .unwrap_or(MAX_AGE_MS)
@@ -301,21 +305,25 @@ mod tests {
         const MIN: i64 = 60_000;
         let t = Thresholds::default(); // 95% and 99%
         let at = |five, week, min: i64| Usage { fetched_at: min * MIN, ..usage(five, week) };
-        let age = |prev: Option<Usage>, u: Usage| max_age(prev.as_ref(), &u, &t) / MIN;
+        let age = |prev: Option<Usage>, u: Usage| max_age(prev.as_ref(), &u, &t) as f64 / MIN as f64;
         // Far from both, or close with nothing to compare with.
-        assert_eq!(age(None, at(50.0, 50.0, 0)), 10);
-        assert_eq!(age(None, at(86.0, 50.0, 0)), 5);
-        // Half the time to the threshold at the last rise, from 2 to 10 minutes: 20, 10 and 3⅓ minutes away.
-        assert_eq!(age(Some(at(80.0, 50.0, 0)), at(85.0, 50.0, 10)), 10);
-        assert_eq!(age(Some(at(85.0, 50.0, 0)), at(90.0, 50.0, 10)), 5);
-        assert_eq!(age(Some(at(90.0, 50.0, 0)), at(93.0, 50.0, 5)), 2);
-        // A slow weekly rise, an hour from 99%: the base pace.
-        assert_eq!(age(Some(at(50.0, 92.0, 0)), at(50.0, 93.0, 10)), 10);
-        // Close and idle, or close after a reset (a drop): 5 minutes.
-        assert_eq!(age(Some(at(50.0, 93.0, 0)), at(50.0, 93.0, 10)), 5);
-        assert_eq!(age(Some(at(94.0, 50.0, 0)), at(88.0, 50.0, 10)), 5);
-        // Over a threshold, with the other window far off.
-        assert_eq!(age(Some(at(90.0, 50.0, 0)), at(96.0, 50.0, 5)), 10);
+        assert_eq!(age(None, at(50.0, 50.0, 0)), 10.0);
+        assert_eq!(age(None, at(86.0, 50.0, 0)), 2.0);
+        // Rising near a threshold: half the time to it at the last rise, 1 to 5 minutes. 6 minutes away,
+        // half a minute away, and an hour away (a slow weekly rise).
+        assert_eq!(age(Some(at(90.0, 50.0, 0)), at(92.0, 50.0, 4)), 3.0);
+        assert_eq!(age(Some(at(90.0, 50.0, 0)), at(94.0, 50.0, 2)), 1.0);
+        assert_eq!(age(Some(at(50.0, 92.0, 0)), at(50.0, 93.0, 10)), 5.0);
+        // Further out, only a fast rise counts: 45 minutes away, then 10.
+        assert_eq!(age(Some(at(50.0, 50.0, 0)), at(60.0, 50.0, 10)), 10.0);
+        assert_eq!(age(Some(at(55.0, 50.0, 0)), at(75.0, 50.0, 10)), 5.0);
+        // Close and idle, or close after a reset (a drop).
+        assert_eq!(age(Some(at(50.0, 93.0, 0)), at(50.0, 93.0, 10)), 2.0);
+        assert_eq!(age(Some(at(94.0, 50.0, 0)), at(88.0, 50.0, 10)), 2.0);
+        // Past a threshold the target is 100%: rising, 6 minutes away; idle; and at the limit.
+        assert_eq!(age(Some(at(95.0, 50.0, 0)), at(97.0, 50.0, 4)), 3.0);
+        assert_eq!(age(Some(at(96.0, 50.0, 0)), at(96.0, 50.0, 5)), 2.0);
+        assert_eq!(age(Some(at(100.0, 50.0, 0)), at(100.0, 50.0, 5)), 10.0);
     }
 
     #[test]
