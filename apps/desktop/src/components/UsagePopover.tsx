@@ -20,11 +20,14 @@ export function UsagePopover({ anchor, onClose }: { anchor: React.RefObject<HTML
   const paces = usagePaces(usage);
   const endsSoon = signInEndsSoon(usage);
   const stale = !!usage?.error && !!(usage.fiveHour || usage.sevenDay);
+  // Forced reads get numbers at most a minute old (5 minutes for an hour after a 429): the backend
+  // throttles them, so opening the popover can ask too.
   const refresh = async () => {
     setBusy(true);
     await refreshUsage(true);
     setBusy(false);
   };
+  useEffect(() => void refresh(), []);
 
   return (
     <Popover anchor={anchor} anchorIsTrigger onClose={onClose} side="top" align="end" className="usage-pop">

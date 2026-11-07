@@ -219,8 +219,9 @@ export const useStore = create<State>((set, get) => ({
     tickSys();
     setInterval(tickSys, 2000);
     setInterval(async () => setSessions(await api.getSessions()), 15000);
+    // Cheap: this reads Navarch's cache, which asks Anthropic every 10 minutes, sooner near a threshold.
     get().refreshUsage(false);
-    setInterval(() => get().refreshUsage(false), 5 * 60 * 1000);
+    setInterval(() => get().refreshUsage(false), 60 * 1000);
     window.addEventListener("focus", () => get().refreshUsage(false));
   },
 

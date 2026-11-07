@@ -3,14 +3,17 @@
 //! PostToolUse and UserPromptSubmit hook, hands the alert to each session (and each subagent) once, as
 //! context for Claude: save your work, and schedule your own resume for after the reset.
 
-use crate::usage::{Usage, UsageWindow};
+use crate::usage::{Usage, UsageWindow, MAX_AGE_MS};
 use chrono::{DateTime, Datelike, Local, Timelike};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const SETTING_KEY: &str = "limit_thresholds";
-/// Within this many points of a threshold, usage is refetched every minute instead of every 5.
+/// Within this many points of a threshold, with no rise to go by, usage is read every 5 minutes.
 const NEAR_POINTS: f64 = 10.0;
+const NEAR_AGE_MS: i64 = 5 * 60_000;
+/// The limit watch never reads usage more often than this, however fast it rises.
+const FASTEST_AGE_MS: i64 = 2 * 60_000;
 /// Sessions resume this long after the reset, so the new window has surely started.
 const RESUME_AFTER_MIN: i64 = 5;
 
@@ -63,8 +66,30 @@ fn windows<'a>(u: &'a Usage, t: &Thresholds) -> impl Iterator<Item = (&'static s
         .filter_map(|(k, w, limit)| w.map(|w| (k, w, limit)))
 }
 
-pub fn near(u: &Usage, t: &Thresholds) -> bool {
-    windows(u, t).any(|(_, w, limit)| w.percent >= limit - NEAR_POINTS)
+/// How old usage may get before the limit watch reads it again: the base pace (10 minutes), unless a
+/// window under its threshold is on course to reach it. Then half the time that would take at its rise
+/// since `prev`, the reading before, so the crossing is caught within a few minutes; with no rise to go
+/// by, 5 minutes within `NEAR_POINTS`. Over a threshold the alert is out already: no hurry.
+pub fn max_age(prev: Option<&Usage>, u: &Usage, t: &Thresholds) -> i64 {
+    windows(u, t)
+        .filter(|(_, w, limit)| w.percent < *limit)
+        .map(|(key, w, limit)| {
+            let gap = limit - w.percent;
+            // Time to the threshold at the rise since `prev`; none after a drop (a reset) or no change.
+            let eta = prev.and_then(|p| {
+                let (_, pw, _) = windows(p, t).find(|(k, _, _)| *k == key)?;
+                let (rise, dt) = (w.percent - pw.percent, u.fetched_at - p.fetched_at);
+                (rise > 0.0 && dt > 0).then(|| gap * dt as f64 / rise)
+            });
+            match eta {
+                Some(eta) => (eta / 2.0) as i64,
+                None if gap <= NEAR_POINTS => NEAR_AGE_MS,
+                None => MAX_AGE_MS,
+            }
+            .clamp(FASTEST_AGE_MS, MAX_AGE_MS)
+        })
+        .min()
+        .unwrap_or(MAX_AGE_MS)
 }
 
 /// "at 14:30" today, else "Mon 3 Nov at 09:00".
@@ -272,11 +297,32 @@ mod tests {
     }
 
     #[test]
+    fn reads_sooner_as_a_threshold_comes_near() {
+        const MIN: i64 = 60_000;
+        let t = Thresholds::default(); // 95% and 99%
+        let at = |five, week, min: i64| Usage { fetched_at: min * MIN, ..usage(five, week) };
+        let age = |prev: Option<Usage>, u: Usage| max_age(prev.as_ref(), &u, &t) / MIN;
+        // Far from both, or close with nothing to compare with.
+        assert_eq!(age(None, at(50.0, 50.0, 0)), 10);
+        assert_eq!(age(None, at(86.0, 50.0, 0)), 5);
+        // Half the time to the threshold at the last rise, from 2 to 10 minutes: 20, 10 and 3⅓ minutes away.
+        assert_eq!(age(Some(at(80.0, 50.0, 0)), at(85.0, 50.0, 10)), 10);
+        assert_eq!(age(Some(at(85.0, 50.0, 0)), at(90.0, 50.0, 10)), 5);
+        assert_eq!(age(Some(at(90.0, 50.0, 0)), at(93.0, 50.0, 5)), 2);
+        // A slow weekly rise, an hour from 99%: the base pace.
+        assert_eq!(age(Some(at(50.0, 92.0, 0)), at(50.0, 93.0, 10)), 10);
+        // Close and idle, or close after a reset (a drop): 5 minutes.
+        assert_eq!(age(Some(at(50.0, 93.0, 0)), at(50.0, 93.0, 10)), 5);
+        assert_eq!(age(Some(at(94.0, 50.0, 0)), at(88.0, 50.0, 10)), 5);
+        // Over a threshold, with the other window far off.
+        assert_eq!(age(Some(at(90.0, 50.0, 0)), at(96.0, 50.0, 5)), 10);
+    }
+
+    #[test]
     fn alerts_only_over_a_threshold() {
         let now = Local.with_ymd_and_hms(2026, 10, 30, 12, 0, 0).unwrap();
         let t = Thresholds::default();
         assert!(alert_for(&usage(94.9, 98.9), &t, now).is_none());
-        assert!(near(&usage(85.0, 0.0), &t) && !near(&usage(84.0, 88.0), &t));
 
         let a = alert_for(&usage(95.4, 50.0), &t, now).unwrap();
         let reset = DateTime::parse_from_rfc3339("2026-10-30T14:30:00+00:00").unwrap();

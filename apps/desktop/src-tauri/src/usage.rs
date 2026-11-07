@@ -25,11 +25,21 @@ use std::time::{Duration, Instant};
 
 const URL: &str = "https://api.anthropic.com/api/oauth/usage";
 pub const CACHE_FILE: &str = "usage-cache.json";
-const MAX_AGE_MS: i64 = 5 * 60_000;
-const FORCE_MIN_AGE_MS: i64 = 30_000;
+/// Usage is read again once it's this old. The endpoint is undocumented and rate-limits hard: one
+/// request a minute drew 429s within minutes, so the base pace is slow and only the limit watch, near a
+/// threshold, asks sooner (`limits::max_age`).
+pub const MAX_AGE_MS: i64 = 10 * 60_000;
+/// The soonest any caller may ask again, such as the usage popover when it opens.
+pub const MIN_AGE_MS: i64 = 60_000;
+/// For an hour after a 429, nothing asks more often than every 5 minutes, so the pace that drew it
+/// doesn't come back the moment a request gets through.
+const CALM_FOR_MS: i64 = 60 * 60_000;
+const CALM_MIN_AGE_MS: i64 = 5 * 60_000;
+/// A 429 isn't reported while the last good numbers are younger than this: they're still good enough.
+const QUIET_429_MS: i64 = 15 * 60_000;
 /// Backoff after 429s in a row: 5, 10, 20, then 30 minutes. A longer Retry-After wins; a shorter one
 /// doesn't, since the endpoint has kept answering 429 for many minutes while asking for under a minute.
-const BACKOFF_FIRST_MS: i64 = MAX_AGE_MS;
+const BACKOFF_FIRST_MS: i64 = 5 * 60_000;
 const BACKOFF_MAX_MS: i64 = 30 * 60_000;
 /// Retry-After is honoured up to this, so a garbled value can't stop updates for good.
 const RETRY_AFTER_MAX_MS: i64 = 60 * 60_000;
@@ -76,6 +86,8 @@ struct Shared {
     retry_at: i64,
     /// 429s in a row, for the backoff.
     rate_limited: u32,
+    /// When the last 429 came, kept after later successes: for an hour after it, requests stay slow.
+    limited_at: i64,
     /// When some process last had Claude Code renew the token.
     renewed_at: i64,
     /// Why that renewal failed; cleared once a request works again.
@@ -105,13 +117,25 @@ enum Outcome {
     Failed(String),
 }
 
-/// Whether to ask the server now, or serve the cached numbers.
-fn should_fetch(s: &Shared, force: bool, now: i64) -> bool {
+/// Whether to ask the server now, for a caller that wants numbers at most `max_age` old, or serve the
+/// cached ones.
+fn should_fetch(s: &Shared, max_age: i64, now: i64) -> bool {
     if now < s.retry_at {
         return false;
     }
-    let age = now - s.asked_at;
-    age >= MAX_AGE_MS || (force && age >= FORCE_MIN_AGE_MS)
+    let floor = if now - s.limited_at < CALM_FOR_MS { CALM_MIN_AGE_MS } else { MIN_AGE_MS };
+    now - s.asked_at >= max_age.max(floor)
+}
+
+/// The usage to show: a 429 goes unmentioned while the numbers from before it are still recent.
+fn shown(s: &Shared, now: i64) -> Usage {
+    let mut u = s.usage.clone();
+    let has_numbers = u.five_hour.is_some() || u.seven_day.is_some();
+    // Only a 429 sets `retry_at`, and the next answer of any kind clears it.
+    if s.retry_at > 0 && has_numbers && now - u.fetched_at < QUIET_429_MS {
+        u.error = None;
+    }
+    u
 }
 
 /// Wait after the n-th 429 in a row (n ≥ 1), unless Retry-After asks for longer.
@@ -163,6 +187,7 @@ fn record(prev: Shared, outcome: Outcome, now: i64) -> Shared {
             asked_at: now,
             retry_at: 0,
             rate_limited: 0,
+            limited_at: prev.limited_at,
             renewed_at: prev.renewed_at,
             renew_error: None,
             sign_in_noticed: false,
@@ -172,7 +197,8 @@ fn record(prev: Shared, outcome: Outcome, now: i64) -> Shared {
             let n = prev.rate_limited + 1;
             let wait = backoff_ms(n).max(retry_after.map_or(0, |ms| ms.min(RETRY_AFTER_MAX_MS)));
             let retry_at = now + wait;
-            failed(format!("Usage requests rate-limited (HTTP 429); next try at {}", clock(retry_at)), retry_at, n, false)
+            let s = failed(format!("Usage requests rate-limited (HTTP 429); next try at {}", clock(retry_at)), retry_at, n, false);
+            Shared { limited_at: now, ..s }
         }
         Outcome::Expired => {
             let renew_failed = prev.renew_error.is_some();
@@ -195,29 +221,31 @@ impl UsageCache {
         UsageCache { file, mem: Mutex::new(Shared::default()) }
     }
 
-    /// A cache holding `u` from a minute ago: fresh for `get(false)`, stale enough that
-    /// `get(true)` would ask the server, so tests can tell the two apart without the network.
+    /// A cache holding `u` from 2 minutes ago: fresh for `get(MAX_AGE_MS)`, stale enough that
+    /// `get(MIN_AGE_MS)` would ask the server, so tests can tell the two apart without the network.
     #[cfg(test)]
     pub fn holding(u: Usage) -> Self {
-        let shared = Shared { usage: u, asked_at: now_ms() - 60_000, ..Shared::default() };
+        let shared = Shared { usage: u, asked_at: now_ms() - 2 * 60_000, ..Shared::default() };
         UsageCache { file: None, mem: Mutex::new(shared) }
     }
 
-    pub fn get(&self, force: bool) -> Usage {
-        self.get_with(force, now_ms(), request, renew)
+    /// Usage at most `max_age` old (`MAX_AGE_MS` for the base pace), asking the server if the cache is
+    /// older, within the limits above. A rate-limited or failed request returns the cache with its error.
+    pub fn get(&self, max_age: i64) -> Usage {
+        self.get_with(max_age, now_ms(), request, renew)
     }
 
     /// Holds the file lock while deciding, fetching and renewing, so other processes wait for the
     /// answer instead of asking (or renewing) too.
     fn get_with(
         &self,
-        force: bool,
+        max_age: i64,
         now: i64,
         mut request: impl FnMut() -> Outcome,
         renew: impl FnOnce() -> Result<(), String>,
     ) -> Usage {
         self.update(|shared| {
-            if should_fetch(shared, force, now) {
+            if should_fetch(shared, max_age, now) {
                 let mut outcome = request();
                 if matches!(outcome, Outcome::Expired) && now - shared.renewed_at >= RENEW_EVERY_MS {
                     shared.renewed_at = now;
@@ -231,7 +259,7 @@ impl UsageCache {
                 }
                 *shared = record(shared.clone(), outcome, now);
             }
-            shared.usage.clone()
+            shown(shared, now)
         })
     }
 
@@ -500,12 +528,33 @@ mod tests {
     fn freshness() {
         let s = Shared { asked_at: 1_000 * MIN, ..Default::default() };
         let at = |m: i64| 1_000 * MIN + m;
-        assert!(should_fetch(&Shared::default(), false, at(0)));
-        assert!(!should_fetch(&s, false, at(4 * MIN)) && should_fetch(&s, false, at(5 * MIN)));
-        assert!(!should_fetch(&s, true, at(29_000)) && should_fetch(&s, true, at(30_000)));
-        // During backoff nothing fetches, forced or not.
+        assert!(should_fetch(&Shared::default(), MAX_AGE_MS, at(0)));
+        assert!(!should_fetch(&s, MAX_AGE_MS, at(9 * MIN)) && should_fetch(&s, MAX_AGE_MS, at(10 * MIN)));
+        // Nobody asks more often than once a minute, however fresh they want it.
+        assert!(!should_fetch(&s, 0, at(59_000)) && should_fetch(&s, 0, at(MIN)));
+        // During backoff nothing fetches.
         let s = Shared { retry_at: at(20 * MIN), ..s };
-        assert!(!should_fetch(&s, true, at(19 * MIN)) && should_fetch(&s, false, at(20 * MIN)));
+        assert!(!should_fetch(&s, MIN_AGE_MS, at(19 * MIN)) && should_fetch(&s, MAX_AGE_MS, at(20 * MIN)));
+        // For an hour after a 429, every 5 minutes at most.
+        let s = Shared { retry_at: 0, limited_at: at(0), asked_at: at(MIN), ..s };
+        assert!(!should_fetch(&s, MIN_AGE_MS, at(5 * MIN)) && should_fetch(&s, MIN_AGE_MS, at(6 * MIN)));
+        let s = Shared { asked_at: at(56 * MIN), ..s };
+        assert!(!should_fetch(&s, MIN_AGE_MS, at(59 * MIN)) && should_fetch(&s, MIN_AGE_MS, at(61 * MIN)));
+    }
+
+    #[test]
+    fn a_429_with_recent_numbers_goes_unmentioned() {
+        let now = 1_000 * MIN;
+        let good = record(Shared::default(), ok(42.0), now);
+        let s = record(good, Outcome::RateLimited(None), now + 10 * MIN);
+        assert_eq!(s.limited_at, now + 10 * MIN);
+        assert_eq!(shown(&s, now + 14 * MIN).error, None);
+        assert!(shown(&s, now + 15 * MIN).error.is_some_and(|e| e.contains("HTTP 429")));
+        // Other errors always show, and so does a 429 with no numbers to fall back on.
+        assert!(shown(&record(s.clone(), Outcome::Failed("x".into()), now + 11 * MIN), now + 11 * MIN).error.is_some());
+        assert!(shown(&record(Shared::default(), Outcome::RateLimited(None), now), now).error.is_some());
+        // The calm hour outlasts the success that follows.
+        assert_eq!(record(s, ok(50.0), now + 20 * MIN).limited_at, now + 10 * MIN);
     }
 
     #[test]
@@ -556,7 +605,7 @@ mod tests {
         let run = |at: i64, outcomes: Vec<Outcome>, renewal: Result<(), String>| {
             script.borrow_mut().extend(outcomes);
             let next = || script.borrow_mut().pop_front().expect("one request too many");
-            let u = cache.get_with(false, at, next, || {
+            let u = cache.get_with(MIN_AGE_MS, at, next, || {
                 renewals.set(renewals.get() + 1);
                 renewal
             });
@@ -593,7 +642,7 @@ mod tests {
         let now = 1_000 * MIN;
         let get = |at: i64, outcome: Outcome| {
             let mut outcome = Some(outcome);
-            cache.get_with(false, at, || outcome.take().expect("one request"), || panic!("signed out: nothing to renew"))
+            cache.get_with(MIN_AGE_MS, at, || outcome.take().expect("one request"), || panic!("signed out: nothing to renew"))
         };
         get(now, ok(10.0));
         assert_eq!(cache.claim_notice(now), None, "nothing to tell while signed in");
@@ -621,7 +670,7 @@ mod tests {
         let mut get = |ends: i64| {
             at += 10 * MIN;
             let mut outcome = Some(Outcome::Usage(None, None, Some(ends)));
-            cache.get_with(false, at, || outcome.take().expect("one request"), || panic!("nothing to renew"));
+            cache.get_with(MIN_AGE_MS, at, || outcome.take().expect("one request"), || panic!("nothing to renew"));
         };
         get(ends);
         assert_eq!(cache.claim_notice(ends - 2 * DAY), None, "too early");
@@ -647,16 +696,25 @@ mod tests {
             o
         };
         let now = 1_000 * MIN;
-        assert_eq!(a.get_with(false, now, || fetch(ok(10.0)), no_renew).five_hour.unwrap().percent, 10.0);
+        let get = |c: &UsageCache, max_age: i64, at: i64, o: Outcome| {
+            let mut o = Some(o);
+            c.get_with(max_age, at, || fetch(o.take().expect("one request")), no_renew)
+        };
+        assert_eq!(get(&a, MAX_AGE_MS, now, ok(10.0)).five_hour.unwrap().percent, 10.0);
         // B reads A's answer from the file instead of asking.
-        assert_eq!(b.get_with(false, now + MIN, || fetch(ok(99.0)), no_renew).five_hour.unwrap().percent, 10.0);
+        assert_eq!(get(&b, MAX_AGE_MS, now + MIN, ok(99.0)).five_hour.unwrap().percent, 10.0);
         assert_eq!(calls.get(), 1);
         // A 429 seen by B holds A back too, and both keep showing the numbers.
-        let u = b.get_with(false, now + 5 * MIN, || fetch(Outcome::RateLimited(None)), no_renew);
-        assert!(u.error.is_some() && u.five_hour.is_some());
-        let u = a.get_with(true, now + 9 * MIN, || fetch(ok(99.0)), no_renew);
+        let u = get(&b, MAX_AGE_MS, now + 10 * MIN, Outcome::RateLimited(None));
+        assert_eq!((u.error, u.five_hour.map(|w| w.percent)), (None, Some(10.0)));
+        let u = get(&a, MIN_AGE_MS, now + 14 * MIN, ok(99.0));
         assert_eq!((calls.get(), u.five_hour.unwrap().percent), (2, 10.0));
-        assert_eq!(a.get_with(false, now + 10 * MIN, || fetch(ok(20.0)), no_renew).error, None);
+        // Past the backoff the numbers are old enough for the error to show, until a request works.
+        assert!(get(&a, MAX_AGE_MS, now + 16 * MIN, ok(20.0)).error.is_some());
+        assert_eq!(get(&a, MIN_AGE_MS, now + 16 * MIN, ok(20.0)).error, None);
+        // Then the calm hour: B can't ask again within 5 minutes.
+        assert_eq!(get(&b, MIN_AGE_MS, now + 20 * MIN, ok(30.0)).five_hour.unwrap().percent, 20.0);
+        assert_eq!(calls.get(), 3);
         assert!(!std::fs::read_to_string(&path).unwrap().contains("Bearer"));
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -61,25 +61,32 @@ pub(crate) fn dev_name() -> Option<String> {
     Some(checkout.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect())
 }
 
-/// Keeps the usage-limit alert file in step with plan usage: refetched every 5 minutes, or every
-/// minute near a threshold. Tells the UI when a new alert goes out to sessions. Dev builds skip the
-/// 1-minute refetch: their alerts go to a file no hook reads.
+/// Keeps the usage-limit alert file in step with plan usage: read every 10 minutes, or sooner when a
+/// window is on course to reach its threshold (`limits::max_age`). Tells the UI when a new alert goes
+/// out to sessions. Dev builds keep the 10 minutes: their alerts go to a file no hook reads.
 fn start_limit_watch(app: tauri::AppHandle) {
     let installed = dev_name().is_none();
     std::thread::Builder::new()
         .name("navarch-limits".into())
         .spawn(move || {
-            let mut near = false;
+            let mut max_age = usage::MAX_AGE_MS;
+            // The last two good readings, for how fast usage rises.
+            let (mut prev, mut last): (Option<usage::Usage>, Option<usage::Usage>) = (None, None);
             loop {
                 let st = app.state::<AppState>();
-                let usage = st.usage.get(near && installed);
+                let usage = st.usage.get(max_age);
                 if let Some(notice) = st.usage.claim_notice(db::now_ms()) {
                     notify(&app, notice);
                 }
                 // A failed fetch says nothing about usage: keep the alert as it is.
                 if usage.error.is_none() {
+                    if last.as_ref().is_none_or(|l| l.fetched_at != usage.fetched_at) {
+                        prev = last.replace(usage.clone());
+                    }
                     if let Ok(mut w) = st.limits.lock() {
-                        near = limits::near(&usage, &w.thresholds);
+                        if installed {
+                            max_age = limits::max_age(prev.as_ref(), &usage, &w.thresholds);
+                        }
                         if let Some(summary) = w.update(&usage) {
                             let _ = app.emit("limit-alert", summary);
                         }

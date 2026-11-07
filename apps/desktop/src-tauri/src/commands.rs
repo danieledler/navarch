@@ -262,9 +262,11 @@ pub async fn get_build_info(state: S<'_>) -> Res<BuildInfo> {
 }
 
 #[tauri::command]
+/// `force` (the usage popover) wants numbers at most a minute old; otherwise the base pace will do.
 pub async fn get_usage(state: S<'_>, force: bool) -> Res<Usage> {
     let cache = state.usage.clone();
-    tauri::async_runtime::spawn_blocking(move || cache.get(force)).await.map_err(db::err)
+    let max_age = if force { usage::MIN_AGE_MS } else { usage::MAX_AGE_MS };
+    tauri::async_runtime::spawn_blocking(move || cache.get(max_age)).await.map_err(db::err)
 }
 
 /// Starts Claude Code's sign-in, which opens the browser; `claude-sign-in` says how it ended (null when
@@ -294,7 +296,7 @@ pub async fn set_limit_thresholds(state: S<'_>, thresholds: Thresholds) -> Res<l
     }
     with_db!(state, |c| limits::save(c, &thresholds))?;
     let cache = state.usage.clone();
-    let usage = tauri::async_runtime::spawn_blocking(move || cache.get(false)).await.map_err(db::err)?;
+    let usage = tauri::async_runtime::spawn_blocking(move || cache.get(usage::MAX_AGE_MS)).await.map_err(db::err)?;
     let mut w = state.limits.lock().map_err(db::err)?;
     w.thresholds = thresholds;
     if usage.error.is_none() {

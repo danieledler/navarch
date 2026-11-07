@@ -84,7 +84,7 @@ pub fn dispatch(st: &AppState, cmd: &str, a: Value) -> Result<Value, Failure> {
         "get_snapshot" => out(core::get_snapshot(st)),
         "get_sessions" => out(core::get_sessions(st).map(|l| slim_sessions(l, chrono::Local::now().date_naive()))),
         // Never forced: the phone mustn't drive Anthropic's usage endpoint.
-        "get_usage" => out(Ok(st.usage.get(false))),
+        "get_usage" => out(Ok(st.usage.get(crate::usage::MAX_AGE_MS))),
         "get_limit_alerts" => out(core::get_limit_alerts(st)),
         "create_task" => {
             let a: CreateTask = args(a)?;
