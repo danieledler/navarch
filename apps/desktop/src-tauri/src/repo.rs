@@ -260,6 +260,130 @@ pub fn overview(path: &str, force: bool) -> Option<RepoOverview> {
     Some(RepoOverview { root, base, branch: main.branch.clone(), worktrees, github, github_error })
 }
 
+// ── Repos of a project folder ──
+
+/// One git repo of a project folder (`RepoRef` in types.ts).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoRef {
+    pub root: String,
+    pub rel: String,
+    pub name: String,
+    pub github: Option<String>,
+    pub committed_at: i64,
+}
+
+/// Folders never searched for repos (besides dot-folders): dependencies, build output, environments.
+const SKIP_DIRS: &[&str] =
+    &["node_modules", "target", "dist", "build", "venv", "env", "__pycache__", "Pods", "vendor", "site-packages"];
+/// Directory entries read at most while looking for repos, so a huge folder costs little.
+const MAX_ENTRIES: usize = 2000;
+const MAX_REPOS: usize = 12;
+
+/// The git repos of a project folder: the one it is in (rel ""), then those 1–2 folders below it, worktrees
+/// resolved to their main checkout and duplicates dropped, most recent commit first, at most 12. Local only.
+pub fn find_repos(path: &str) -> Vec<RepoRef> {
+    // Git reports real paths (/private/var/… for /var/…), so compare against the real folder.
+    let base = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    let (containing_id, containing) = main_checkout(path).unzip();
+    let candidates = repo_dirs(&base);
+    // (identity, root) pairs; worktrees of one bare repo share the identity, so keep one root per repo
+    // (the lexicographically first worktree).
+    let mut found: Vec<(String, String)> =
+        par_map(&candidates, |d| d.to_str().and_then(main_checkout)).into_iter().flatten().collect();
+    found.sort();
+    found.dedup_by(|a, b| a.0 == b.0);
+    found.retain(|(id, _)| Some(id) != containing_id.as_ref());
+    let roots: Vec<String> = found.into_iter().map(|(_, r)| r).collect();
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty());
+    let rel_of = |root: &str| match Path::new(root).strip_prefix(&base) {
+        Ok(r) => r.to_string_lossy().into_owned(),
+        Err(_) => match home.as_deref().and_then(|h| root.strip_prefix(h)) {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
+            _ => root.to_string(),
+        },
+    };
+    let all: Vec<(String, String)> = containing
+        .iter()
+        .map(|r| (r.clone(), String::new()))
+        .chain(roots.iter().map(|r| (r.clone(), rel_of(r))))
+        .collect();
+    let mut out = par_map(&all, |(root, rel)| {
+        let github = git(root, &["remote", "-v"]).and_then(|r| slug_from_remotes(&r));
+        let committed_at =
+            git(root, &["log", "-1", "--format=%ct"]).and_then(|s| s.trim().parse::<i64>().ok()).map_or(0, |s| s * 1000);
+        let name = if rel.is_empty() { root.rsplit('/').next().unwrap_or(root).to_string() } else { rel.clone() };
+        RepoRef { root: root.clone(), rel: rel.clone(), name, github, committed_at }
+    });
+    let first = (containing.is_some() as usize).min(out.len());
+    out[first..].sort_by(|a, b| b.committed_at.cmp(&a.committed_at).then_with(|| a.rel.cmp(&b.rel)));
+    out.truncate(MAX_REPOS);
+    out
+}
+
+/// The repo `dir` is in, as (identity, root): the identity is the main entry's path (the bare repo when the main
+/// one is bare, shared by all its worktrees), the root its main checkout (the worktree itself when the main one is bare).
+fn main_checkout(dir: &str) -> Option<(String, String)> {
+    let entries = parse_worktrees(&git(dir, &["worktree", "list", "--porcelain"])?);
+    let e = entries.first()?;
+    let root = if !e.bare {
+        e.path.clone()
+    } else {
+        git(dir, &["rev-parse", "--show-toplevel"]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?
+    };
+    Some((e.path.clone(), root))
+}
+
+/// Folders 1–2 levels below `base` that hold a `.git` (a folder, or a file for worktrees and submodules).
+/// Skips dot-folders, `SKIP_DIRS` and symlinks; reads at most `MAX_ENTRIES` entries in all.
+fn repo_dirs(base: &Path) -> Vec<PathBuf> {
+    let mut seen = 0;
+    let mut subdirs = |dir: &Path| -> Vec<PathBuf> {
+        let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
+        let mut out = vec![];
+        for e in rd.flatten() {
+            if seen >= MAX_ENTRIES {
+                break;
+            }
+            seen += 1;
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            // DirEntry::file_type doesn't follow symlinks, so a link to a folder isn't a dir here.
+            if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) || !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            out.push(e.path());
+        }
+        out.sort();
+        out
+    };
+    let is_repo = |d: &Path| d.join(".git").symlink_metadata().is_ok();
+    let mut found = vec![];
+    for d1 in subdirs(base) {
+        if is_repo(&d1) {
+            found.push(d1.clone());
+        }
+        found.extend(subdirs(&d1).into_iter().filter(|d2| is_repo(d2)));
+    }
+    found
+}
+
+/// `f` over `items` on up to 8 threads, results in order.
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    const THREADS: usize = 8;
+    let n = THREADS.min(items.len()).max(1);
+    let f = &f;
+    let mut parts: Vec<Vec<(usize, R)>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..n)
+            .map(|k| s.spawn(move || items.iter().enumerate().skip(k).step_by(n).map(|(i, t)| (i, f(t))).collect()))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+    });
+    let mut all: Vec<(usize, R)> = parts.drain(..).flatten().collect();
+    all.sort_by_key(|(i, _)| *i);
+    all.into_iter().map(|(_, r)| r).collect()
+}
+
 /// Runs git in `dir`; its stdout when it exits 0 in time.
 fn git(dir: &str, args: &[&str]) -> Option<String> {
     let mut all = vec!["--no-optional-locks", "-C", dir, "-c", "core.quotepath=off"];
@@ -1042,6 +1166,54 @@ mod tests {
         assert!(d.commits_ahead.is_empty());
 
         assert!(overview(std::env::temp_dir().to_str().unwrap(), false).is_none());
+    }
+
+    #[test]
+    fn finds_repos_below_a_folder() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("navarch-find-test-{}-{nanos}", std::process::id()));
+        let repo = |rel: &str| {
+            let d = dir.join(rel);
+            std::fs::create_dir_all(&d).unwrap();
+            sh(&d, &["init", "-q", "-b", "main"]);
+            sh(&d, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        };
+        for r in ["project/a", "project/b/c", "project/.hidden/r", "project/node_modules/x", "project/d/e/f"] {
+            repo(r);
+        }
+        sh(&dir.join("project/a"), &["worktree", "add", "-q", "-b", "feat", "../wt"]);
+        // The project folder is itself inside a repo, with a repo below it.
+        repo("outer");
+        repo("outer/sub/g");
+
+        let project = dir.join("project");
+        let found = find_repos(project.to_str().unwrap());
+        let outer = find_repos(dir.join("outer/sub").to_str().unwrap());
+        std::fs::create_dir_all(dir.join("empty/x/y")).unwrap();
+        let none = find_repos(dir.join("empty").to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut rels: Vec<&str> = found.iter().map(|r| r.rel.as_str()).collect();
+        rels.sort();
+        assert_eq!(rels, vec!["a", "b/c"], "{found:?}");
+        let a = found.iter().find(|r| r.rel == "a").unwrap();
+        assert!(a.root.ends_with("/project/a") && a.name == "a" && a.github.is_none() && a.committed_at > 0, "{a:?}");
+
+        assert_eq!(outer.iter().map(|r| r.rel.as_str()).collect::<Vec<_>>(), vec!["", "g"], "{outer:?}");
+        assert!(outer[0].root.ends_with("/outer") && outer[0].name == "outer", "{outer:?}");
+
+        assert!(none.is_empty(), "{none:?}");
+    }
+
+    #[test]
+    #[ignore = "live: lists the repos of this Mac's project folders"]
+    fn find_repos_live() {
+        for p in ["/Users/daniel/dev/projects/icelab/paper-projects/bioregions2", "/Users/daniel/dev/planning/Navarch"] {
+            println!("{p}");
+            for r in find_repos(p) {
+                println!("  {:?} name {} github {:?} committed {}", r.rel, r.name, r.github, r.committed_at > 0);
+            }
+        }
     }
 
     #[test]

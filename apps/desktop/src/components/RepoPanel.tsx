@@ -3,15 +3,15 @@
 // row shows a hover card with the details.
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
-  ArrowDown, ArrowUp, BadgeCheck, Check, ChevronRight, CircleDot, Copy, Eye, ExternalLink, FileDiff, FolderGit2, FolderOpen,
+  ArrowDown, ArrowUp, BadgeCheck, Check, ChevronDown, ChevronRight, CircleDot, Copy, Eye, ExternalLink, FileDiff, FolderGit2, FolderOpen,
   GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft, Lock, MessageSquare, Minus, RefreshCw, SquareTerminal,
   TriangleAlert, X, Zap,
 } from "lucide-react";
-import { api, type CheckState, type GitHubInfo, type Issue, type Label, type PullRequest, type Reviewer, type Session } from "../api";
-import { useModel, useStore } from "../store";
+import { api, type CheckState, type GitHubInfo, type Issue, type Label, type PullRequest, type RepoOverview, type RepoRef, type Reviewer, type Session } from "../api";
+import { chosenRepo, useModel, useStore } from "../store";
 import { baseName, plainText, relTime, shortPath } from "../lib/format";
 import { linkRepo, type LinkedIssue, type LinkedPull, type LinkedRepo, type LinkedWorktree } from "../lib/repo";
-import { IconButton, STATUS_LABEL, StatusDot } from "./ui";
+import { IconButton, Popover, STATUS_LABEL, StatusDot } from "./ui";
 import { HoverCard, useHoverCard } from "./HoverCard";
 
 const MIN_H = 120; // panel
@@ -27,7 +27,15 @@ function useAct() {
 }
 
 export function RepoPanel({ path }: { path: string }) {
-  const st = useStore((s) => s.repos[path]);
+  // The project folder may be a repo, sit inside one, or hold several (1–2 folders down): the panel shows one of them.
+  const list = useStore((s) => s.repoLists[path]);
+  const saved = useStore((s) => s.repoOfProject[path]);
+  const findRepos = useStore((s) => s.findRepos);
+  const selectRepo = useStore((s) => s.selectRepo);
+  const repos = list?.repos ?? [];
+  const chosen = chosenRepo(repos, saved);
+  const root = chosen?.root ?? null;
+  const st = useStore((s) => (root ? s.repos[root] : undefined));
   const sessions = useStore((s) => s.sessions);
   const loadRepo = useStore((s) => s.loadRepo);
   const panel = useStore((s) => s.repoPanel);
@@ -41,22 +49,33 @@ export function RepoPanel({ path }: { path: string }) {
   const hc = useHoverCard();
 
   const data = st?.data ?? null;
-  const open = panel.open && data != null;
+  // Keep the panel open while the chosen repo's first overview loads (gh calls can take seconds), so the view above
+  // doesn't jump.
+  const loadingChosen = panel.open && root != null && !data && !st?.error && !(st && st.at > 0);
+  const open = panel.open && (data != null || loadingChosen);
 
-  // Load on mount and when the folder changes; then poll while the window is visible (slower while folded).
+  // Look for the folder's repos on mount, when it changes and when the window comes back; load the chosen repo
+  // when it changes, then poll it while the window is visible (slower while folded).
   useEffect(() => {
-    void loadRepo(path);
-  }, [path, loadRepo]);
+    void findRepos(path);
+  }, [path, findRepos]);
+  useEffect(() => {
+    if (root) void loadRepo(root);
+  }, [root, loadRepo]);
   useEffect(() => {
     const visible = () => document.visibilityState === "visible";
-    const iv = window.setInterval(() => visible() && void loadRepo(path), panel.open ? 30_000 : 120_000);
-    const onVis = () => visible() && void loadRepo(path);
+    const iv = window.setInterval(() => visible() && root && void loadRepo(root), panel.open ? 30_000 : 120_000);
+    const onVis = () => {
+      if (!visible()) return;
+      void findRepos(path);
+      if (root) void loadRepo(root);
+    };
     document.addEventListener("visibilitychange", onVis);
     return () => {
       clearInterval(iv);
       document.removeEventListener("visibilitychange", onVis);
     };
-  }, [path, panel.open, loadRepo]);
+  }, [path, root, panel.open, loadRepo, findRepos]);
 
   useEffect(() => {
     const el = rootRef.current;
@@ -68,14 +87,15 @@ export function RepoPanel({ path }: { path: string }) {
 
   const linked = useMemo(() => (data ? linkRepo(data, sessions) : null), [data, sessions]);
 
-  // Loaded, and the folder isn't in a git repo.
-  if (st && st.at > 0 && data === null) return null;
+  // Loaded, and the folder neither is in a git repo nor holds one (or the chosen one is gone).
+  if (list && repos.length === 0) return null;
+  if (st && st.at > 0 && data === null && repos.length <= 1) return null;
 
   const gh = data?.github ?? null;
   const h = Math.max(MIN_H, dragH ?? panel.height);
 
   const onDividerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!open || e.button !== 0) return;
+    if (!open || !data || e.button !== 0) return;
     const root = rootRef.current;
     const above = root?.previousElementSibling as HTMLElement | null;
     if (!root) return;
@@ -103,7 +123,7 @@ export function RepoPanel({ path }: { path: string }) {
   const toggle = () => {
     hc.hide();
     // Folded, it polls only every 2 min: refresh on unfolding.
-    if (!panel.open) void loadRepo(path);
+    if (!panel.open && root) void loadRepo(root);
     setRepoPanel({ open: !panel.open });
   };
 
@@ -131,16 +151,36 @@ export function RepoPanel({ path }: { path: string }) {
         className="repo-divider"
         onPointerDown={onDividerDown}
         onDoubleClick={() => data && toggle()}
-        title={open ? "Drag to resize · double-click to fold" : data ? "Double-click to unfold" : undefined}
+        title={open && data ? "Drag to resize · double-click to fold" : data ? "Double-click to unfold" : undefined}
       />
       <div className="repo-head">
         <button type="button" className="section-toggle" onClick={() => data && toggle()} disabled={!data} aria-expanded={open}>
           <ChevronRight size={14} className={open ? "rot" : ""} />
           Repo
         </button>
+        {repos.length > 1 && chosen && (
+          <>
+            <RepoPicker
+              repos={repos}
+              chosen={chosen}
+              onPick={(r) => {
+                hc.hide();
+                selectRepo(path, r.root);
+              }}
+            />
+            {(gh || chosen.github) && (
+              <IconButton
+                icon={<ExternalLink size={12} />}
+                label={`Open ${gh?.repo ?? chosen.github} on GitHub`}
+                className="repo-open-gh"
+                onClick={() => act(api.openUrl(gh?.url ?? `https://github.com/${chosen.github}`))}
+              />
+            )}
+          </>
+        )}
         {data && (
           <>
-            {gh ? (
+            {repos.length > 1 ? null : gh ? (
               <button type="button" className="repo-name" title={`Open ${gh.url}`} onClick={() => act(api.openUrl(gh.url))}>
                 {gh.repo}
               </button>
@@ -153,7 +193,9 @@ export function RepoPanel({ path }: { path: string }) {
             <span className="repo-counts">{counts.join(" · ")}</span>
           </>
         )}
-        {!data && <span className="repo-counts">{st?.error ? "Couldn’t read the repo" : "Loading…"}</span>}
+        {!data && (
+          <span className="repo-counts">{st?.error ? "Couldn’t read the repo" : st && st.at > 0 ? "Not a git repo any more" : "Loading…"}</span>
+        )}
         <span className="repo-head-end">
           {data?.githubError && gh && (
             <span className="repo-stale" title={`GitHub data from ${new Date(gh.fetchedAt).toLocaleString()}. Refresh failed: ${data.githubError}`}>
@@ -167,7 +209,10 @@ export function RepoPanel({ path }: { path: string }) {
             icon={<RefreshCw size={13} />}
             label="Refresh from git and GitHub"
             className={st?.loading ? "spin" : ""}
-            onClick={() => void loadRepo(path, true)}
+            onClick={() => {
+              void findRepos(path);
+              if (root) void loadRepo(root, true);
+            }}
           />
         </span>
       </div>
@@ -187,6 +232,8 @@ export function RepoPanel({ path }: { path: string }) {
         />
       )}
 
+      {open && !data && <div className="repo-body is-loading"><div className="repo-note">Loading…</div></div>}
+
       {open && linked && hc.open && (
         <CardFor k={hc.open.key} linked={linked} gh={gh} base={data!.base} rect={hc.open.rect} hc={hc} />
       )}
@@ -195,6 +242,75 @@ export function RepoPanel({ path }: { path: string }) {
 }
 
 type HC = ReturnType<typeof useHoverCard>;
+
+/** Picks which of a folder's repos the panel shows; each item lists what's cached for it. */
+function RepoPicker({ repos, chosen, onPick }: { repos: RepoRef[]; chosen: RepoRef; onPick: (r: RepoRef) => void }) {
+  const ref = useRef<HTMLButtonElement>(null);
+  const [open, setOpen] = useState(false);
+  const cached = useStore((s) => s.repos);
+  const repoPart = chosen.github?.split("/").pop();
+  return (
+    <>
+      <button
+        ref={ref}
+        type="button"
+        className={`repo-pick ${open ? "is-active" : ""}`}
+        title={`${chosen.root}\nSwitch between the ${repos.length} repos in this folder`}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+      >
+        <span className="repo-pick-name">{chosen.name}</span>
+        {chosen.github && repoPart !== chosen.name && <span className="repo-pick-slug">{chosen.github}</span>}
+        <ChevronDown size={12} />
+      </button>
+      {open && (
+        <Popover anchor={ref} anchorIsTrigger onClose={() => setOpen(false)} className="menu repo-menu">
+          {repos.map((r) => {
+            const o = cached[r.root]?.data;
+            return (
+              <button
+                key={r.root}
+                type="button"
+                role="menuitemradio"
+                aria-checked={r.root === chosen.root}
+                className="menu-item repo-menu-item"
+                title={r.root}
+                onClick={() => {
+                  setOpen(false);
+                  if (r.root !== chosen.root) onPick(r);
+                }}
+              >
+                <span className="menu-icon">{r.root === chosen.root && <Check size={14} />}</span>
+                <span className="rm-main">
+                  <span className="rm-top">
+                    <span className="rm-name">{r.name}</span>
+                    <span className="menu-hint" title={r.committedAt ? `Last commit ${new Date(r.committedAt).toLocaleString()}` : undefined}>
+                      {r.committedAt ? relTime(r.committedAt) : "no commits"}
+                    </span>
+                  </span>
+                  <span className="rm-sub">
+                    <span className={r.github ? "rm-slug" : "rm-slug is-none"}>{r.github ?? "no GitHub remote"}</span>
+                    {o && <span className="rm-counts">{overviewCounts(o)}</span>}
+                  </span>
+                </span>
+              </button>
+            );
+          })}
+        </Popover>
+      )}
+    </>
+  );
+}
+
+const overviewCounts = (o: RepoOverview) =>
+  [
+    o.github && plural(o.github.pulls.length, "PR"),
+    o.github && plural(o.github.issues.length, "issue"),
+    plural(o.worktrees.length, "worktree"),
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
 function RepoBody({
   linked, gh, githubError, base, narrow, tab, setTab, showDone, setShowDone, hc,

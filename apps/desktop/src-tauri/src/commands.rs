@@ -367,6 +367,13 @@ pub async fn get_repo_overview(path: String, force: bool) -> Res<Option<crate::r
     tauri::async_runtime::spawn_blocking(move || crate::repo::overview(&path, force)).await.map_err(db::err)
 }
 
+/// The git repos of a project folder for the Repo panel's picker: the one it is in, then those 1–2 folders
+/// below it, most recent commit first. Local only.
+#[tauri::command]
+pub async fn find_repos(path: String) -> Res<Vec<crate::repo::RepoRef>> {
+    tauri::async_runtime::spawn_blocking(move || crate::repo::find_repos(&path)).await.map_err(db::err)
+}
+
 /// Opens a GitHub page (a pull request, an issue) in the browser.
 #[tauri::command]
 pub async fn open_url(url: String) -> Res<()> {

@@ -3,7 +3,7 @@
 // Add ?reset to the URL to reseed.
 import type { Api } from "./index";
 import type { CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Tailscale, TailscaleServe, Session, Snapshot, SystemStats, Task, Usage } from "./types";
-import { DEMO_PICK_FOLDER, demoRepoOverview, demoSessions, demoSnapshot } from "./demo";
+import { DEMO_PICK_FOLDER, demoFindRepos, demoRepoOverview, demoSessions, demoSnapshot } from "./demo";
 
 const KEY = "navarch-mock-v2";
 
@@ -247,6 +247,10 @@ export function mockApi(): Api {
       const o = demoRepoOverview(path);
       if (o?.github && force) o.github.fetchedAt = Date.now();
       return o;
+    },
+    findRepos: async (path) => {
+      await new Promise((r) => setTimeout(r, 80));
+      return demoFindRepos(path);
     },
     openUrl: async (url) => {
       if (import.meta.env.PROD) throw "In the app this opens it on GitHub. The demo's repos are made up.";

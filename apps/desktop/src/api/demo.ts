@@ -1,7 +1,7 @@
 // The demo dataset: one fictional developer, Robin, with work, open-source and personal projects.
 // Shared by the mock backend (`pnpm dev`), the landing page's live demo and the UI walkthrough/e2e tests.
 // Everything here is invented; dates are relative to today so deadlines, the week log and the OKR period stay current.
-import type { CheckState, Id, Issue, Label, Period, PullRequest, RepoOverview, Session, SessionStatus, Snapshot, Task, Worktree } from "./types";
+import type { CheckState, Id, Issue, Label, Period, PullRequest, RepoOverview, RepoRef, Session, SessionStatus, Snapshot, Task, Worktree } from "./types";
 import { addDays, dayStr, isoWeek, parseDay, today, weekStart } from "../lib/dates";
 
 export const DEMO_HOME = "/Users/robin";
@@ -335,18 +335,42 @@ const L = {
 
 const CHECK_ORDER = { failure: 0, pending: 1, success: 2, neutral: 3 } as const;
 
+// The talk's folder isn't a repo itself: it holds three (the demo app, the slides, and notes with no GitHub remote).
+const TALK = `${DEMO_HOME}/writing/local-first-talk`;
+/** Demo repo roots: [root, GitHub slug or null, HEAD commit hours ago]. */
+const DEMO_REPOS: [string, string | null, number][] = [
+  [`${DEMO_HOME}/code/shiftwren-web`, "robin-lab/shiftwren-web", 0.4],
+  [`${DEMO_HOME}/oss/knotfile`, "robin-lab/knotfile", 20],
+  [`${DEMO_HOME}/games/pixel-orchard`, null, 48],
+  [`${TALK}/demo-app`, "robin-lab/syncpad", 1.6],
+  [`${TALK}/slides`, "robin-lab/local-first-talk", 26],
+  [`${TALK}/notes`, null, 140],
+];
+
+/** The git repos of a demo project folder, as `find_repos` would report them. */
+export function demoFindRepos(path: string): RepoRef[] {
+  const p = path.replace(/\/+$/, "");
+  const ref = ([root, github, hours]: [string, string | null, number], rel: string): RepoRef => ({
+    root, rel, name: rel || root.split("/").pop()!, github, committedAt: Date.now() - hours * 36e5,
+  });
+  const inside = DEMO_REPOS.find(([r]) => p === r || p.startsWith(r + "/"));
+  const below = DEMO_REPOS.filter(([r]) => r.startsWith(p + "/") && r.slice(p.length + 1).split("/").length <= 2)
+    .map((x) => ref(x, x[0].slice(p.length + 1)))
+    .sort((a, b) => b.committedAt - a.committedAt);
+  return [...(inside ? [ref(inside, "")] : []), ...below].slice(0, 12);
+}
+
 /** The repo behind a demo project folder (or a folder inside it), as `get_repo_overview` would report it. */
 export function demoRepoOverview(path: string): RepoOverview | null {
   const now = Date.now();
   const m = (n: number) => now - n * 6e4;
   const h = (n: number) => now - n * 36e5;
   const d = (n: number) => now - n * 864e5;
-  const root = [`${DEMO_HOME}/code/shiftwren-web`, `${DEMO_HOME}/oss/knotfile`, `${DEMO_HOME}/games/pixel-orchard`].find(
-    (r) => path.replace(/\/+$/, "") === r || path.startsWith(r + "/"),
-  );
-  if (!root) return null;
+  const known = DEMO_REPOS.find(([r]) => path.replace(/\/+$/, "") === r || path.startsWith(r + "/"));
+  if (!known) return null;
+  const root = known[0];
   const name = root.split("/").pop()!;
-  const slug = `robin-lab/${name}`;
+  const slug = known[1] ?? `robin-lab/${name}`;
   const gh = `https://github.com/${slug}`;
 
   const checks = (spec: string) =>
@@ -608,6 +632,64 @@ export function demoRepoOverview(path: string): RepoOverview | null {
       root, base: "main", branch: "main", worktrees, githubError: null,
       github: { repo: slug, url: gh, pulls, recentPulls, issues, fetchedAt: m(3) },
     };
+  }
+
+  if (name === "demo-app") {
+    const pulls = [
+      pr({
+        number: 14, title: "Offline toggle that pauses the sync socket", headRef: "offline-toggle",
+        createdAt: h(20), updatedAt: m(95), additions: 118, deletions: 22, changedFiles: 4, commits: 3, review: null,
+        checks: checks("build, test"), body: "A switch in the corner so the audience sees edits pile up while offline.",
+      }),
+      pr({
+        number: 12, title: "Show each peer's cursor in its own colour", headRef: "peer-cursors", author: "ana-sousa", isDraft: true,
+        createdAt: d(4), updatedAt: d(1), additions: 64, deletions: 9, changedFiles: 2, commits: 1, review: null, mergeState: "draft",
+        checks: checks("build, test:pending"),
+      }),
+    ];
+    const recentPulls = [
+      pr({
+        number: 11, title: "Shared text demo on Automerge", headRef: "crdt-text", state: "merged",
+        createdAt: d(5), updatedAt: d(2), mergedAt: d(2), closedAt: d(2), additions: 402, deletions: 31, changedFiles: 9, commits: 6,
+        review: "approved", reviewers: [{ login: "ana-sousa", state: "approved" }], checks: checks("build, test"),
+      }),
+    ];
+    const issues = [
+      issue({ number: 13, title: "Conflicting edits flash on reconnect", createdAt: d(3), updatedAt: h(7), labels: [L.bug], comments: 2 }),
+      issue({ number: 9, title: "QR code so the audience can join the demo", createdAt: d(12), updatedAt: d(5), labels: [L.feature] }),
+    ];
+    return {
+      root, base: "main", branch: "main", githubError: null,
+      worktrees: [
+        wt(
+          {
+            head: "5be71d2", subject: "Pause the socket while offline", committedAt: h(1.6), ahead: 3,
+            changes: [" M src/Toolbar.tsx"],
+            commitsAhead: [
+              { hash: "5be71d2", subject: "Pause the socket while offline", at: h(1.6) },
+              { hash: "0c93e4a", subject: "Queue local ops while offline", at: h(5) },
+              { hash: "f2a18b7", subject: "Offline switch in the toolbar", at: h(19) },
+            ],
+          },
+          "offline-toggle",
+        ),
+      ],
+      github: { repo: slug, url: gh, pulls, recentPulls, issues, fetchedAt: m(2) },
+    };
+  }
+
+  if (name === "slides") {
+    return {
+      root, base: "main", branch: "main", githubError: null, worktrees: [],
+      github: {
+        repo: slug, url: gh, pulls: [], recentPulls: [], fetchedAt: m(4),
+        issues: [issue({ number: 3, title: "Diagram for the three sync strategies", createdAt: d(6), updatedAt: d(1), labels: [L.docs] })],
+      },
+    };
+  }
+
+  if (name === "notes") {
+    return { root, base: "main", branch: "main", github: null, githubError: "No GitHub remote", worktrees: [] };
   }
 
   // pixel-orchard: a local repo with no GitHub remote.

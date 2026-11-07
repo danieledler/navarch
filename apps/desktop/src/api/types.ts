@@ -308,6 +308,15 @@ export interface GitHubInfo {
   fetchedAt: number; // unix ms of the gh calls behind this
 }
 
+/** A git repo of a project (find_repos): the one its folder is in, or one 1–2 folders below it. */
+export interface RepoRef {
+  root: string; // the repo's main checkout (pass it to getRepoOverview)
+  rel: string; // its path from the project folder, e.g. "bioregions" or "code/infomap"; "" for the repo the folder is in
+  name: string; // what the picker shows: rel, or the root folder's name when rel is ""
+  github: string | null; // "owner/name" read from its remotes (no network); null without a GitHub remote
+  committedAt: number; // unix ms of its HEAD commit; 0 for a repo without commits
+}
+
 /** What `get_repo_overview` returns for a folder inside a git repo (null for any other folder). */
 export interface RepoOverview {
   root: string; // the repo's main checkout

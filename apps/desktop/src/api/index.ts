@@ -1,4 +1,4 @@
-import type { BuildInfo, CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Tailscale, TailscaleServe, Period, Project, RepoOverview, Session, Snapshot, Space, SystemStats, Task, TaskPatch, Usage } from "./types";
+import type { BuildInfo, CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Tailscale, TailscaleServe, Period, Project, RepoOverview, RepoRef, Session, Snapshot, Space, SystemStats, Task, TaskPatch, Usage } from "./types";
 import { mockApi } from "./mock";
 
 export * from "./types";
@@ -31,6 +31,10 @@ export interface Api {
   /** Worktrees of the git repo holding `path`, with its GitHub PRs and issues (via `gh`); null if `path` is in no
    *  git repo. GitHub data is cached ~5 min per repo; `force` fetches it again now. */
   getRepoOverview(path: string, force: boolean): Promise<RepoOverview | null>;
+  /** Git repos of a project folder: the repo it is in (first), then repos 1–2 folders below it (dot-folders,
+   *  node_modules and the like skipped; worktrees resolved to their main checkout; duplicates dropped), most
+   *  recent commit first, at most 12. Empty when there is none. Local only, no network. */
+  findRepos(path: string): Promise<RepoRef[]>;
   /** Opens a https://github.com/ link in the default browser. */
   openUrl(url: string): Promise<void>;
   revealPath(path: string): Promise<void>;
@@ -123,6 +127,7 @@ function tauriApi(): Api {
     openSession: (sessionId) => call("open_session", { sessionId }),
     revealPath: (path) => call("reveal_path", { path }),
     getRepoOverview: (path, force) => call("get_repo_overview", { path, force }),
+    findRepos: (path) => call("find_repos", { path }),
     openUrl: (url) => call("open_url", { url }),
     getSessions: () => call("get_sessions"),
     getSystemStats: () => call("get_system_stats"),

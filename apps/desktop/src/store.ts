@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api, type Id, type RepoOverview, type Session, type Snapshot, type SystemStats, type Usage } from "./api";
+import { api, type Id, type RepoOverview, type RepoRef, type Session, type Snapshot, type SystemStats, type Usage } from "./api";
 import { baseName } from "./lib/format";
 import { buildModel, type Model } from "./lib/model";
 
@@ -29,6 +29,8 @@ interface UIPrefs {
   logByProject: boolean;
   /** The Repo panel at the bottom of a project: shown or folded, and its height in px. */
   repoPanel: { open: boolean; height: number };
+  /** The repo the Repo panel shows, by project path (its root), for a folder holding several. */
+  repoOfProject: Record<string, string>;
 }
 
 /** A project folder's repo overview as last loaded. */
@@ -52,8 +54,10 @@ interface State extends UIPrefs {
   toasts: Toast[];
   /** Session row to highlight briefly after it moved, so the eye can follow it. */
   flashSession: string | null;
-  /** Repo overviews by project path. */
+  /** Repo overviews by repo root. */
   repos: Record<string, RepoState | undefined>;
+  /** Git repos found in each project folder (`findRepos`), as last loaded. */
+  repoLists: Record<string, { repos: RepoRef[]; at: number } | undefined>;
   init: () => Promise<void>;
   reload: () => Promise<void>;
   /** Run a backend mutation, reload the snapshot, and surface errors as toasts. */
@@ -79,13 +83,22 @@ interface State extends UIPrefs {
    *  (which also refetches GitHub data and toasts a failure; background loads fail silently). */
   loadRepo: (path: string, force?: boolean) => Promise<void>;
   setRepoPanel: (p: Partial<{ open: boolean; height: number }>) => void;
+  /** Look for the git repos of a project folder. Fails silently (the old list stays); one at a time per folder. */
+  findRepos: (projectPath: string) => Promise<void>;
+  /** Pick which of a project folder's repos the Repo panel shows. */
+  selectRepo: (projectPath: string, root: string) => void;
+}
+
+/** The repo the panel shows: the saved choice while the folder still holds it, else the first one. */
+export function chosenRepo(list: RepoRef[], saved: string | undefined): RepoRef | undefined {
+  return list.find((r) => r.root === saved) ?? list[0];
 }
 
 const PREFS = "navarch-ui";
 const empty: Snapshot = { spaces: [], projects: [], tasks: [], periods: [], periodTasks: [], weekTasks: [] };
 
 function loadPrefs(): UIPrefs {
-  const base: UIPrefs = { view: { kind: "dashboard" }, projectOfSpace: {}, collapsed: {}, hideDone: false, recentFirst: {}, logByProject: false, repoPanel: { open: true, height: 300 } };
+  const base: UIPrefs = { view: { kind: "dashboard" }, projectOfSpace: {}, collapsed: {}, hideDone: false, recentFirst: {}, logByProject: false, repoPanel: { open: true, height: 300 }, repoOfProject: {} };
   try {
     return { ...base, ...JSON.parse(localStorage.getItem(PREFS) ?? "{}") };
   } catch {
@@ -101,6 +114,8 @@ let appliedReload = 0;
 // Repo loads in flight, by path: the newest one's number. An older one finishing later is dropped.
 const repoLoads = new Map<string, number>();
 let repoSeq = 0;
+// Project folders whose repo search is running.
+const repoFinds = new Set<string>();
 
 // Undoable actions, newest last, keyed by the toast that announced them.
 const undoStack: ({ id: number; text: string } & Undoable)[] = [];
@@ -131,6 +146,7 @@ export const useStore = create<State>((set, get) => ({
   toasts: [],
   flashSession: null,
   repos: {},
+  repoLists: {},
 
   init: async () => {
     if (started) return; // StrictMode runs effects twice in dev
@@ -297,10 +313,30 @@ export const useStore = create<State>((set, get) => ({
     }
   },
   setRepoPanel: (p) => set((s) => ({ repoPanel: { ...s.repoPanel, ...p } })),
+  findRepos: async (projectPath) => {
+    if (repoFinds.has(projectPath)) return;
+    repoFinds.add(projectPath);
+    try {
+      const repos = await api.findRepos(projectPath);
+      set((s) => ({
+        repoLists: { ...s.repoLists, [projectPath]: { repos, at: Date.now() } },
+        // Several repos and none picked yet: pin the first one, so a later commit that reorders the list (most recent
+        // first) doesn't switch the panel to another repo unasked.
+        ...(repos.length > 1 && !s.repoOfProject[projectPath]
+          ? { repoOfProject: { ...s.repoOfProject, [projectPath]: repos[0].root } }
+          : {}),
+      }));
+    } catch {
+      /* keep the old list */
+    } finally {
+      repoFinds.delete(projectPath);
+    }
+  },
+  selectRepo: (projectPath, root) => set((s) => ({ repoOfProject: { ...s.repoOfProject, [projectPath]: root } })),
 }));
 
 useStore.subscribe((s) => {
-  const prefs: UIPrefs = { view: s.view, projectOfSpace: s.projectOfSpace, collapsed: s.collapsed, hideDone: s.hideDone, recentFirst: s.recentFirst, logByProject: s.logByProject, repoPanel: s.repoPanel };
+  const prefs: UIPrefs = { view: s.view, projectOfSpace: s.projectOfSpace, collapsed: s.collapsed, hideDone: s.hideDone, recentFirst: s.recentFirst, logByProject: s.logByProject, repoPanel: s.repoPanel, repoOfProject: s.repoOfProject };
   try {
     localStorage.setItem(PREFS, JSON.stringify(prefs));
   } catch {

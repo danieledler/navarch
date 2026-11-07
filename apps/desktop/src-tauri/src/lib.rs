@@ -305,6 +305,7 @@ pub fn run() {
             commands::tailscale_serve,
             commands::open_tailscale_login,
             commands::get_repo_overview,
+            commands::find_repos,
             commands::open_url,
             set_undo_menu,
         ])
