@@ -198,3 +198,31 @@ export function linkProject(chosen: RepoOverview | null, entries: RepoEntry[], s
 export function linkRepo(o: RepoOverview, sessions: Session[]): LinkedRepo {
   return linkProject(o, [{ ref: null, o }], sessions);
 }
+
+/** The branch `name` of an overview, when listed (branches load only with GitHub data). */
+export const branchOf = (o: RepoOverview | null | undefined, name: string | null): Branch | null =>
+  (o && name ? o.branches.find((b) => b.name === name) : null) ?? null;
+
+/** GitHub has commits on this branch that its local remote-tracking branch hasn't (a fetch would bring them).
+ *  False without GitHub data. */
+export const newerOnGitHub = (b: Branch | null | undefined): boolean => !!b && b.onGitHub !== null && b.newerOnGitHub;
+/** On GitHub but never fetched: no remote-tracking branch here yet. */
+export const newOnGitHub = (b: Branch): boolean => b.onGitHub === true && !b.remoteRef;
+/** Deleted on GitHub since the last fetch: the remote-tracking branch is still here (fetch --prune drops it). */
+export const deletedOnGitHub = (b: Branch): boolean => b.onGitHub === false && !!b.remoteRef && !b.upstreamGone;
+
+/** What a fetch would bring, from GitHub's branch tips vs the local remote-tracking refs (all empty without GitHub
+ *  data). `branches` covers only the listed ones (capped, see RepoOverview.branchCount). */
+export interface RemoteNews {
+  newer: Branch[]; // branches GitHub has commits on that aren't fetched
+  created: Branch[];
+  deleted: Branch[];
+  any: boolean;
+}
+export function remoteNews(o: RepoOverview | null | undefined): RemoteNews {
+  const bs = o?.branches ?? [];
+  const newer = bs.filter(newerOnGitHub);
+  const created = bs.filter(newOnGitHub);
+  const deleted = bs.filter(deletedOnGitHub);
+  return { newer, created, deleted, any: newer.length + created.length + deleted.length > 0 };
+}

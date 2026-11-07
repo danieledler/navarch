@@ -376,6 +376,13 @@ pub async fn find_repos(path: String) -> Res<Vec<crate::repo::RepoRef>> {
     tauri::async_runtime::spawn_blocking(move || crate::repo::find_repos(&path)).await.map_err(db::err)
 }
 
+/// `git fetch --prune` of the GitHub remote in the repo whose main checkout is `root` (remote-tracking refs only,
+/// never a pull); a one-line summary of what changed, or git's error. No prompts, 60 s timeout.
+#[tauri::command]
+pub async fn git_fetch(root: String) -> Res<String> {
+    tauri::async_runtime::spawn_blocking(move || crate::repo::git_fetch(&root)).await.map_err(db::err)?
+}
+
 /// Opens a GitHub page (a pull request, an issue) in the browser.
 #[tauri::command]
 pub async fn open_url(url: String) -> Res<()> {

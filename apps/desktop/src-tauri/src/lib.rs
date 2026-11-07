@@ -306,6 +306,7 @@ pub fn run() {
             commands::open_tailscale_login,
             commands::get_repo_overview,
             commands::find_repos,
+            commands::git_fetch,
             commands::open_url,
             set_undo_menu,
         ])

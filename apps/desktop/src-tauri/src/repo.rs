@@ -4,10 +4,10 @@
 //! working session's index.lock is never taken); gh signs in on its own (its token is never read here) and its
 //! data is cached 5 min per repo.
 
-use crate::tailscale::exec;
+use crate::tailscale::{exec, exec_env};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -237,6 +237,29 @@ pub struct GitHubInfo {
     pub viewer: Option<String>,
     pub issues: Vec<Issue>,
     pub fetched_at: i64,
+    /// GitHub's branch tips, compared with the remote-tracking refs on every load (not in the contract).
+    #[serde(skip)]
+    pub tips: Option<GitHubTips>,
+}
+
+/// GitHub's branches as of the last gh query: the first 100 by name (`TIPS_SELECTION`), plus the default branch.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GitHubTips {
+    pub heads: Vec<GitHubHead>,
+    /// `heads` holds every branch GitHub has (its list wasn't cut at 100).
+    pub complete: bool,
+    pub default_branch: Option<String>,
+    /// Commits on the default branch.
+    pub default_commits: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GitHubHead {
+    pub name: String,
+    pub oid: String,
+    /// Unix ms of the tip commit; 0 when unknown.
+    pub at: i64,
+    pub subject: String,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -257,6 +280,8 @@ pub struct RepoOverview {
     pub branch_count: usize,
     /// The remote the branches' remote side refers to: the GitHub one (origin preferred), else origin.
     pub remote: Option<String>,
+    /// Unix ms of the last fetch from any remote (FETCH_HEAD's time); `None` if never fetched.
+    pub fetched_at: Option<i64>,
     pub github: Option<GitHubInfo>,
     pub github_error: Option<String>,
 }
@@ -283,6 +308,15 @@ pub struct Branch {
     /// `remote_ref` commits not on the local branch; `None` without both sides.
     pub unpulled: Option<u32>,
     pub checked_out: Option<String>,
+    /// GitHub has this branch now (last gh query); `None` without GitHub data, or when GitHub's list was cut and
+    /// it isn't in it.
+    #[serde(rename = "onGitHub")]
+    pub on_github: Option<bool>,
+    /// GitHub's tip isn't in the local remote-tracking branch yet: a fetch would bring commits.
+    #[serde(rename = "newerOnGitHub")]
+    pub newer_on_github: bool,
+    /// How many commits that is, when known (the base branch).
+    pub github_new: Option<u32>,
 }
 
 const BRANCHES_MAX: usize = 80;
@@ -310,7 +344,9 @@ pub fn overview(path: &str, force: bool, with_github: bool) -> Option<RepoOvervi
         .filter(|e| !e.bare && !e.prunable)
         .filter_map(|e| Some((e.branch.clone()?, e.path.clone())))
         .collect();
-    let ((github, github_error), main_wt, worktrees, (mut branches, branch_count)) = std::thread::scope(|s| {
+    let common = common_dir(&root);
+    let fetched_at = common.as_deref().and_then(fetched_at);
+    let ((github, github_error), main_wt, worktrees, (mut branches, mut branch_count, remote_oids)) = std::thread::scope(|s| {
         let gh = with_github.then(|| s.spawn(|| github(&root, slug.as_deref(), force)));
         let (base, base_ref, procs, linked_dirs) = (&base, base_ref.as_deref(), &procs, &linked_dirs);
         let (root, remote, checked_out) = (&root, remote.as_deref(), &checked_out);
@@ -328,6 +364,18 @@ pub fn overview(path: &str, force: bool, with_github: bool) -> Option<RepoOvervi
         let gh = gh.map_or((None, None), |h| h.join().unwrap_or_else(|_| (None, Some("GitHub lookup failed".into()))));
         (gh, main_wt, worktrees, br.map(|h| h.join().unwrap_or_default()).unwrap_or_default())
     });
+    let gh_tips = github.as_ref().and_then(|g| Some((g.tips.as_ref()?, g.fetched_at)));
+    if let (Some((tips, tips_at)), Some(remote)) = (gh_tips, remote.as_deref()) {
+        // Read after the refs were: a change in between only makes the comparison more cautious.
+        let refs_at = common.as_deref().and_then(|c| remote_refs_changed_at(c, remote));
+        let shallow = common.as_deref().is_some_and(|c| c.join("shallow").exists());
+        let added = github_tips(&root, remote, &base, &mut branches, &remote_oids, tips, (tips_at, refs_at), shallow);
+        if added > 0 {
+            branch_count += added;
+            sort_branches(&mut branches, &base);
+            branches = cap_branches(branches, &base);
+        }
+    }
     // A fresh branch with uncommitted work in its checkout is ahead 0 too: not merged (as for worktrees).
     for b in branches.iter_mut().filter(|b| b.merged) {
         let dirty = main_wt.iter().chain(&worktrees).any(|w| Some(&w.path) == b.checked_out.as_ref() && w.dirty > 0);
@@ -342,6 +390,7 @@ pub fn overview(path: &str, force: bool, with_github: bool) -> Option<RepoOvervi
         branches,
         branch_count,
         remote,
+        fetched_at,
         github,
         github_error,
     })
@@ -353,6 +402,9 @@ pub fn overview(path: &str, force: bool, with_github: bool) -> Option<RepoOvervi
 #[derive(Debug, Default, PartialEq)]
 struct RefRow {
     refname: String,
+    /// Full object name of the tip.
+    oid: String,
+    /// Its first 7 characters.
     head: String,
     /// Unix ms of the tip commit.
     at: i64,
@@ -371,7 +423,7 @@ struct RefRow {
 fn branch_format(base_ref: Option<&str>) -> String {
     let ab = base_ref.map_or(String::new(), |b| format!("%(ahead-behind:{b})"));
     format!(
-        "--format=%(refname)%00%(objectname:short)%00%(committerdate:unix)%00%(authorname)%00%(upstream)%00\
+        "--format=%(refname)%00%(objectname)%00%(committerdate:unix)%00%(authorname)%00%(upstream)%00\
          %(upstream:track)%00{ab}%00%(subject)%1e"
     )
 }
@@ -382,14 +434,15 @@ fn parse_refs(out: &str) -> Vec<RefRow> {
             let rec = rec.trim_start_matches(['\n', '\r']);
             let mut f = rec.splitn(8, '\0');
             let refname = f.next().filter(|r| r.starts_with("refs/"))?.to_string();
-            let head = f.next()?.to_string();
+            let oid = f.next()?.to_string();
+            let head = oid.chars().take(7).collect();
             let at = f.next()?.trim().parse::<i64>().unwrap_or(0) * 1000;
             let (author, upstream, track) = (f.next()?.to_string(), f.next()?.to_string(), f.next()?.to_string());
             let (ahead, behind) = f.next()?.split_once(' ').map_or((0, 0), |(a, b)| {
                 (a.trim().parse().unwrap_or(0), b.trim().parse().unwrap_or(0))
             });
             let subject = f.next().unwrap_or("").to_string();
-            Some(RefRow { refname, head, at, author, upstream, track, ahead, behind, subject })
+            Some(RefRow { refname, oid, head, at, author, upstream, track, ahead, behind, subject })
         })
         .collect()
 }
@@ -451,6 +504,9 @@ fn build_branches(
                 unpushed: counts.map(|c| c.0),
                 unpulled: counts.map(|c| c.1),
                 checked_out: checked_out.get(&name).cloned(),
+                on_github: None,
+                newer_on_github: false,
+                github_new: None,
                 head: r.head,
                 subject: r.subject,
                 author: r.author,
@@ -469,6 +525,9 @@ fn build_branches(
         unpushed: None,
         unpulled: None,
         checked_out: None,
+        on_github: None,
+        newer_on_github: false,
+        github_new: None,
         head: r.head,
         subject: r.subject,
         author: r.author,
@@ -477,10 +536,15 @@ fn build_branches(
         behind: r.behind,
         name,
     }));
-    out.sort_by(|a, b| {
+    sort_branches(&mut out, base);
+    out
+}
+
+/// Base first, then the newest tip.
+fn sort_branches(all: &mut [Branch], base: &str) {
+    all.sort_by(|a, b| {
         (a.name != base).cmp(&(b.name != base)).then(b.committed_at.cmp(&a.committed_at)).then_with(|| a.name.cmp(&b.name))
     });
-    out
 }
 
 /// Base and the local branches first, then the newest remote-only ones, at most `BRANCHES_MAX` (so the stale local
@@ -502,13 +566,14 @@ fn cap_branches(mut all: Vec<Branch>, base: &str) -> Vec<Branch> {
 /// The repo's local branches and `remote`'s, with one `for-each-ref`, plus one `rev-list` per shown local branch
 /// whose remote side is not its upstream (pushed without `-u`). (branches, count before the cap). A git without
 /// `%(ahead-behind:)` (before 2.41) gets a second `for-each-ref` without it: ahead/behind 0, nothing merged.
+/// Also the tips of all of `remote`'s remote-tracking branches by name (full object names, shown or not).
 fn branches(
     root: &str,
     base: &str,
     base_ref: Option<&str>,
     remote: Option<&str>,
     checked_out: &HashMap<String, String>,
-) -> (Vec<Branch>, usize) {
+) -> (Vec<Branch>, usize, HashMap<String, String>) {
     let remote_pat = remote.map(|r| format!("refs/remotes/{r}"));
     let refs = |base_ref: Option<&str>| {
         let format = branch_format(base_ref);
@@ -520,11 +585,18 @@ fn branches(
         Some(out) => (out, base_ref.is_some()),
         None if base_ref.is_some() => match refs(None) {
             Some(out) => (out, false),
-            None => return (Vec::new(), 0),
+            None => return Default::default(),
         },
-        None => return (Vec::new(), 0),
+        None => return Default::default(),
     };
-    let all = build_branches(parse_refs(&out), base, has_base, remote, checked_out);
+    let rows = parse_refs(&out);
+    let prefix = remote.map(|r| format!("refs/remotes/{r}/"));
+    let remote_oids: HashMap<String, String> = rows
+        .iter()
+        .filter_map(|r| Some((r.refname.strip_prefix(prefix.as_deref()?)?.to_string(), r.oid.clone())))
+        .filter(|(n, _)| n != "HEAD")
+        .collect();
+    let all = build_branches(rows, base, has_base, remote, checked_out);
     let count = all.len();
     let mut all = cap_branches(all, base);
     let todo: Vec<usize> =
@@ -539,7 +611,277 @@ fn branches(
             (all[i].unpushed, all[i].unpulled) = (Some(unpushed), Some(unpulled));
         }
     }
-    (all, count)
+    (all, count, remote_oids)
+}
+
+// ── GitHub's branch tips vs the last fetch ──
+
+/// The git dir all of the repo's worktrees share.
+fn common_dir(root: &str) -> Option<PathBuf> {
+    let dir = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    Some(PathBuf::from(dir.trim()))
+}
+
+fn mtime_ms(p: &Path) -> Option<i64> {
+    let t = std::fs::symlink_metadata(p).ok()?.modified().ok()?;
+    Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64)
+}
+
+/// Unix ms of the newest FETCH_HEAD (written by every fetch): each worktree has its own, the main checkout's in
+/// `<common>/`, a linked one's in `<common>/worktrees/<name>/`. `None` if the repo was never fetched.
+fn fetched_at(common: &Path) -> Option<i64> {
+    let linked = std::fs::read_dir(common.join("worktrees")).into_iter().flatten().flatten();
+    std::iter::once(common.join("FETCH_HEAD")).chain(linked.map(|e| e.path().join("FETCH_HEAD"))).filter_map(|p| mtime_ms(&p)).max()
+}
+
+/// Newest mtime in a directory tree, directories included (creating or deleting a ref changes its directory's).
+fn tree_mtime(p: &Path) -> Option<i64> {
+    let mut newest = mtime_ms(p)?;
+    for e in std::fs::read_dir(p).into_iter().flatten().flatten() {
+        let t = if e.file_type().is_ok_and(|t| t.is_dir()) { tree_mtime(&e.path()) } else { mtime_ms(&e.path()) };
+        newest = newest.max(t.unwrap_or(0));
+    }
+    Some(newest)
+}
+
+/// Unix ms of the last change to `remote`'s remote-tracking refs here (a fetch, a push, a deleted branch): their
+/// loose refs and reflogs, and the FETCH_HEADs. `None` if none of them exist.
+fn remote_refs_changed_at(common: &Path, remote: &str) -> Option<i64> {
+    let refs = Path::new("refs").join("remotes").join(remote);
+    [tree_mtime(&common.join(&refs)), tree_mtime(&common.join("logs").join(&refs)), fetched_at(common)].into_iter().flatten().max()
+}
+
+/// A full object name (SHA-1 or SHA-256), so GitHub's data never reaches git as anything else.
+fn is_oid(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `compare_github` with git answering: one `rev-list --no-walk --ignore-missing` for which of GitHub's tips are
+/// here at all, then `merge-base --is-ancestor` for those present; `rev-list --count` for the base. Returns how
+/// many GitHub-only branches it appended. `times`: as `compare_github`'s. In a `shallow` clone the local commit
+/// count covers only the shallow history, so the base gets no count.
+#[allow(clippy::too_many_arguments)]
+fn github_tips(
+    root: &str,
+    remote: &str,
+    base: &str,
+    branches: &mut Vec<Branch>,
+    remote_oids: &HashMap<String, String>,
+    tips: &GitHubTips,
+    times: (i64, Option<i64>),
+    shallow: bool,
+) -> usize {
+    let contained = |pairs: &[(&str, &str)]| -> Vec<bool> {
+        let mut args = vec!["rev-list", "--no-walk", "--ignore-missing"];
+        args.extend(pairs.iter().map(|p| p.0));
+        let present: HashSet<String> =
+            git(root, &args).map(|o| o.lines().map(|l| l.trim().to_string()).collect()).unwrap_or_default();
+        par_map(pairs, |(gh, local)| {
+            present.contains(*gh) && git(root, &["merge-base", "--is-ancestor", gh, local]).is_some()
+        })
+    };
+    let count = |name: &str| {
+        let r = format!("refs/remotes/{remote}/{name}");
+        if shallow {
+            return None;
+        }
+        git(root, &["rev-list", "--count", &r]).and_then(|c| c.trim().parse().ok())
+    };
+    let added = compare_github(branches, remote_oids, tips, times, base, contained, count);
+    let n = added.len();
+    branches.extend(added);
+    n
+}
+
+/// Marks `branches` against GitHub's `tips`: `on_github`, `newer_on_github`, and `github_new` for the base.
+/// `remote_oids`: the GitHub remote's remote-tracking tips by name (all of them, shown or not). `contained` gets
+/// every (GitHub tip, remote-tracking tip) pair that differs, at once, and says whether GitHub's tip is already in
+/// the remote-tracking branch (the object is here and an ancestor). `count(name)`: commits on the remote-tracking
+/// branch. Returns entries for GitHub's branches with no local or remote-tracking ref (created since the last
+/// fetch), not yet sorted or capped. `(tips_at, refs_at)`: Unix ms of GitHub's snapshot and of the last change to
+/// the remote-tracking refs (`remote_refs_changed_at`). When the refs changed after the snapshot (a push, a deleted
+/// branch, a fetch since), a branch on one side only may just have been created or deleted: no presence verdicts
+/// then, only the comparison of tips both sides have (an older GitHub tip is an ancestor, so not newer).
+fn compare_github(
+    branches: &mut [Branch],
+    remote_oids: &HashMap<String, String>,
+    tips: &GitHubTips,
+    (tips_at, refs_at): (i64, Option<i64>),
+    base: &str,
+    contained: impl FnOnce(&[(&str, &str)]) -> Vec<bool>,
+    count: impl FnOnce(&str) -> Option<u64>,
+) -> Vec<Branch> {
+    let current = refs_at.is_none_or(|t| t <= tips_at);
+    let gh: HashMap<&str, &GitHubHead> =
+        tips.heads.iter().filter(|h| is_oid(&h.oid)).map(|h| (h.name.as_str(), h)).collect();
+    let mut pairs: Vec<(usize, &str, &str)> = Vec::new();
+    for (i, b) in branches.iter_mut().enumerate() {
+        b.github_new = None;
+        b.newer_on_github = false;
+        let Some(h) = gh.get(b.name.as_str()) else {
+            b.on_github = (tips.complete && current).then_some(false);
+            continue;
+        };
+        match remote_oids.get(&b.name) {
+            Some(l) if *l == h.oid => b.on_github = Some(true),
+            Some(l) => {
+                b.on_github = Some(true);
+                pairs.push((i, h.oid.as_str(), l.as_str()));
+            }
+            // GitHub has it, the remote-tracking ref doesn't exist: a fetch would make it (unless it was just
+            // deleted on GitHub, which a snapshot older than the refs can't tell).
+            None => (b.on_github, b.newer_on_github) = if current { (Some(true), true) } else { (None, false) },
+        }
+    }
+    if !pairs.is_empty() {
+        let asked: Vec<(&str, &str)> = pairs.iter().map(|p| (p.1, p.2)).collect();
+        let have = contained(&asked);
+        for (k, (i, _, _)) in pairs.iter().enumerate() {
+            branches[*i].newer_on_github = !have.get(k).copied().unwrap_or(false);
+        }
+    }
+    let is_default = tips.default_branch.as_deref() == Some(base);
+    let known: HashSet<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+    let added: Vec<Branch> = tips
+        .heads
+        .iter()
+        .filter(|h| current && is_oid(&h.oid) && !known.contains(h.name.as_str()) && !remote_oids.contains_key(&h.name))
+        .map(|h| Branch {
+            name: h.name.clone(),
+            local: false,
+            remote_ref: None,
+            upstream_gone: false,
+            head: h.oid.chars().take(7).collect(),
+            subject: h.subject.clone(),
+            author: String::new(),
+            committed_at: h.at,
+            ahead: 0,
+            behind: 0,
+            merged: false,
+            unpushed: None,
+            unpulled: None,
+            checked_out: None,
+            on_github: Some(true),
+            newer_on_github: true,
+            // Never fetched: all of GitHub's commits are new.
+            github_new: (is_default && h.name == base).then_some(tips.default_commits).flatten().map(|c| c as u32),
+        })
+        .collect();
+    if is_default {
+        if let Some(b) = branches.iter_mut().find(|b| b.name == base && b.newer_on_github && remote_oids.contains_key(base)) {
+            // Inconsistent (say, a force push that dropped commits): unknown.
+            b.github_new = tips.default_commits.zip(count(base)).and_then(|(gh, here)| {
+                u32::try_from(gh.saturating_sub(here)).ok().filter(|&n| n > 0)
+            });
+        }
+    }
+    added
+}
+
+// ── Fetch ──
+
+const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `git fetch --prune` of the GitHub remote (as `RepoOverview.remote`) in the repo whose main checkout is `root`:
+/// only remote-tracking refs (and tags) change. Never prompts: ssh in batch mode (unless the repo or user configures
+/// its own ssh command), no credential prompts; 60 s timeout. A one-line summary of what changed, or git's error.
+pub fn git_fetch(root: &str) -> Result<String, String> {
+    let wt = git(root, &["worktree", "list", "--porcelain"]).ok_or("Not a git repo")?;
+    let entries = parse_worktrees(&wt);
+    entries
+        .first()
+        .filter(|e| !e.bare && canonical(&e.path) == canonical(root))
+        .ok_or("Not the main checkout of a repo")?;
+    let remote = git(root, &["remote", "-v"]).as_deref().and_then(github_remote).ok_or("No remote to fetch from")?;
+    let own_ssh = git(root, &["config", "core.sshCommand"]).is_some_and(|c| !c.trim().is_empty())
+        || ["GIT_SSH_COMMAND", "GIT_SSH"].iter().any(|v| std::env::var_os(v).is_some());
+    let mut args = vec!["-C", root, "-c", "credential.interactive=never"];
+    if !own_ssh {
+        args.extend(["-c", "core.sshCommand=ssh -o BatchMode=yes -o ConnectTimeout=15"]);
+    }
+    args.extend(["fetch", "--prune", "--porcelain", "--no-recurse-submodules", "--", remote.as_str()]);
+    let env = [("GIT_TERMINAL_PROMPT", "0"), ("SSH_ASKPASS_REQUIRE", "never")];
+    let o = exec_env(GIT, &args, &env, FETCH_TIMEOUT, |_| false).map_err(|e| format!("git didn't start: {e}"))?;
+    match o.status {
+        None => Err(format!("git fetch timed out after {} s", FETCH_TIMEOUT.as_secs())),
+        Some(st) if st.success() => {
+            let updates = parse_fetch(&o.out, &remote);
+            let count = |old: &str, new: &str| git(root, &["rev-list", "--count", &format!("{old}..{new}")]).and_then(|c| c.trim().parse().ok());
+            Ok(fetch_summary(&updates, count))
+        }
+        Some(_) => Err(fetch_error(&o.err)),
+    }
+}
+
+/// One ref update of `git fetch --porcelain`.
+#[derive(Debug, PartialEq)]
+struct RefUpdate {
+    /// ' ' fast-forward, '+' forced, '-' pruned, '*' new, 't' tag moved, '!' rejected, '=' unchanged.
+    flag: char,
+    old: String,
+    new: String,
+    /// The branch name for `remote`'s refs; the full ref otherwise (`refs/tags/v1`).
+    name: String,
+    branch: bool,
+}
+
+/// `<flag> <old> <new> <ref>` lines → updates (`remote/HEAD` left out).
+fn parse_fetch(out: &str, remote: &str) -> Vec<RefUpdate> {
+    let prefix = format!("refs/remotes/{remote}/");
+    out.lines()
+        .filter_map(|l| {
+            let flag = l.chars().next()?;
+            let mut f = l.get(1..)?.trim_start().splitn(3, ' ');
+            let (old, new, r) = (f.next()?.to_string(), f.next()?.to_string(), f.next()?.trim());
+            let (name, branch) = match r.strip_prefix(&prefix) {
+                Some(n) => (n.to_string(), true),
+                None => (r.to_string(), false),
+            };
+            (name != "HEAD" || !branch).then_some(RefUpdate { flag, old, new, name, branch })
+        })
+        .collect()
+}
+
+/// "main +3 · feat rewritten · 2 new branches · 1 deleted · 1 new tag", or "Already up to date".
+/// `count(old, new)`: commits in old..new.
+fn fetch_summary(updates: &[RefUpdate], count: impl Fn(&str, &str) -> Option<u64>) -> String {
+    let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut parts: Vec<String> = Vec::new();
+    let moved: Vec<&RefUpdate> = updates.iter().filter(|u| u.branch && matches!(u.flag, ' ' | '+' | '!')).collect();
+    for u in moved.iter().take(3) {
+        parts.push(match u.flag {
+            ' ' => count(&u.old, &u.new).map_or(format!("{} updated", u.name), |n| format!("{} +{n}", u.name)),
+            '+' => format!("{} rewritten", u.name),
+            _ => format!("{} rejected", u.name),
+        });
+    }
+    if moved.len() > 3 {
+        parts.push(format!("{} more updated", moved.len() - 3));
+    }
+    let n = |flag: char, branch: bool| updates.iter().filter(|u| u.flag == flag && u.branch == branch).count();
+    let (new, gone, tags) = (n('*', true), n('-', true), n('*', false));
+    if new > 0 {
+        parts.push(plural(new, "new branch", "new branches"));
+    }
+    if gone > 0 {
+        parts.push(format!("{gone} deleted"));
+    }
+    if tags > 0 {
+        parts.push(plural(tags, "new tag", "new tags"));
+    }
+    if parts.is_empty() { "Already up to date".into() } else { parts.join(" · ") }
+}
+
+/// git's stderr → its first two meaningful lines (no hints), at most 300 characters.
+fn fetch_error(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("hint:"))
+        .take(2)
+        .collect();
+    let msg = if lines.is_empty() { "git fetch failed".to_string() } else { lines.join(" ") };
+    msg.chars().take(300).collect()
 }
 
 // ── Repos of a project folder ──
@@ -1089,12 +1431,18 @@ fn flatten_nodes(v: Value) -> Value {
     }
 }
 
+/// The repository fields asked along with the issues: GitHub's branch tips (`GitHubTips`).
+const TIPS_SELECTION: &str = "defaultBranchRef { name target { oid ... on Commit { history(first: 0) { totalCount } } } }
+  heads: refs(refPrefix: \"refs/heads/\", first: 100) { totalCount nodes { name target { oid ... on Commit { committedDate messageHeadline } } } }";
+
 /// One connection of `owner/name` (`selection` is e.g. `pullRequests(...) { nodes { ...pr } }`), its nodes, and
-/// the login gh is signed in as (asked along, free).
-fn gh_graphql(slug: &str, selection: &str, fragment: &str) -> Result<(Vec<Value>, Option<String>), String> {
+/// the login gh is signed in as (asked along, free); `extra` repository fields come back in the third value (the
+/// repository object, nodes flattened).
+type GraphQl = (Vec<Value>, Option<String>, Value);
+fn gh_graphql(slug: &str, selection: &str, extra: &str, fragment: &str) -> Result<GraphQl, String> {
     let (owner, name) = slug.split_once('/').ok_or_else(|| format!("Not a GitHub repo: {slug}"))?;
     let query = format!(
-        "query($owner: String!, $name: String!) {{ viewer {{ login }} repository(owner: $owner, name: $name) {{ list: {selection} }} }}\n{fragment}"
+        "query($owner: String!, $name: String!) {{ viewer {{ login }} repository(owner: $owner, name: $name) {{ list: {selection} {extra} }} }}\n{fragment}"
     );
     let (q, o, n) = (format!("query={query}"), format!("owner={owner}"), format!("name={name}"));
     let out = gh(&["api", "graphql", "-f", &q, "-f", &o, "-f", &n])?;
@@ -1103,25 +1451,54 @@ fn gh_graphql(slug: &str, selection: &str, fragment: &str) -> Result<(Vec<Value>
         v.pointer("/errors/0/message").and_then(Value::as_str).unwrap_or("Repository not found on GitHub").to_string()
     })?;
     let viewer = v.pointer("/data/viewer/login").and_then(Value::as_str).filter(|l| !l.is_empty()).map(String::from);
-    match flatten_nodes(repo.get("list").cloned().unwrap_or_default()) {
-        Value::Array(a) => Ok((a, viewer)),
-        _ => Ok((Vec::new(), viewer)),
+    let mut repo = flatten_nodes(repo.clone());
+    match repo.get_mut("list").map(Value::take) {
+        Some(Value::Array(a)) => Ok((a, viewer, repo)),
+        _ => Ok((Vec::new(), viewer, repo)),
     }
 }
 
+/// `TIPS_SELECTION`'s answer (nodes flattened) → GitHub's branch tips; `None` without a `heads` list.
+pub fn parse_tips(repo: &Value) -> Option<GitHubTips> {
+    let refs = repo.get("heads")?;
+    let total = refs.get("totalCount").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let mut heads: Vec<GitHubHead> = arr(refs, "nodes")
+        .iter()
+        .map(|n| {
+            let t = n.get("target").unwrap_or(&Value::Null);
+            GitHubHead { name: text(n, "name"), oid: text(t, "oid"), at: ms(t, "committedDate").unwrap_or(0), subject: text(t, "messageHeadline") }
+        })
+        .filter(|h| !h.name.is_empty())
+        .collect();
+    let complete = heads.len() >= total;
+    let d = repo.get("defaultBranchRef").filter(|d| !d.is_null());
+    let default_branch = d.map(|d| text(d, "name")).filter(|n| !n.is_empty());
+    let target = d.and_then(|d| d.get("target"));
+    let default_commits = target.and_then(|t| t.pointer("/history/totalCount")).and_then(Value::as_u64);
+    // Past the cut, the default branch still counts.
+    if let (Some(name), Some(t)) = (&default_branch, target) {
+        if !heads.iter().any(|h| &h.name == name) {
+            heads.push(GitHubHead { name: name.clone(), oid: text(t, "oid"), ..Default::default() });
+        }
+    }
+    Some(GitHubTips { heads, complete, default_branch, default_commits })
+}
+
 fn fetch_github(slug: &str) -> Result<GitHubInfo, String> {
+    // The snapshot's time is when it was asked for: refs changed while gh ran count as newer (compare_github).
+    let asked_at = chrono::Utc::now().timestamp_millis();
     let order = "orderBy: {field: UPDATED_AT, direction: DESC}";
     let open = format!("pullRequests(states: OPEN, first: {OPEN_PRS}, {order}) {{ nodes {{ ...pr }} }}");
     let closed = format!("pullRequests(states: [CLOSED, MERGED], first: {CLOSED_PRS}, {order}) {{ nodes {{ ...pr }} }}");
     let issues = format!("issues(states: OPEN, first: {OPEN_ISSUES}, {order}) {{ nodes {{ {ISSUE_SELECTION} }} }}");
-    let lost = || Err::<(Vec<Value>, Option<String>), _>("gh failed".to_string());
+    let lost = || Err::<GraphQl, _>("gh failed".to_string());
     let (open, closed, issues) = std::thread::scope(|s| {
-        let a = s.spawn(|| gh_graphql(slug, &open, PR_FRAGMENT));
-        let b = s.spawn(|| gh_graphql(slug, &closed, CLOSED_PR_FRAGMENT));
-        let c = s.spawn(|| gh_graphql(slug, &issues, ""));
+        let a = s.spawn(|| gh_graphql(slug, &open, "", PR_FRAGMENT));
+        let b = s.spawn(|| gh_graphql(slug, &closed, "", CLOSED_PR_FRAGMENT));
+        let c = s.spawn(|| gh_graphql(slug, &issues, TIPS_SELECTION, ""));
         (a.join().unwrap_or_else(|_| lost()), b.join().unwrap_or_else(|_| lost()), c.join().unwrap_or_else(|_| lost()))
     });
-    let ((open, v1), (closed, v2), (issues, v3)) = (open?, closed?, issues?);
+    let ((open, v1, _), (closed, v2, _), (issues, v3, repo)) = (open?, closed?, issues?);
     let viewer = v1.or(v2).or(v3);
     let mut pulls: Vec<PullRequest> = open.iter().map(parse_pr).collect();
     pulls.sort_by_key(|p| std::cmp::Reverse(p.updated_at));
@@ -1138,7 +1515,8 @@ fn fetch_github(slug: &str) -> Result<GitHubInfo, String> {
         recent_pulls,
         viewer,
         issues,
-        fetched_at: chrono::Utc::now().timestamp_millis(),
+        fetched_at: asked_at,
+        tips: parse_tips(&repo),
     })
 }
 
@@ -1806,6 +2184,220 @@ mod tests {
         assert!(w.checked_out.as_deref().is_some_and(|p| p.ends_with("/wt")) && w.merged, "{w:?}");
         let d = get("dirty");
         assert!(d.checked_out.as_deref().is_some_and(|p| p.ends_with("/dirty")) && !d.merged, "{d:?}");
+    }
+
+    fn br(name: &str, local: bool, remote_ref: Option<&str>) -> Branch {
+        Branch {
+            name: name.into(),
+            local,
+            remote_ref: remote_ref.map(String::from),
+            upstream_gone: false,
+            head: String::new(),
+            subject: String::new(),
+            author: String::new(),
+            committed_at: 0,
+            ahead: 0,
+            behind: 0,
+            merged: false,
+            unpushed: None,
+            unpulled: None,
+            checked_out: None,
+            on_github: None,
+            newer_on_github: false,
+            github_new: None,
+        }
+    }
+
+    #[test]
+    fn branches_compared_with_github_tips() {
+        let oid = |c: char| c.to_string().repeat(40);
+        let head = |n: &str, c: char| GitHubHead { name: n.into(), oid: oid(c), at: 5_000, subject: format!("{n} tip") };
+        // Local remote-tracking tips: main and stale at a; feat at b; ours (local newer) at c; gone (deleted on GitHub).
+        let remote_oids: HashMap<String, String> =
+            [("main", 'a'), ("stale", 'a'), ("feat", 'b'), ("ours", 'c'), ("gone", 'd')].map(|(n, c)| (n.to_string(), oid(c))).into();
+        let mut tips = GitHubTips {
+            heads: vec![head("main", '1'), head("stale", '2'), head("feat", 'b'), head("ours", '3'), head("fresh", '4')],
+            complete: true,
+            default_branch: Some("main".into()),
+            default_commits: Some(10),
+        };
+        let fresh = || {
+            vec![
+                br("main", true, Some("origin/main")),
+                br("stale", false, Some("origin/stale")),
+                br("feat", true, Some("origin/feat")),
+                br("ours", false, Some("origin/ours")),
+                br("gone", true, Some("origin/gone")),
+                br("solo", true, None),
+            ]
+        };
+        // GitHub's 1 (main) and 2 (stale) aren't here (missing objects); 3 is an ancestor of our c.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let contained = |pairs: &[(&str, &str)]| {
+            asked.borrow_mut().extend(pairs.iter().map(|p| p.0.chars().next().unwrap()));
+            pairs.iter().map(|(gh, _)| gh.starts_with('3')).collect()
+        };
+        let mut b = fresh();
+        let added = compare_github(&mut b, &remote_oids, &tips, (100, Some(50)), "main", contained, |n| (n == "main").then_some(7));
+        let get = |b: &[Branch], n: &str| {
+            let x = b.iter().find(|x| x.name == n).unwrap();
+            (x.on_github, x.newer_on_github, x.github_new)
+        };
+        assert_eq!(get(&b, "main"), (Some(true), true, Some(3)), "GitHub newer, object missing: 10 - 7 new");
+        assert_eq!(get(&b, "stale"), (Some(true), true, None), "newer, but not the base: no count");
+        assert_eq!(get(&b, "feat"), (Some(true), false, None), "equal");
+        assert_eq!(get(&b, "ours"), (Some(true), false, None), "remote-tracking newer: GitHub's tip is an ancestor");
+        assert_eq!(get(&b, "gone"), (Some(false), false, None), "deleted on GitHub");
+        assert_eq!(get(&b, "solo"), (Some(false), false, None), "never pushed");
+        assert_eq!(asked.borrow().as_slice(), &['1', '2', '3'], "only differing tips are checked, in one call");
+        assert_eq!(added.len(), 1, "created on GitHub");
+        let f = &added[0];
+        assert_eq!((f.name.as_str(), f.local, f.remote_ref.as_deref(), f.on_github, f.newer_on_github), ("fresh", false, None, Some(true), true));
+        assert_eq!((f.head.as_str(), f.subject.as_str(), f.committed_at), ("4444444", "fresh tip", 5_000));
+        // A count that doesn't add up (GitHub has fewer commits than here, say after a force push): unknown.
+        let mut b = fresh();
+        let contained_none = |p: &[(&str, &str)]| vec![false; p.len()];
+        compare_github(&mut b, &remote_oids, &tips, (100, Some(50)), "main", contained_none, |_| Some(12));
+        assert_eq!(get(&b, "main"), (Some(true), true, None));
+        // The refs changed after GitHub's snapshot (a push, a deleted branch, a fetch): no created/deleted verdicts,
+        // tips both sides have still compare. "lost" is a local branch whose remote-tracking ref was just deleted.
+        let mut b = fresh();
+        b.push(br("lost", true, None));
+        tips.heads.push(head("lost", 'e'));
+        let added = compare_github(&mut b, &remote_oids, &tips, (100, Some(150)), "main", contained_none, |_| Some(7));
+        assert!(added.is_empty(), "{added:?}");
+        assert_eq!(get(&b, "gone"), (None, false, None));
+        assert_eq!(get(&b, "solo"), (None, false, None));
+        assert_eq!(get(&b, "lost"), (None, false, None));
+        assert_eq!(get(&b, "feat"), (Some(true), false, None));
+        assert_eq!(get(&b, "main"), (Some(true), true, Some(3)));
+        // Never-touched refs (no loose refs, reflogs or FETCH_HEAD) trust the snapshot.
+        let mut b = fresh();
+        b.push(br("lost", true, None));
+        compare_github(&mut b, &remote_oids, &tips, (100, None), "main", contained_none, |_| None);
+        assert_eq!((get(&b, "gone"), get(&b, "lost")), ((Some(false), false, None), (Some(true), true, None)));
+        tips.heads.pop();
+        // GitHub's list was cut: branches missing from it are unknown, not deleted; those in it still compare.
+        tips.complete = false;
+        let mut b = fresh();
+        compare_github(&mut b, &remote_oids, &tips, (100, Some(50)), "main", |p| vec![false; p.len()], |_| None);
+        assert_eq!(get(&b, "gone"), (None, false, None));
+        assert_eq!(get(&b, "solo"), (None, false, None));
+        assert_eq!(get(&b, "feat"), (Some(true), false, None));
+        assert_eq!(get(&b, "main"), (Some(true), true, None));
+    }
+
+    #[test]
+    fn github_tips_from_graphql() {
+        let repo = flatten_nodes(json!({
+            "list": {"nodes": []},
+            "defaultBranchRef": {"name": "trunk", "target": {"oid": "f".repeat(40), "history": {"totalCount": 12562}}},
+            "heads": {"totalCount": 3, "nodes": [
+                {"name": "a", "target": {"oid": "a".repeat(40), "committedDate": "2026-11-01T10:00:00Z", "messageHeadline": "A"}},
+                {"name": "b", "target": {"oid": "b".repeat(40)}}
+            ]}
+        }));
+        let t = parse_tips(&repo).unwrap();
+        assert!(!t.complete);
+        assert_eq!((t.default_branch.as_deref(), t.default_commits), (Some("trunk"), Some(12562)));
+        let names: Vec<&str> = t.heads.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "trunk"], "the default branch is kept past the cut");
+        assert_eq!((t.heads[0].subject.as_str(), t.heads[0].at > 0, t.heads[1].at), ("A", true, 0));
+        assert!(parse_tips(&json!({})).is_none());
+        // The tips stay out of the contract.
+        let g = GitHubInfo {
+            repo: "o/n".into(),
+            url: String::new(),
+            pulls: vec![],
+            recent_pulls: vec![],
+            viewer: None,
+            issues: vec![],
+            fetched_at: 0,
+            tips: Some(t),
+        };
+        assert!(serde_json::to_value(&g).unwrap().get("tips").is_none());
+        let j = serde_json::to_value(br("x", true, None)).unwrap();
+        for k in ["onGitHub", "newerOnGitHub", "githubNew"] {
+            assert!(j.get(k).is_some(), "{k}");
+        }
+    }
+
+    #[test]
+    fn fetch_output_summarized() {
+        let z = "0".repeat(40);
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let out = format!(
+            "  {a} {b} refs/remotes/origin/main\n+ {a} {b} refs/remotes/origin/wip\n* {z} {b} refs/remotes/origin/new1\n\
+             * {z} {b} refs/remotes/origin/new2\n- {a} {z} refs/remotes/origin/old\n* {z} {a} refs/tags/v1\n\
+             * {z} {a} refs/remotes/origin/HEAD\n"
+        );
+        let u = parse_fetch(&out, "origin");
+        assert_eq!(u.len(), 6);
+        assert_eq!((u[0].flag, u[0].name.as_str(), u[0].branch), (' ', "main", true));
+        assert_eq!((u[5].name.as_str(), u[5].branch), ("refs/tags/v1", false));
+        assert_eq!(fetch_summary(&u, |_, _| Some(3)), "main +3 · wip rewritten · 2 new branches · 1 deleted · 1 new tag");
+        assert_eq!(fetch_summary(&[], |_, _| None), "Already up to date");
+        let err = "hint: x\ngit@github.com: Permission denied (publickey).\r\nfatal: Could not read from remote repository.\n\nPlease make sure";
+        assert_eq!(fetch_error(err), "git@github.com: Permission denied (publickey). fatal: Could not read from remote repository.");
+        assert_eq!(fetch_error(&"x".repeat(500)).len(), 300);
+    }
+
+    #[test]
+    fn git_fetch_of_a_real_repo() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("navarch-fetch-test-{}-{nanos}", std::process::id()));
+        let (origin, main, other) = (dir.join("origin.git"), dir.join("main"), dir.join("other"));
+        for d in [&origin, &main] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        sh(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        sh(&main, &["init", "-q", "-b", "main"]);
+        sh(&main, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        sh(&main, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        sh(&main, &["push", "-q", "-u", "origin", "main"]);
+        sh(&main, &["push", "-q", "origin", "main:side"]);
+        sh(&dir, &["clone", "-q", origin.to_str().unwrap(), "other"]);
+        sh(&other, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        sh(&other, &["push", "-q", "origin", "main"]);
+        let root = main.to_str().unwrap();
+        let before = overview(root, false, false).unwrap().fetched_at;
+        let first = git_fetch(root);
+        let fetched = overview(root, false, false).unwrap().fetched_at;
+        let second = git_fetch(root);
+        sh(&other, &["push", "-q", "origin", "--delete", "side"]);
+        let third = git_fetch(root);
+        sh(&main, &["worktree", "add", "-q", "-b", "wt", "../wt"]);
+        let in_worktree = git_fetch(dir.join("wt").to_str().unwrap());
+        let not_root = git_fetch(dir.to_str().unwrap());
+        // A fetch in a linked worktree writes that worktree's own FETCH_HEAD, and it counts too.
+        std::fs::remove_file(main.join(".git/FETCH_HEAD")).unwrap();
+        let none = overview(root, false, false).unwrap().fetched_at;
+        sh(&dir.join("wt"), &["fetch", "-q", "origin"]);
+        let from_wt = overview(root, false, false).unwrap().fetched_at;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(first.as_deref(), Ok("main +1"));
+        assert_eq!(second.as_deref(), Ok("Already up to date"));
+        assert_eq!(third.as_deref(), Ok("1 deleted"));
+        assert!(fetched.is_some_and(|t| Some(t) > before.or(Some(0))), "{before:?} {fetched:?}");
+        assert!(in_worktree.is_err() && not_root.is_err(), "{in_worktree:?} {not_root:?}");
+        assert!(none.is_none() && from_wt.is_some(), "{none:?} {from_wt:?}");
+    }
+
+    #[test]
+    #[ignore = "live: compares ChessCabin/rchess's remote-tracking branches with GitHub through gh (no fetch)"]
+    fn github_tips_live() {
+        let root = "/Users/daniel/dev/projects/romelandaschack/ChessCabin/rchess";
+        let t = Instant::now();
+        let o = overview(root, true, true).expect("a git repo");
+        let at = o.fetched_at.and_then(chrono::DateTime::from_timestamp_millis).map(|d| d.to_rfc3339());
+        let base = o.branches.iter().find(|b| b.name == o.base);
+        let unfetched: Vec<&str> =
+            o.branches.iter().filter(|b| b.on_github == Some(true) && b.remote_ref.is_none() && !b.local).map(|b| b.name.as_str()).collect();
+        let deleted = o.branches.iter().filter(|b| b.on_github == Some(false) && b.remote_ref.is_some()).count();
+        let newer = o.branches.iter().filter(|b| b.newer_on_github).count();
+        println!("fetchedAt {at:?} error {:?} ({} ms)", o.github_error, t.elapsed().as_millis());
+        println!("base {} newerOnGitHub {:?} githubNew {:?}", o.base, base.map(|b| b.newer_on_github), base.and_then(|b| b.github_new));
+        println!("on GitHub, not fetched {unfetched:?}; deleted on GitHub {deleted}; newer {newer}; branches {}", o.branch_count);
     }
 
     #[test]

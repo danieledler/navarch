@@ -38,6 +38,11 @@ export interface Api {
    *  may sit there even when the repo is elsewhere); most recent commit first, at most 12. Empty when there is
    *  none. Local only, no network. */
   findRepos(path: string): Promise<RepoRef[]>;
+  /** `git fetch --prune <remote>` in the repo whose main checkout is `root` (the GitHub remote, as RepoOverview.remote):
+   *  updates only its remote-tracking branches, never local branches or files. No prompts (fails instead when a
+   *  password or passphrase would be needed); 60 s timeout. Resolves with a one-line summary of what changed, e.g.
+   *  "main +3 · 2 new branches · 1 deleted", or "Already up to date"; rejects with git's error. */
+  gitFetch(root: string): Promise<string>;
   /** Opens a https://github.com/ link in the default browser. */
   openUrl(url: string): Promise<void>;
   revealPath(path: string): Promise<void>;
@@ -131,6 +136,7 @@ function tauriApi(): Api {
     revealPath: (path) => call("reveal_path", { path }),
     getRepoOverview: (path, force, github = true) => call("get_repo_overview", { path, force, github }),
     findRepos: (path) => call("find_repos", { path }),
+    gitFetch: (root) => call("git_fetch", { root }),
     openUrl: (url) => call("open_url", { url }),
     getSessions: () => call("get_sessions"),
     getSystemStats: () => call("get_system_stats"),

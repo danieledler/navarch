@@ -67,6 +67,8 @@ interface State extends UIPrefs {
   repos: Record<string, RepoState | undefined>;
   /** Git repos found in each project folder (`findRepos`), as last loaded. */
   repoLists: Record<string, { repos: RepoRef[]; at: number } | undefined>;
+  /** Repo roots with a `git fetch` running (fetchRepo). */
+  fetching: Record<string, true | undefined>;
   init: () => Promise<void>;
   reload: () => Promise<void>;
   /** Run a backend mutation, reload the snapshot, and surface errors as toasts. */
@@ -92,6 +94,9 @@ interface State extends UIPrefs {
    *  also refetches GitHub data and toasts a failure; background loads fail silently). `github: false` reads only
    *  the local git side and keeps the GitHub data loaded before. */
   loadRepo: (path: string, force?: boolean, github?: boolean) => Promise<void>;
+  /** `git fetch --prune` the repo whose main checkout is `root` (one at a time per repo), toast what it brought,
+   *  then reload its overview: the local remote-tracking refs changed, the cached GitHub data didn't. */
+  fetchRepo: (root: string) => Promise<void>;
   setRepoPanel: (p: Partial<RepoPanelPrefs>) => void;
   /** Look for the git repos of a project folder. Fails silently (the old list stays); one at a time per folder. */
   findRepos: (projectPath: string) => Promise<void>;
@@ -160,6 +165,7 @@ export const useStore = create<State>((set, get) => ({
   flashSession: null,
   repos: {},
   repoLists: {},
+  fetching: {},
 
   init: async () => {
     if (started) return; // StrictMode runs effects twice in dev
@@ -345,6 +351,23 @@ export const useStore = create<State>((set, get) => ({
       if (force) get().toast(`Couldn’t load the repo: ${e}`, undefined, "error");
     } finally {
       if (repoLoads.get(key) === n) repoLoads.delete(key);
+    }
+  },
+  fetchRepo: async (root) => {
+    if (get().fetching[root]) return;
+    const busy = (on: boolean) => set((s) => ({ fetching: { ...s.fetching, [root]: on || undefined } }));
+    busy(true);
+    const name =
+      Object.values(get().repoLists).flatMap((l) => l?.repos ?? []).find((r) => r.root === root)?.name ?? baseName(root);
+    try {
+      const summary = await api.gitFetch(root);
+      get().toast(`Fetched ${name}: ${summary}`);
+      // Forced: supersedes a poll's load that read the refs before the fetch, and asks GitHub afresh.
+      await get().loadRepo(root, true);
+    } catch (e) {
+      get().toast(`Couldn’t fetch ${name}: ${e}`, undefined, "error");
+    } finally {
+      busy(false);
     }
   },
   setRepoPanel: (p) => set((s) => ({ repoPanel: { ...s.repoPanel, ...p } })),

@@ -308,6 +308,11 @@ export interface Branch {
   unpushed: number | null; // local commits not on remoteRef; null without both sides
   unpulled: number | null; // remoteRef commits not on the local branch, as of the last fetch; null without both sides
   checkedOut: string | null; // folder of the worktree or main checkout that has it checked out
+  /** Compared with GitHub's branch tips from the last gh query (local refs only know the last fetch): */
+  onGitHub: boolean | null; // GitHub has this branch now; null without GitHub data. true with remoteRef null: created
+  // there since the last fetch; false with a remoteRef: deleted there since (fetch --prune drops it)
+  newerOnGitHub: boolean; // GitHub's tip isn't in the local remote-tracking branch yet: a fetch would bring commits
+  githubNew: number | null; // how many commits that is, when known (the base branch); null otherwise
 }
 
 export interface WorktreeCommit {
@@ -359,6 +364,7 @@ export interface RepoOverview {
   branches: Branch[];
   branchCount: number; // branches before the cap
   remote: string | null; // the remote the remote-side fields refer to: the GitHub one (origin preferred), else origin
+  fetchedAt: number | null; // unix ms of the last fetch from any remote (FETCH_HEAD's time); null if never fetched
   github: GitHubInfo | null; // last good GitHub data (may be older than a failed refresh)
   githubError: string | null; // why there is no fresh GitHub data: gh missing, not signed in, no GitHub remote, or gh's error
 }

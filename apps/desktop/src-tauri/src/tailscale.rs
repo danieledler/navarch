@@ -48,11 +48,23 @@ pub(crate) struct Output {
 /// the run early (it is then killed). Errs if the CLI can't start (not installed there). Also runs git and gh
 /// for the Repo panel (repo.rs).
 pub(crate) fn exec(cli: &str, args: &[&str], timeout: Duration, stop: impl Fn(&str) -> bool) -> std::io::Result<Output> {
+    exec_env(cli, args, &[], timeout, stop)
+}
+
+/// `exec` with `env` added to the inherited environment (git fetch's GIT_TERMINAL_PROMPT=0).
+pub(crate) fn exec_env(
+    cli: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    timeout: Duration,
+    stop: impl Fn(&str) -> bool,
+) -> std::io::Result<Output> {
     use std::os::unix::process::CommandExt;
     // Its own process group, so a kill also ends what a wrapper script started: /usr/local/bin/tailscale is
     // a `#!/bin/sh` that runs the app's binary without `exec`, and that binary would hold the pipes open.
     let mut child = Command::new(cli)
         .args(args)
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -3,14 +3,14 @@
 // row shows a hover card with the details.
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
-  ArrowDown, ArrowUp, BadgeCheck, Check, ChevronDown, ChevronRight, CircleDot, Cloud, Copy, Eye, ExternalLink, FileDiff, FolderGit2, FolderOpen,
+  ArrowDown, ArrowUp, BadgeCheck, Check, ChevronDown, ChevronRight, CircleDot, Cloud, CloudDownload, Copy, Eye, ExternalLink, FileDiff, FolderGit2, FolderOpen,
   GitBranch, GitCompare, GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft, Laptop, Lock, MessageSquare, Minus, RefreshCw, SquareTerminal,
   TriangleAlert, X, Zap,
 } from "lucide-react";
 import { api, type Branch, type CheckState, type GitHubInfo, type Issue, type Label, type PullRequest, type RepoOverview, type RepoRef, type Reviewer, type Session } from "../api";
 import { chosenRepo, useModel, useStore } from "../store";
 import { baseName, plainText, relTime, shortPath } from "../lib/format";
-import { doneAt, linkProject, type LinkedBranch, type LinkedIssue, type LinkedPull, type LinkedRepo, type LinkedWorktree, type RepoEntry } from "../lib/repo";
+import { branchOf, deletedOnGitHub, doneAt, linkProject, newerOnGitHub, newOnGitHub, remoteNews, type LinkedBranch, type LinkedIssue, type LinkedPull, type LinkedRepo, type LinkedWorktree, type RepoEntry } from "../lib/repo";
 import { IconButton, Popover, STATUS_LABEL, StatusDot } from "./ui";
 import { HoverCard, useHoverCard } from "./HoverCard";
 
@@ -164,7 +164,12 @@ export function RepoPanel({ path }: { path: string }) {
   const fetchedAt = gh?.fetchedAt ?? st?.at ?? 0;
   const unpushed = data?.main?.unpushed ?? 0;
   const staleN = linked?.branches.stale.length ?? 0;
-  const ctx: BrCtx | null = data ? { slug: gh?.repo ?? chosen?.github ?? null, remote: data.remote, base: data.base } : null;
+  const ctx: BrCtx | null = data ? { root: data.root, slug: gh?.repo ?? chosen?.github ?? null, remote: data.remote, base: data.base } : null;
+  const fetching = useStore((s) => (root ? !!s.fetching[root] : false));
+  const fetchRepo = useStore((s) => s.fetchRepo);
+  // The base branch moved on GitHub since this clone last fetched: git status still says "up to date".
+  const baseB = branchOf(data, data?.base ?? null);
+  const baseNews = newerOnGitHub(baseB) ? baseB : null;
   const showStaleBranches = () => {
     hc.hide();
     if (!panel.open) loadAll();
@@ -267,6 +272,19 @@ export function RepoPanel({ path }: { path: string }) {
                   </span>
                 </>
               )}
+              {baseNews && data.remote && (
+                <>
+                  {" · "}
+                  <button
+                    type="button"
+                    className="repo-news-link"
+                    title={`Not fetched yet: GitHub’s ${data.base} has ${baseNews.githubNew != null ? plural(baseNews.githubNew, "commit") : "commits"} that ${baseNews.remoteRef ?? `${data.remote}/${data.base}`} here doesn’t. Click to fetch (git fetch --prune ${data.remote}).`}
+                    onClick={() => void fetchRepo(data.root)}
+                  >
+                    {baseNews.githubNew != null ? `GitHub has ${baseNews.githubNew} new on ${data.base}` : `${data.base} moved on GitHub`}
+                  </button>
+                </>
+              )}
               {staleN > 0 && (
                 <>
                   {" · "}
@@ -289,6 +307,15 @@ export function RepoPanel({ path }: { path: string }) {
           )}
           {fetchedAt > 0 && (
             <span className="repo-updated" title={`Updated ${new Date(fetchedAt).toLocaleString()}`}>updated {relTime(fetchedAt)}</span>
+          )}
+          {data?.remote && (
+            <IconButton
+              icon={<CloudDownload size={13} />}
+              label={fetching ? `Fetching from ${data.remote}…` : fetchTitle(data.remote, data.fetchedAt)}
+              className={`repo-fetch ${fetching ? "spin" : ""} ${baseNews ? "has-news" : ""}`}
+              disabled={fetching}
+              onClick={() => void fetchRepo(data.root)}
+            />
           )}
           <IconButton
             icon={<RefreshCw size={13} />}
@@ -830,6 +857,45 @@ function UpstreamMarks({ lw }: { lw: LinkedWorktree }) {
   );
 }
 
+/** The Fetch button's tooltip. */
+function fetchTitle(remote: string, fetchedAt: number | null): string {
+  const when = fetchedAt ? `Last fetched ${relTime(fetchedAt)} (${new Date(fetchedAt).toLocaleString()})` : "Never fetched";
+  return `Fetch from GitHub: git fetch --prune ${remote}. Updates ${remote}/* only; your branches and files stay as they are. ${when}`;
+}
+
+/** Fetch button for a hover card: fetches the repo whose main checkout is `root`; nothing when it has no remote. */
+function FetchButton({ root }: { root: string }) {
+  const o = useStore((s) => s.repos[root]?.data);
+  const fetching = useStore((s) => !!s.fetching[root]);
+  const fetchRepo = useStore((s) => s.fetchRepo);
+  if (!o?.remote) return null;
+  return (
+    <button
+      type="button"
+      className={`btn btn-small btn-ghost ${fetching ? "spin" : ""}`}
+      title={fetchTitle(o.remote, o.fetchedAt)}
+      disabled={fetching}
+      onClick={() => void fetchRepo(root)}
+    >
+      <CloudDownload size={12} /> {fetching ? "Fetching…" : "Fetch"}
+    </button>
+  );
+}
+
+/** "↓N on GitHub": commits on GitHub that this clone's remote-tracking branch doesn't have (not fetched yet). */
+function GitHubNewsMark({ b, remote }: { b: Branch; remote: string | null }) {
+  const ref = b.remoteRef ?? `${remote ?? "origin"}/${b.name}`;
+  const n = b.githubNew;
+  return (
+    <span
+      className="rr-ab c-amber"
+      title={`Not fetched yet: GitHub has ${n != null ? plural(n, "commit") : "commits"} that this clone’s ${ref} doesn’t; Fetch brings them in, then pull/merge yourself`}
+    >
+      <span><ArrowDown size={10} />{n ?? ""}</span> <span className="rr-ab-label">on GitHub</span>
+    </span>
+  );
+}
+
 /** The main checkout's row: pinned first; its many idle sessions show only in the hover card. */
 function MainRow({ lw, multi, hc }: { lw: LinkedWorktree; multi: boolean; hc: HC }) {
   const act = useAct();
@@ -837,6 +903,9 @@ function MainRow({ lw, multi, hc }: { lw: LinkedWorktree; multi: boolean; hc: HC
   const key = `wt:${wt.path}`;
   const running = sessions.filter((s) => s.running || s.status === "working" || s.status === "needs_input");
   const offBase = wt.branch !== base;
+  const o = useStore((s) => s.repos[lw.root]?.data);
+  const b = branchOf(o, wt.branch);
+  const news = newerOnGitHub(b) ? b : null;
   return (
     <div
       className={`repo-row is-main ${hc.open?.key === key ? "is-hovered" : ""}`}
@@ -860,13 +929,14 @@ function MainRow({ lw, multi, hc }: { lw: LinkedWorktree; multi: boolean; hc: HC
             <span className="muted">{wt.branch}</span>
           )}
           <UpstreamMarks lw={lw} />
+          {news && <GitHubNewsMark b={news} remote={o?.remote ?? null} />}
           {wt.dirty > 0 && <span className="c-amber" title={`${plural(wt.dirty, "uncommitted change")}`}>+{wt.dirty}</span>}
           {wt.procs.length > 0 && (
             <span className="mark c-blue" title={`Running: ${wt.procs.map((p) => p.name).join(", ")}`}>
               <SquareTerminal size={12} /> {wt.procs.length}
             </span>
           )}
-          {!offBase && !wt.dirty && !wt.unpushed && !wt.behindUpstream && wt.upstream && (
+          {!offBase && !wt.dirty && !wt.unpushed && !wt.behindUpstream && wt.upstream && !news && (
             <span className="muted">· in sync with {wt.upstream}</span>
           )}
           <span className="rr-marks">
@@ -950,6 +1020,7 @@ function WorktreeRow({ lw, multi, hc }: { lw: LinkedWorktree; multi: boolean; hc
 
 /** What a branch row needs from its repo: the GitHub slug (links), the remote the remote side refers to, the base. */
 interface BrCtx {
+  root: string; // the repo's main checkout (Fetch)
   slug: string | null;
   remote: string | null;
   base: string;
@@ -961,6 +1032,8 @@ const STALE_HINT =
 /** The branch's name on GitHub when it is there: its remote-tracking branch on the GitHub remote, without "<remote>/". */
 function ghBranch(b: Branch, ctx: BrCtx): string | null {
   const { remote, slug } = ctx;
+  if (slug && newOnGitHub(b)) return b.name;
+  if (b.onGitHub === false) return null;
   if (!slug || !remote || !b.remoteRef || b.upstreamGone || !b.remoteRef.startsWith(`${remote}/`)) return null;
   return b.remoteRef.slice(remote.length + 1);
 }
@@ -973,7 +1046,17 @@ function whereLabel(b: Branch, remote: string | null): string {
   const onRemote = b.remoteRef && !b.upstreamGone;
   if (b.local && onRemote) return `Local branch, tracking ${b.remoteRef}`;
   if (b.local) return b.upstreamGone ? "Local branch; its remote branch was deleted" : `Local branch only, not on ${remote ?? "a remote"}`;
+  if (!b.remoteRef) return newOnGitHub(b) ? `Only on GitHub, not fetched yet: no ${remote ?? "origin"}/${b.name} here` : "Not found";
   return `Only on ${b.remoteRef}, no local branch`;
+}
+
+/** The row's cloud icon tooltip, after whereLabel: what GitHub has that the local copy doesn't. */
+function githubLabel(b: Branch): string {
+  if (newOnGitHub(b)) return "";
+  if (deletedOnGitHub(b)) return `. Deleted on GitHub since the last fetch; Fetch removes ${b.remoteRef}`;
+  if (newerOnGitHub(b))
+    return `. Not fetched yet: GitHub has ${b.githubNew != null ? plural(b.githubNew, "new commit") : "newer commits"} on it that ${b.remoteRef ?? "the local copy"} doesn’t`;
+  return "";
 }
 
 function BranchRow({ lb, ctx, hc }: { lb: LinkedBranch; ctx: BrCtx; hc: HC }) {
@@ -1018,10 +1101,24 @@ function BranchRow({ lb, ctx, hc }: { lb: LinkedBranch; ctx: BrCtx; hc: HC }) {
           </span>
         </div>
         <div className="rr-sub">
-          <span className="br-where" title={whereLabel(b, ctx.remote)}>
+          <span className="br-where" title={whereLabel(b, ctx.remote) + githubLabel(b)}>
             {b.local && <Laptop size={12} />}
-            {b.remoteRef && !b.upstreamGone && <Cloud size={12} />}
+            {((b.remoteRef && !b.upstreamGone) || newOnGitHub(b)) && (
+              <span className={`br-cloud ${newerOnGitHub(b) ? "has-news" : ""} ${newOnGitHub(b) ? "is-unfetched" : ""}`}>
+                <Cloud size={12} />
+              </span>
+            )}
           </span>
+          {newOnGitHub(b) && (
+            <span className="tag tag-amber" title={`Created on GitHub since the last fetch: no ${remote}/${b.name} here yet. Fetch brings it in.`}>
+              new on GitHub
+            </span>
+          )}
+          {deletedOnGitHub(b) && (
+            <span className="tag tag-red" title={`Deleted on GitHub since the last fetch; ${b.remoteRef} is still here until a fetch prunes it`}>
+              deleted on GitHub
+            </span>
+          )}
           {up > 0 && (
             <span className="rr-ab c-amber" title={`${plural(up, "commit")} not pushed to ${b.remoteRef}`}>
               <span><ArrowUp size={10} />{up}</span> <span className="rr-ab-label">not pushed</span>
@@ -1037,7 +1134,7 @@ function BranchRow({ lb, ctx, hc }: { lb: LinkedBranch; ctx: BrCtx; hc: HC }) {
               gone
             </span>
           )}
-          {b.local && !b.remoteRef && !b.upstreamGone && ctx.remote && (
+          {b.local && !b.remoteRef && !b.upstreamGone && ctx.remote && !newOnGitHub(b) && (
             <span className="tag tag-amber" title={`Never pushed to ${ctx.remote}`}>not pushed</span>
           )}
           {!isBase && (b.ahead > 0 || b.behind > 0) && (
@@ -1321,6 +1418,7 @@ function WorktreeCard({ lw, multi }: { lw: LinkedWorktree; multi: boolean }) {
   const toast = useStore((s) => s.toast);
   const { wt, pr, base, isMain } = lw;
   const behindUp = wt.behindUpstream ?? 0;
+  const o = useStore((s) => s.repos[lw.root]?.data);
   // The main checkout keeps many idle sessions: the card lists the most recent ones.
   const sessions = isMain ? lw.sessions.slice(0, 5) : lw.sessions;
   const copy = (text: string, what: string) =>
@@ -1369,7 +1467,7 @@ function WorktreeCard({ lw, multi }: { lw: LinkedWorktree; multi: boolean }) {
                 → <code>{wt.upstream}</code>
                 {wt.unpushed ? <span className="c-amber">{wt.unpushed} unpushed</span> : <span className="muted">pushed</span>}
                 {behindUp > 0 && (
-                  <span title="Navarch never fetches: run git fetch to see newer commits">
+                  <span title="As of the last fetch: Fetch updates the remote-tracking branches">
                     {behindUp} behind origin <span className="muted">(as of the last fetch)</span>
                   </span>
                 )}
@@ -1475,12 +1573,15 @@ function WorktreeCard({ lw, multi }: { lw: LinkedWorktree; multi: boolean }) {
         </div>
       )}
 
+      {isMain && o?.remote && <FetchedLine o={o} branch={wt.branch} />}
+
       <div className="hc-actions">
         {!wt.prunable && (
           <button type="button" className="btn btn-small" onClick={() => act(api.revealPath(wt.path))}>
             <FolderOpen size={12} /> Reveal in Finder
           </button>
         )}
+        {isMain && <FetchButton root={lw.root} />}
         <button type="button" className="btn btn-small btn-ghost" onClick={() => copy(wt.path, "path")}>
           <Copy size={12} /> Path
         </button>
@@ -1490,6 +1591,27 @@ function WorktreeCard({ lw, multi }: { lw: LinkedWorktree; multi: boolean }) {
           </button>
         )}
       </div>
+    </div>
+  );
+}
+
+/** The main checkout card's "Last fetched" line, with what GitHub has that the clone hasn't fetched. Amber when the
+ *  last fetch is over a week old and GitHub has news. */
+function FetchedLine({ o, branch }: { o: RepoOverview; branch: string | null }) {
+  const news = remoteNews(o);
+  const at = o.fetchedAt;
+  const old = !at || Date.now() - at > 7 * 864e5;
+  const b = branchOf(o, branch);
+  const parts = [
+    newerOnGitHub(b) && b && (b.githubNew != null ? `${b.githubNew} new on ${b.name}` : `${b.name} moved`),
+    news.newer.length - (newerOnGitHub(b) ? 1 : 0) > 0 && plural(news.newer.length - (newerOnGitHub(b) ? 1 : 0), "branch") + " moved",
+    news.created.length > 0 && plural(news.created.length, "new branch"),
+    news.deleted.length > 0 && `${news.deleted.length} deleted`,
+  ].filter(Boolean);
+  return (
+    <div className={`hc-fetched ${old && news.any ? "c-amber" : "muted"}`} title={at ? new Date(at).toLocaleString() : undefined}>
+      <CloudDownload size={12} /> {at ? `Last fetched ${relTime(at)}` : "Never fetched"}
+      {parts.length > 0 && <> · GitHub has {parts.join(", ")}</>}
     </div>
   );
 }
@@ -1518,6 +1640,8 @@ function BranchCard({ lb, ctx }: { lb: LinkedBranch; ctx: BrCtx }) {
         </span>
         {b.merged && <span className="pill pill-merged">Merged</span>}
         {b.upstreamGone && <span className="pill pill-closed">Deleted on GitHub</span>}
+        {deletedOnGitHub(b) && <span className="pill pill-closed">Deleted on GitHub</span>}
+        {newOnGitHub(b) && <span className="pill pill-muted">Not fetched</span>}
         {stale && !b.merged && !b.upstreamGone && <span className="pill pill-muted">Stale</span>}
       </div>
       <div className="hc-title is-static br-card-name">{b.name}</div>
@@ -1533,7 +1657,15 @@ function BranchCard({ lb, ctx }: { lb: LinkedBranch; ctx: BrCtx }) {
 
         <span className="hc-k">{slug ? "GitHub" : "Remote"}</span>
         <span className="hc-v">
-          {b.upstreamGone ? (
+          {newOnGitHub(b) ? (
+            <span className="c-amber">New on GitHub, not fetched yet: no {ctx.remote ?? "origin"}/{b.name} here</span>
+          ) : deletedOnGitHub(b) ? (
+            <>
+              <code>{b.remoteRef}</code>
+              <span className="c-red">deleted on GitHub</span>
+              <span className="muted">since the last fetch; Fetch removes the local copy</span>
+            </>
+          ) : b.upstreamGone ? (
             <span className="c-red">Deleted on GitHub{pr?.state === "merged" ? ` after #${pr.number} merged` : ""}</span>
           ) : b.remoteRef ? (
             <>
@@ -1541,11 +1673,18 @@ function BranchCard({ lb, ctx }: { lb: LinkedBranch; ctx: BrCtx }) {
               {b.local &&
                 (up > 0 ? <span className="c-amber">{up} not pushed</span> : down === 0 && <span className="muted">in sync</span>)}
               {down > 0 && (
-                <span title="Navarch never fetches: run git fetch to see newer commits">
+                <span title="As of the last fetch: Fetch updates the remote-tracking branches">
                   {down} behind <span className="muted">(as of the last fetch)</span>
                 </span>
               )}
               {!b.local && <span className="muted">no local branch</span>}
+              {newerOnGitHub(b) ? (
+                <span className="c-amber" title={`GitHub’s ${b.name} has commits that ${b.remoteRef} here doesn’t: Fetch brings them in`}>
+                  GitHub has {b.githubNew != null ? plural(b.githubNew, "new commit") : "newer commits"}, not fetched
+                </span>
+              ) : (
+                b.onGitHub && <span className="muted">same as on GitHub</span>
+              )}
             </>
           ) : (
             <span className={ctx.remote ? "c-amber" : "muted"}>Not on {remoteLabel}</span>
@@ -1603,6 +1742,7 @@ function BranchCard({ lb, ctx }: { lb: LinkedBranch; ctx: BrCtx }) {
         <button type="button" className="btn btn-small" onClick={copy}>
           <Copy size={12} /> Copy name
         </button>
+        {ctx.root && b.onGitHub !== null && <FetchButton root={ctx.root} />}
         {gh && slug && (
           <button type="button" className="btn btn-small btn-ghost" onClick={() => act(api.openUrl(treeUrl(slug, gh)))}>
             <ExternalLink size={12} /> Open on GitHub

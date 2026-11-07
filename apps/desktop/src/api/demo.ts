@@ -360,6 +360,17 @@ export function demoFindRepos(path: string): RepoRef[] {
   return [...(inside ? [ref(inside, "")] : []), ...below].slice(0, 12);
 }
 
+/** Demo repos fetched in this page load, with when (demoFetch). */
+const demoFetched = new Map<string, number>();
+
+/** A `git fetch` of a demo repo (dev mock only): knotfile's first fetch brings 3 commits on main, the branch created on
+ *  GitHub and the prune of the one deleted there; everything else is already up to date. */
+export function demoFetch(root: string): string {
+  const first = !demoFetched.has(root);
+  demoFetched.set(root, Date.now());
+  return first && root.endsWith("/knotfile") ? "main +3 · 1 new branch · 1 deleted" : "Already up to date";
+}
+
 /** The repo behind a demo project folder (or a folder inside it), as `get_repo_overview` would report it. */
 export function demoRepoOverview(path: string): RepoOverview | null {
   const now = Date.now();
@@ -420,12 +431,19 @@ export function demoRepoOverview(path: string): RepoOverview | null {
     const both = (b.local ?? true) && remoteRef != null;
     return {
       name, local: true, remoteRef, upstreamGone: false, head, subject, author: "Robin Vale", committedAt, ahead: 0, behind: 0,
-      merged: false, unpushed: both ? 0 : null, unpulled: both ? 0 : null, checkedOut: null, ...b,
+      merged: false, unpushed: both ? 0 : null, unpulled: both ? 0 : null, checkedOut: null,
+      onGitHub: null, newerOnGitHub: false, githubNew: null, ...b,
     };
   };
+  const fetchedAt = demoFetched.get(root);
   /** The overview with its branches: those checked out in the main checkout and worktrees, plus `extra` (not checked
-   *  out), base first, then newest tip first. `remote` is null for a repo without any remote. */
-  const withBranches = (o: Omit<RepoOverview, "branches" | "branchCount" | "remote">, extra: Branch[], remote: string | null = "origin"): RepoOverview => {
+   *  out), base first, then newest tip first. `remote` is null for a repo without any remote. With GitHub data, a branch
+   *  is on GitHub when it has a remote-tracking branch (unless it says otherwise). Fetched 25 min ago unless `o` says. */
+  const withBranches = (
+    o: Omit<RepoOverview, "branches" | "branchCount" | "remote" | "fetchedAt"> & { fetchedAt?: number | null },
+    extra: Branch[],
+    remote: string | null = "origin",
+  ): RepoOverview => {
     const out = [o.main, ...o.worktrees].flatMap((w): Branch[] =>
       w?.branch
         ? [br(w.branch, w.head, w.subject, w.committedAt, {
@@ -434,8 +452,10 @@ export function demoRepoOverview(path: string): RepoOverview | null {
           })]
         : [],
     );
-    const branches = [...out, ...extra].sort((a, b) => Number(b.name === o.base) - Number(a.name === o.base) || b.committedAt - a.committedAt);
-    return { ...o, branches, branchCount: branches.length, remote };
+    const branches = [...out, ...extra]
+      .map((b) => (o.github ? { ...b, onGitHub: b.onGitHub ?? (!!b.remoteRef && !b.upstreamGone) } : b))
+      .sort((a, b) => Number(b.name === o.base) - Number(a.name === o.base) || b.committedAt - a.committedAt);
+    return { ...o, branches, branchCount: branches.length, remote, fetchedAt: fetchedAt ?? (o.fetchedAt !== undefined ? o.fetchedAt : remote ? m(25) : null) };
   };
 
   if (name === "shiftwren-web") {
@@ -705,16 +725,26 @@ export function demoRepoOverview(path: string): RepoOverview | null {
       ),
       wt({ head: "c9e14b8", subject: "Coalesce FSEvents bursts on macOS", committedAt: d(1.6), behind: 2, merged: true }, "fsevents-coalesce"),
     ];
-    return withBranches({
-      root, base: "main", branch: "main", worktrees, githubError: null,
-      main: main({ head: "52d8e1b", subject: "Release 0.9.2", behindUpstream: 3 }),
+    // Last fetched 9 days ago: git status says main is up to date with origin/main, but GitHub has 3 more commits on
+    // main, a branch created since and one deleted since (until demoFetch).
+    const fetched = demoFetched.has(root);
+    const o = withBranches({
+      root, base: "main", branch: "main", worktrees, githubError: null, fetchedAt: d(9),
+      main: main({ head: "52d8e1b", subject: "Release 0.9.2", behindUpstream: fetched ? 3 : 0 }),
       github: { repo: slug, url: gh, pulls, recentPulls, viewer: ME, issues, fetchedAt: m(3) },
     }, [
       br("docs-migration", "61b2f07", "Migration guide: config keys renamed in 1.0", d(2), { ahead: 2, behind: 4 }),
       br("gitignore-watch", "a9e04d3", "Skip ignored paths before stat", h(6), { local: false, author: "Ana Sousa", ahead: 5, behind: 1 }),
-      br("dependabot/cargo/notify-7.0.0", "3f7c2b8", "Bump notify from 6.1.1 to 7.0.0", d(1), { local: false, author: "dependabot[bot]", ahead: 1, behind: 3 }),
+      ...(fetched
+        ? [br("ana/inotify-fallback", "0b6e2f9", "Fall back to polling when inotify watches run out", h(14), { local: false, author: "Ana Sousa", ahead: 2, behind: 3 })]
+        : [
+            br("ana/inotify-fallback", "0b6e2f9", "Fall back to polling when inotify watches run out", h(14), { local: false, remoteRef: null, author: "Ana Sousa", onGitHub: true }),
+            br("dependabot/cargo/notify-7.0.0", "3f7c2b8", "Bump notify from 6.1.1 to 7.0.0", d(1), { local: false, author: "dependabot[bot]", ahead: 1, behind: 0, onGitHub: false }),
+          ]),
       br("xdg-cache", "e20d9a6", "Keep the cache under XDG_CACHE_HOME", d(8.3), { merged: true, behind: 11 }),
     ]);
+    if (!fetched) o.branches = o.branches.map((b) => (b.name === "main" ? { ...b, newerOnGitHub: true, githubNew: 3 } : b));
+    return o;
   }
 
   if (name === "demo-app") {
