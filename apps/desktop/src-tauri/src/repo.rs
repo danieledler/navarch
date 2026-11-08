@@ -342,6 +342,25 @@ const BRANCHES_MAX: usize = 80;
 /// `github` and `github_error` are `None`) and the branches (empty, count 0: only the chosen repo shows them). Blocks: git calls take well under a second, gh up to 20 s (run
 /// alongside them).
 pub fn overview(path: &str, force: bool, with_github: bool) -> Option<RepoOverview> {
+    overview_in(path, force, if with_github { Gh::Fetch } else { Gh::Skip })
+}
+
+/// How `overview_in` gets GitHub's side.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Gh {
+    /// No GitHub data and no branches (`overview`'s `with_github: false`).
+    Skip,
+    /// The branches, with whatever GitHub data is cached however old (`(None, None)` before the first answer),
+    /// never running gh: an answer in well under a second while a `Fetch` waits for gh.
+    Cached,
+    /// The branches and GitHub data, from gh unless cached for less than 5 min (or `force`).
+    Fetch,
+}
+
+/// `overview` with `Gh::Cached` as a third way: the Repo panel asks for it alongside a `Fetch` so the panel draws
+/// before gh answers.
+pub fn overview_in(path: &str, force: bool, gh_mode: Gh) -> Option<RepoOverview> {
+    let with_github = gh_mode != Gh::Skip;
     let entries = parse_worktrees(&git(path, &["worktree", "list", "--porcelain"])?);
     let main = entries.first()?;
     let root = main.path.clone();
@@ -361,7 +380,12 @@ pub fn overview(path: &str, force: bool, with_github: bool) -> Option<RepoOvervi
     let common = common_dir(&root);
     let fetched_at = common.as_deref().and_then(fetched_at);
     let ((github, github_error), main_wt, worktrees, (mut branches, mut branch_count, remote_oids)) = std::thread::scope(|s| {
-        let gh = with_github.then(|| s.spawn(|| github(&root, slug.as_deref(), force)));
+        let gh = with_github.then(|| {
+            s.spawn(|| match gh_mode {
+                Gh::Cached => github_cached(&root, slug.as_deref()),
+                _ => github(&root, slug.as_deref(), force),
+            })
+        });
         let (base, base_ref, procs, linked_dirs) = (&base, base_ref.as_deref(), &procs, &linked_dirs);
         let (root, remote, checked_out) = (&root, remote.as_deref(), &checked_out);
         let br = with_github.then(|| s.spawn(move || branches(root, base, base_ref, remote, checked_out)));
@@ -1493,6 +1517,14 @@ fn github(root: &str, slug: Option<&str>, force: bool) -> (Option<GitHubInfo>, O
     (github, error)
 }
 
+/// The GitHub data `github` last kept for the repo at `root`, however old; never runs gh. `(None, None)` before
+/// its first answer.
+fn github_cached(root: &str, slug: Option<&str>) -> (Option<GitHubInfo>, Option<String>) {
+    let Some(slug) = slug else { return (None, Some(NO_REMOTE.into())) };
+    let cache = GH_CACHE.lock().ok();
+    cache.and_then(|c| c.get(root).filter(|c| c.slug == slug).map(|c| (c.github.clone(), c.error.clone()))).unwrap_or((None, None))
+}
+
 /// Runs gh (the first of `GH_CLIS` that starts); its stdout, or a message for the panel.
 fn gh(args: &[&str]) -> Result<String, String> {
     for cli in GH_CLIS {
@@ -2278,11 +2310,14 @@ mod tests {
         // Branches come only with with_github (the remote is a local path, so no gh runs).
         let o = overview(main.to_str().unwrap(), false, true);
         let local = overview(main.to_str().unwrap(), false, false);
+        let quick = overview_in(main.to_str().unwrap(), false, Gh::Cached);
         let _ = std::fs::remove_dir_all(&dir);
 
         let local = local.expect("a git repo");
         assert_eq!((local.branches.len(), local.branch_count), (0, 0));
         let o = o.expect("a git repo");
+        let quick = quick.expect("a git repo");
+        assert_eq!((&quick.branches, quick.branch_count, quick.github_error), (&o.branches, o.branch_count, o.github_error.clone()), "cached: the same branches without gh");
         assert_eq!(o.remote.as_deref(), Some("origin"));
         let names: Vec<&str> = o.branches.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(o.branch_count, 9, "{names:?}");

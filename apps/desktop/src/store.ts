@@ -334,6 +334,17 @@ export const useStore = create<State>((set, get) => ({
       });
     if (github) patch(() => ({ loading: true }));
     const stale = () => repoLoads.get(key) !== n || (!github && (repoApplied.get(path) ?? 0) > n);
+    // The backend's GitHub cache (5 min) has likely run out, so this load waits for gh (seconds): draw the git side
+    // (worktrees, branches) and the GitHub data it still has first, unless this load has answered by then.
+    if (github && !force && Date.now() - (get().repos[path]?.ghAt ?? 0) >= 5 * 60_000) {
+      void api.getRepoOverview(path, false, true, true).then(
+        (quick) => {
+          if (stale() || !quick) return;
+          patch((cur) => ({ data: { ...quick, github: quick.github ?? cur.data?.github ?? null }, at: Date.now() }));
+        },
+        () => {},
+      );
+    }
     try {
       const data = await api.getRepoOverview(path, force, github);
       if (stale()) return;

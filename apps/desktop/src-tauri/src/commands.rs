@@ -364,11 +364,21 @@ pub async fn open_tailscale_login(url: String) -> Res<()> {
 
 /// The Repo panel's data for a project folder: its git worktrees and GitHub pull requests and issues;
 /// null when the folder isn't in a git repo. GitHub data is cached 5 min unless `force`; `github: false` reads
-/// only the local git side (no gh call).
+/// only the local git side (no gh call); `cached: true` the branches too, with GitHub data only from the cache.
 #[tauri::command]
-pub async fn get_repo_overview(path: String, force: bool, github: Option<bool>) -> Res<Option<crate::repo::RepoOverview>> {
-    let github = github.unwrap_or(true);
-    tauri::async_runtime::spawn_blocking(move || crate::repo::overview(&path, force, github)).await.map_err(db::err)
+pub async fn get_repo_overview(
+    path: String,
+    force: bool,
+    github: Option<bool>,
+    cached: Option<bool>,
+) -> Res<Option<crate::repo::RepoOverview>> {
+    use crate::repo::Gh;
+    let mode = match (github.unwrap_or(true), cached.unwrap_or(false)) {
+        (false, _) => Gh::Skip,
+        (true, true) => Gh::Cached,
+        (true, false) => Gh::Fetch,
+    };
+    tauri::async_runtime::spawn_blocking(move || crate::repo::overview_in(&path, force, mode)).await.map_err(db::err)
 }
 
 /// The git repos of a project folder for the Repo panel's picker: the one it is in, then those 1–2 folders

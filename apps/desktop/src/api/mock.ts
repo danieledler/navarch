@@ -242,10 +242,13 @@ export function mockApi(): Api {
       console.info("[mock] reveal", path);
     },
     // Made-up repos for the busiest demo projects; GitHub data "fetched" a few minutes ago unless forced.
-    getRepoOverview: async (path, force, github = true) => {
-      await new Promise((r) => setTimeout(r, github ? 150 : 60));
+    getRepoOverview: async (path, force, github = true, cached = false) => {
+      // A full load waits for "gh" (?slowgh makes that 3 s, to see the panel draw before it).
+      const slow = github && !cached && new URLSearchParams(location.search).has("slowgh");
+      await new Promise((r) => setTimeout(r, slow ? 3000 : github && !cached ? 150 : 60));
       const o = demoRepoOverview(path);
       if (o && !github) return { ...o, github: null, githubError: null, branches: [], branchCount: 0 };
+      if (o && cached) return { ...o, github: null, githubError: null };
       if (o?.github && force) o.github.fetchedAt = Date.now();
       return o;
     },
