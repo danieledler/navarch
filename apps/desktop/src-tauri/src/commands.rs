@@ -388,6 +388,13 @@ pub async fn find_repos(path: String) -> Res<Vec<crate::repo::RepoRef>> {
     tauri::async_runtime::spawn_blocking(move || crate::repo::find_repos(&path)).await.map_err(db::err)
 }
 
+/// The Repo panel's GitHub side for a project folder: gh's pull requests and issues (cached 5 min unless `force`)
+/// and the branches compared with GitHub, without the worktrees; null when the folder isn't in a git repo.
+#[tauri::command]
+pub async fn get_repo_github(path: String, force: bool) -> Res<Option<crate::repo::RepoGitHub>> {
+    tauri::async_runtime::spawn_blocking(move || crate::repo::github_side(&path, force)).await.map_err(db::err)
+}
+
 /// `git fetch --prune` of the GitHub remote in the repo whose main checkout is `root` (remote-tracking refs only,
 /// never a pull); a one-line summary of what changed, or git's error. No prompts, 60 s timeout.
 #[tauri::command]

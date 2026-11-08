@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api, type Id, type RepoOverview, type RepoRef, type Session, type Snapshot, type SystemStats, type Usage } from "./api";
+import { api, type Branch, type Id, type RepoGitHub, type RepoOverview, type RepoRef, type Session, type Snapshot, type SystemStats, type Usage } from "./api";
 import { baseName } from "./lib/format";
 import { buildModel, type Model } from "./lib/model";
 
@@ -136,12 +136,71 @@ let reloadSeq = 0;
 let appliedReload = 0;
 // Repo loads in flight, by kind and path ("gh:<path>" or "local:<path>"): the newest one's number. An older one
 // finishing later is dropped.
+/** A git-side overview (`cached`) that arrived before gh answered, with no GitHub data cached in the backend (after a
+ *  launch): keeps the GitHub data and the branches' GitHub fields already shown, rather than none until gh answers. */
+function keepGitHub(d: RepoOverview, prev: RepoOverview | null): RepoOverview {
+  if (d.github || !prev?.github) return d;
+  const was = new Map(prev.branches.map((b) => [b.name, b]));
+  const branches = d.branches.map((b): Branch => {
+    const p = was.get(b.name);
+    return p ? { ...b, onGitHub: p.onGitHub, newerOnGitHub: p.newerOnGitHub, githubNew: p.githubNew, ci: p.ci } : b;
+  });
+  return { ...d, github: prev.github, githubError: prev.githubError, branches };
+}
+
 const repoLoads = new Map<string, number>();
 // The number of the newest load applied per path, so a local-only load that started before it is dropped.
 const repoApplied = new Map<string, number>();
 let repoSeq = 0;
 // Project folders whose repo search is running.
 const repoFinds = new Set<string>();
+
+/** The repos' last overviews and the folders' repo lists, kept across launches so a project opened before draws its
+ *  Repo panel at once (then refreshes, as on every visit): the `REPO_CACHE_MAX` most recently loaded repos. */
+const REPO_CACHE = "navarch-repo-cache";
+const REPO_CACHE_MAX = 8;
+const REPO_CACHE_BYTES = 2_000_000;
+interface RepoCache {
+  repos: Record<string, Pick<RepoState, "data" | "at" | "ghAt">>;
+  lists: Record<string, { repos: RepoRef[]; at: number } | undefined>;
+}
+
+function readRepoCache(): { repos: Record<string, RepoState | undefined>; repoLists: RepoCache["lists"] } {
+  try {
+    const c = JSON.parse(localStorage.getItem(REPO_CACHE) ?? "null") as RepoCache | null;
+    if (!c?.repos) return { repos: {}, repoLists: {} };
+    const repos = Object.fromEntries(Object.entries(c.repos).map(([k, r]) => [k, { ...r, loading: false, error: null }]));
+    return { repos, repoLists: c.lists ?? {} };
+  } catch {
+    return { repos: {}, repoLists: {} };
+  }
+}
+
+let repoCacheTimer: ReturnType<typeof setTimeout> | undefined;
+/** Saves the cache a few seconds after the last change (loads land in bursts), newest repos first, within
+ *  `REPO_CACHE_BYTES`. */
+function saveRepoCache(repos: Record<string, RepoState | undefined>, lists: RepoCache["lists"]) {
+  clearTimeout(repoCacheTimer);
+  repoCacheTimer = setTimeout(() => {
+    let kept = Object.entries(repos)
+      .filter((e): e is [string, RepoState] => !!e[1]?.data)
+      .sort((a, b) => b[1].at - a[1].at)
+      .slice(0, REPO_CACHE_MAX);
+    try {
+      for (;;) {
+        const c: RepoCache = { repos: Object.fromEntries(kept.map(([k, r]) => [k, { data: r.data, at: r.at, ghAt: r.ghAt }])), lists };
+        const json = JSON.stringify(c);
+        if (json.length <= REPO_CACHE_BYTES || kept.length === 0) {
+          localStorage.setItem(REPO_CACHE, json);
+          return;
+        }
+        kept = kept.slice(0, -1);
+      }
+    } catch {
+      // Storage full or unavailable: the panel just loads as before.
+    }
+  }, 3000);
+}
 
 // Undoable actions, newest last, keyed by the toast that announced them.
 const undoStack: ({ id: number; text: string } & Undoable)[] = [];
@@ -171,8 +230,7 @@ export const useStore = create<State>((set, get) => ({
   editing: null,
   toasts: [],
   flashSession: null,
-  repos: {},
-  repoLists: {},
+  ...readRepoCache(),
   fetching: {},
   pushing: {},
 
@@ -332,43 +390,53 @@ export const useStore = create<State>((set, get) => ({
         const cur: RepoState = { data: null, loading: false, error: null, at: 0, ghAt: 0, ...s.repos[path] };
         return { repos: { ...s.repos, [path]: { ...cur, ...p(cur) } } };
       });
-    if (github) patch(() => ({ loading: true }));
     const stale = () => repoLoads.get(key) !== n || (!github && (repoApplied.get(path) ?? 0) > n);
-    // The backend's GitHub cache (5 min) has likely run out, so this load waits for gh (seconds): draw the git side
-    // (worktrees, branches) and the GitHub data it still has first, unless this load has answered by then.
-    if (github && !force && Date.now() - (get().repos[path]?.ghAt ?? 0) >= 5 * 60_000) {
-      void api.getRepoOverview(path, false, true, true).then(
-        (quick) => {
-          if (stale() || !quick) return;
-          patch((cur) => ({ data: { ...quick, github: quick.github ?? cur.data?.github ?? null }, at: Date.now() }));
-        },
-        () => {},
-      );
+    if (github) {
+      // The chosen repo: the git side (worktrees, and the branches compared with whatever GitHub data the backend has
+      // cached) and the GitHub side (gh: seconds once its 5-min cache has run out) load at once, each drawn as it lands.
+      patch(() => ({ loading: true }));
+      let side: RepoGitHub | null = null; // this load's GitHub side, once it landed
+      const withSide = (d: RepoOverview, g: RepoGitHub): RepoOverview => ({
+        ...d, github: g.github, githubError: g.githubError, branches: g.branches, branchCount: g.branchCount,
+      });
+      const local = api.getRepoOverview(path, false, true, true).then((data) => {
+        if (stale()) return;
+        repoApplied.set(path, Math.max(n, repoApplied.get(path) ?? 0));
+        patch((cur) => ({ data: data && (side ? withSide(data, side) : keepGitHub(data, cur.data)), error: null, at: Date.now() }));
+      });
+      const remote = api.getRepoGitHub(path, force).then((g) => {
+        if (stale()) return;
+        side = g;
+        patch((cur) => ({ data: cur.data && g ? withSide(cur.data, g) : cur.data, ghAt: Date.now() }));
+      });
+      try {
+        const failed = (await Promise.allSettled([local, remote])).find((r) => r.status === "rejected");
+        if (stale()) return;
+        const e = failed?.reason;
+        patch(() => ({ loading: false, ...(failed ? { error: String(e) } : {}) }));
+        if (failed && force) get().toast(`Couldn’t load the repo: ${e}`, undefined, "error");
+      } finally {
+        if (repoLoads.get(key) === n) repoLoads.delete(key);
+      }
+      return;
     }
     try {
       const data = await api.getRepoOverview(path, force, github);
       if (stale()) return;
       repoApplied.set(path, Math.max(n, repoApplied.get(path) ?? 0));
       const now = Date.now();
-      patch((cur) =>
-        github
-          ? { data, loading: false, error: null, at: now, ghAt: now }
-          : // Local only: keep the GitHub side and the branches (only full loads read them) of the last full load
-            // while it is fresh (the backend's 5-min cache), so a repo picked once and left doesn't show stale PRs
-            // on its worktrees for the rest of the run, and picking it again doesn't flash an empty Branches column.
-            (() => {
-              const fresh = now - cur.ghAt < 5 * 60_000;
-              const prev = fresh ? cur.data : null;
-              const github = prev?.github ?? null;
-              const githubError = prev?.githubError ?? null;
-              const branches = prev?.branches ?? [];
-              const branchCount = prev?.branchCount ?? 0;
-              return { data: data && { ...data, github, githubError, branches, branchCount }, error: null, at: now };
-            })(),
-      );
+      // Local only: keep the GitHub side and the branches (only the chosen repo's loads read them) of the last such
+      // load while it is fresh (the backend's 5-min cache), so a repo picked once and left doesn't show stale PRs on
+      // its worktrees for the rest of the run, and picking it again doesn't flash an empty Branches column.
+      patch((cur) => {
+        const prev = now - cur.ghAt < 5 * 60_000 ? cur.data : null;
+        const gh = { github: prev?.github ?? null, githubError: prev?.githubError ?? null };
+        const br = { branches: prev?.branches ?? [], branchCount: prev?.branchCount ?? 0 };
+        return { data: data && { ...data, ...gh, ...br }, error: null, at: now };
+      });
     } catch (e) {
       if (repoLoads.get(key) !== n) return;
-      patch(() => (github ? { loading: false, error: String(e) } : { error: String(e) }));
+      patch(() => ({ error: String(e) }));
       if (force) get().toast(`Couldn’t load the repo: ${e}`, undefined, "error");
     } finally {
       if (repoLoads.get(key) === n) repoLoads.delete(key);
@@ -446,3 +514,7 @@ export function useModel(): Model {
   if (!cached || cached.snap !== snap || cached.sessions !== sessions) cached = { snap, sessions, model: buildModel(snap, sessions) };
   return cached.model;
 }
+
+useStore.subscribe((s, prev) => {
+  if (s.repos !== prev.repos || s.repoLists !== prev.repoLists) saveRepoCache(s.repos, s.repoLists);
+});

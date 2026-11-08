@@ -356,6 +356,16 @@ export interface RepoRef {
 }
 
 /** What `get_repo_overview` returns for a folder inside a git repo (null for any other folder). */
+/** The GitHub side of a repo (get_repo_github): gh's data and the branches compared with it, without the worktrees.
+ *  The Repo panel loads it alongside a git-only overview and puts its fields over that one's. */
+export interface RepoGitHub {
+  root: string;
+  branches: Branch[]; // as RepoOverview.branches
+  branchCount: number;
+  github: GitHubInfo | null;
+  githubError: string | null;
+}
+
 export interface RepoOverview {
   root: string; // the repo's main checkout
   base: string; // branch worktrees are compared with: origin's default branch if known, else main/master

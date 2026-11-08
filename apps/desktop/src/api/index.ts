@@ -1,4 +1,4 @@
-import type { BuildInfo, CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Tailscale, TailscaleServe, Period, Project, RepoOverview, RepoRef, Session, Snapshot, Space, SystemStats, Task, TaskPatch, Usage } from "./types";
+import type { BuildInfo, CpuSample, Id, LimitAlerts, MobileAccess, PairingCode, Tailscale, TailscaleServe, Period, Project, RepoGitHub, RepoOverview, RepoRef, Session, Snapshot, Space, SystemStats, Task, TaskPatch, Usage } from "./types";
 import { mockApi } from "./mock";
 
 export * from "./types";
@@ -34,6 +34,8 @@ export interface Api {
   /** `github: false`: the local git side only, no branches. `cached: true`: with the branches, and GitHub data only
    *  from the backend's cache (no gh call), to draw the panel while a full load waits for gh. */
   getRepoOverview(path: string, force: boolean, github?: boolean, cached?: boolean): Promise<RepoOverview | null>;
+  /** gh's data (cached 5 min unless `force`) and the branches compared with it; no worktrees. */
+  getRepoGitHub(path: string, force: boolean): Promise<RepoGitHub | null>;
   /** Git repos of a project folder: the repo it is in (first), then repos 1–2 folders below it (dot-folders,
    *  node_modules and the like skipped; worktrees resolved to their main checkout; duplicates dropped), plus the
    *  repos of worktrees in `<path>/.claude/worktrees/*` (sessions start in the project folder, so their worktrees
@@ -142,6 +144,7 @@ function tauriApi(): Api {
     openSession: (sessionId) => call("open_session", { sessionId }),
     revealPath: (path) => call("reveal_path", { path }),
     getRepoOverview: (path, force, github = true, cached = false) => call("get_repo_overview", { path, force, github, cached }),
+    getRepoGitHub: (path, force) => call("get_repo_github", { path, force }),
     findRepos: (path) => call("find_repos", { path }),
     gitFetch: (root) => call("git_fetch", { root }),
     gitPush: (root, branch) => call("git_push", { root, branch }),

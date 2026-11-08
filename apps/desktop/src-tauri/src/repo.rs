@@ -1,4 +1,4 @@
-//! The Repo panel's data (`get_repo_overview`): a project folder's git worktrees, compared with the base
+//! The Repo panel's data (`get_repo_overview`, `get_repo_github`): a project folder's git worktrees, compared with the base
 //! branch, and its GitHub pull requests and issues through the `gh` CLI. Nothing runs in the background: only
 //! when the UI asks. git runs as /usr/bin/git (5 s timeout, never through a shell, no optional locks so a
 //! working session's index.lock is never taken); gh signs in on its own (its token is never read here) and its
@@ -298,6 +298,19 @@ pub struct RepoOverview {
     pub github_error: Option<String>,
 }
 
+/// The GitHub side of a repo (`RepoGitHub` in types.ts, `github_side`): gh's data and the branches compared with
+/// it, without the worktrees, so the Repo panel draws those from a `Gh::Cached` overview without waiting for gh.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoGitHub {
+    pub root: String,
+    /// As `RepoOverview.branches` and `branch_count`.
+    pub branches: Vec<Branch>,
+    pub branch_count: usize,
+    pub github: Option<GitHubInfo>,
+    pub github_error: Option<String>,
+}
+
 /// A branch name with its local and remote side (`Branch` in types.ts).
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -351,35 +364,22 @@ pub enum Gh {
     /// No GitHub data and no branches (`overview`'s `with_github: false`).
     Skip,
     /// The branches, with whatever GitHub data is cached however old (`(None, None)` before the first answer),
-    /// never running gh: an answer in well under a second while a `Fetch` waits for gh.
+    /// never running gh: the Repo panel draws from it while `github_side` waits for gh (~0.55 s against ~2.3 s on a
+    /// repo with 17 worktrees and 60 branches).
     Cached,
     /// The branches and GitHub data, from gh unless cached for less than 5 min (or `force`).
     Fetch,
 }
 
-/// `overview` with `Gh::Cached` as a third way: the Repo panel asks for it alongside a `Fetch` so the panel draws
-/// before gh answers.
+/// `overview` with `Gh::Cached` as a third way: the Repo panel draws from it while `github_side` waits for gh.
 pub fn overview_in(path: &str, force: bool, gh_mode: Gh) -> Option<RepoOverview> {
     let with_github = gh_mode != Gh::Skip;
-    let entries = parse_worktrees(&git(path, &["worktree", "list", "--porcelain"])?);
+    let RepoSetup { entries, root, base, base_ref, slug, remote, checked_out, linked_dirs, common } = setup(path)?;
     let main = entries.first()?;
-    let root = main.path.clone();
-    let (base, base_ref) = base_branch(&root, main.branch.as_deref());
-    let remote_v = git(&root, &["remote", "-v"]);
-    let slug = remote_v.as_deref().and_then(slug_from_remotes);
-    let remote = remote_v.as_deref().and_then(github_remote);
     let procs = cwd_procs();
     let linked: Vec<&WtEntry> = entries[1..].iter().filter(|e| !e.bare).collect();
-    // The main checkout leaves out the linked worktrees' folders (often inside it, in .claude/worktrees).
-    let linked_dirs: Vec<PathBuf> = linked.iter().map(|e| canonical(&e.path)).collect();
-    let checked_out: HashMap<String, String> = entries
-        .iter()
-        .filter(|e| !e.bare && !e.prunable)
-        .filter_map(|e| Some((e.branch.clone()?, e.path.clone())))
-        .collect();
-    let common = common_dir(&root);
     let fetched_at = common.as_deref().and_then(fetched_at);
-    let ((github, github_error), main_wt, worktrees, (mut branches, mut branch_count, remote_oids)) = std::thread::scope(|s| {
+    let ((github, github_error), main_wt, worktrees, listed) = std::thread::scope(|s| {
         let gh = with_github.then(|| {
             s.spawn(|| match gh_mode {
                 Gh::Cached => github_cached(&root, slug.as_deref()),
@@ -402,23 +402,10 @@ pub fn overview_in(path: &str, force: bool, gh_mode: Gh) -> Option<RepoOverview>
         let gh = gh.map_or((None, None), |h| h.join().unwrap_or_else(|_| (None, Some("GitHub lookup failed".into()))));
         (gh, main_wt, worktrees, br.map(|h| h.join().unwrap_or_default()).unwrap_or_default())
     });
-    let gh_tips = github.as_ref().and_then(|g| Some((g.tips.as_ref()?, g.fetched_at)));
-    if let (Some((tips, tips_at)), Some(remote)) = (gh_tips, remote.as_deref()) {
-        // Read after the refs were: a change in between only makes the comparison more cautious.
-        let refs_at = common.as_deref().and_then(|c| remote_refs_changed_at(c, remote));
-        let shallow = common.as_deref().is_some_and(|c| c.join("shallow").exists());
-        let added = github_tips(&root, remote, &base, &mut branches, &remote_oids, tips, (tips_at, refs_at), shallow);
-        if added > 0 {
-            branch_count += added;
-            sort_branches(&mut branches, &base);
-            branches = cap_branches(branches, &base);
-        }
-    }
-    // A fresh branch with uncommitted work in its checkout is ahead 0 too: not merged (as for worktrees).
-    for b in branches.iter_mut().filter(|b| b.merged) {
-        let dirty = main_wt.iter().chain(&worktrees).any(|w| Some(&w.path) == b.checked_out.as_ref() && w.dirty > 0);
-        b.merged = !dirty;
-    }
+    let dirty = |p: &str| main_wt.iter().chain(&worktrees).any(|w| w.path == p && w.dirty > 0);
+    let st = RepoSetup { entries: Vec::new(), root, base, base_ref, slug, remote, checked_out, linked_dirs, common };
+    let (branches, branch_count) = compared_branches(&st, listed, github.as_ref(), dirty);
+    let RepoSetup { root, base, remote, .. } = st;
     Some(RepoOverview {
         root,
         base,
@@ -432,6 +419,88 @@ pub fn overview_in(path: &str, force: bool, gh_mode: Gh) -> Option<RepoOverview>
         github,
         github_error,
     })
+}
+
+/// What the overview and the GitHub side read first: the worktree list, the base branch and the remotes.
+struct RepoSetup {
+    entries: Vec<WtEntry>,
+    /// The main checkout.
+    root: String,
+    base: String,
+    base_ref: Option<String>,
+    slug: Option<String>,
+    remote: Option<String>,
+    /// Branch → the folder that has it checked out.
+    checked_out: HashMap<String, String>,
+    /// The linked worktrees' folders, which the main checkout's status and processes leave out (they are often
+    /// inside it, in .claude/worktrees).
+    linked_dirs: Vec<PathBuf>,
+    common: Option<PathBuf>,
+}
+
+fn setup(path: &str) -> Option<RepoSetup> {
+    let entries = parse_worktrees(&git(path, &["worktree", "list", "--porcelain"])?);
+    let main = entries.first()?;
+    let root = main.path.clone();
+    let (base, base_ref) = base_branch(&root, main.branch.as_deref());
+    let remote_v = git(&root, &["remote", "-v"]);
+    let slug = remote_v.as_deref().and_then(slug_from_remotes);
+    let remote = remote_v.as_deref().and_then(github_remote);
+    let linked_dirs = entries[1..].iter().filter(|e| !e.bare).map(|e| canonical(&e.path)).collect();
+    let checked_out = entries
+        .iter()
+        .filter(|e| !e.bare && !e.prunable)
+        .filter_map(|e| Some((e.branch.clone()?, e.path.clone())))
+        .collect();
+    let common = common_dir(&root);
+    Some(RepoSetup { entries, root, base, base_ref, slug, remote, checked_out, linked_dirs, common })
+}
+
+/// `branches`' answer compared with GitHub's tips in `github` (when it has them), sorted and capped again when GitHub
+/// added branches. `dirty(folder)`: a checkout with uncommitted changes, where a branch that looks merged isn't.
+fn compared_branches(
+    st: &RepoSetup,
+    (mut branches, mut count, remote_oids): (Vec<Branch>, usize, HashMap<String, String>),
+    github: Option<&GitHubInfo>,
+    dirty: impl Fn(&str) -> bool,
+) -> (Vec<Branch>, usize) {
+    let gh_tips = github.and_then(|g| Some((g.tips.as_ref()?, g.fetched_at)));
+    if let (Some((tips, tips_at)), Some(remote)) = (gh_tips, st.remote.as_deref()) {
+        // Read after the refs were: a change in between only makes the comparison more cautious.
+        let common = st.common.as_deref();
+        let refs_at = common.and_then(|c| remote_refs_changed_at(c, remote));
+        let shallow = common.is_some_and(|c| c.join("shallow").exists());
+        let added = github_tips(&st.root, remote, &st.base, &mut branches, &remote_oids, tips, (tips_at, refs_at), shallow);
+        if added > 0 {
+            count += added;
+            sort_branches(&mut branches, &st.base);
+            branches = cap_branches(branches, &st.base);
+        }
+    }
+    // A fresh branch with uncommitted work in its checkout is ahead 0 too: not merged (as for worktrees).
+    for b in branches.iter_mut().filter(|b| b.merged) {
+        b.merged = !b.checked_out.as_deref().is_some_and(&dirty);
+    }
+    (branches, count)
+}
+
+/// The GitHub side of the repo `path` is in: gh's data (cached 5 min unless `force`) and the branches compared with
+/// it; no worktrees, so it takes gh's time plus the branch list's (~0.1 s on a repo with 60 branches). `None` when
+/// `path` isn't in a git repo.
+pub fn github_side(path: &str, force: bool) -> Option<RepoGitHub> {
+    let st = setup(path)?;
+    let ((github, github_error), listed) = std::thread::scope(|s| {
+        let gh = s.spawn(|| github(&st.root, st.slug.as_deref(), force));
+        let listed = branches(&st.root, &st.base, st.base_ref.as_deref(), st.remote.as_deref(), &st.checked_out);
+        (gh.join().unwrap_or_else(|_| (None, Some("GitHub lookup failed".into()))), listed)
+    });
+    // Only branches that look merged need their checkout's status (rare); a failed status counts as dirty.
+    let dirty = |p: &str| {
+        let exclude: &[PathBuf] = if p == st.root { &st.linked_dirs } else { &[] };
+        status(p, &canonical(p), exclude).is_none_or(|l| !l.is_empty())
+    };
+    let (branches, branch_count) = compared_branches(&st, listed, github.as_ref(), dirty);
+    Some(RepoGitHub { root: st.root.clone(), branches, branch_count, github, github_error })
 }
 
 // ── Branches ──
@@ -2311,6 +2380,7 @@ mod tests {
         let o = overview(main.to_str().unwrap(), false, true);
         let local = overview(main.to_str().unwrap(), false, false);
         let quick = overview_in(main.to_str().unwrap(), false, Gh::Cached);
+        let side = github_side(main.to_str().unwrap(), false);
         let _ = std::fs::remove_dir_all(&dir);
 
         let local = local.expect("a git repo");
@@ -2318,6 +2388,8 @@ mod tests {
         let o = o.expect("a git repo");
         let quick = quick.expect("a git repo");
         assert_eq!((&quick.branches, quick.branch_count, quick.github_error), (&o.branches, o.branch_count, o.github_error.clone()), "cached: the same branches without gh");
+        let side = side.expect("a git repo");
+        assert_eq!((&side.branches, side.branch_count, &side.github_error, side.root.as_str()), (&o.branches, o.branch_count, &o.github_error, o.root.as_str()), "the GitHub side: the same branches, no worktrees");
         assert_eq!(o.remote.as_deref(), Some("origin"));
         let names: Vec<&str> = o.branches.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(o.branch_count, 9, "{names:?}");
@@ -2631,6 +2703,54 @@ mod tests {
         assert!(fetched.is_some_and(|t| Some(t) > before.or(Some(0))), "{before:?} {fetched:?}");
         assert!(in_worktree.is_err() && not_root.is_err(), "{in_worktree:?} {not_root:?}");
         assert!(none.is_none() && from_wt.is_some(), "{none:?} {from_wt:?}");
+    }
+
+    #[test]
+    #[ignore = "live: times the parts of a repo overview (NAVARCH_LIVE_REPO, else Infomap); no gh"]
+    fn overview_timing_live() {
+        let path = std::env::var("NAVARCH_LIVE_REPO").unwrap_or("/Users/daniel/dev/projects/icelab/code/infomap/Infomap".into());
+        let ms = |t: Instant| t.elapsed().as_millis();
+        for round in ["cold", "warm"] {
+            let t = Instant::now();
+            let repos = find_repos(&path);
+            let find = ms(t);
+            let t = Instant::now();
+            let procs = cwd_procs();
+            let procs_ms = ms(t);
+            let t = Instant::now();
+            let entries = parse_worktrees(&git(&path, &["worktree", "list", "--porcelain"]).unwrap());
+            let (base, base_ref) = base_branch(&entries[0].path, entries[0].branch.as_deref());
+            let list = ms(t);
+            let mut each: Vec<(u128, String)> = entries[1..]
+                .iter()
+                .map(|e| {
+                    let t = Instant::now();
+                    worktree(e, &base, base_ref.as_deref(), &procs, &[]);
+                    (ms(t), e.path.rsplit('/').next().unwrap_or_default().to_string())
+                })
+                .collect();
+            each.sort_by(|a, b| b.0.cmp(&a.0));
+            let t = Instant::now();
+            let s = status(&entries[1].path, &canonical(&entries[1].path), &[]);
+            let one_status = ms(t);
+            let t = Instant::now();
+            let (bs, _, _) = branches(&entries[0].path, &base, base_ref.as_deref(), Some("origin"), &HashMap::new());
+            println!("  branches {} ms ({} of them)", ms(t), bs.len());
+            let t = Instant::now();
+            let o = overview_in(&path, false, Gh::Skip).unwrap();
+            let skip = ms(t);
+            let t = Instant::now();
+            let c = overview_in(&path, false, Gh::Cached).unwrap();
+            let cached = ms(t);
+            println!(
+                "{round}: find_repos {find} ms ({} repos), procs {procs_ms} ms, list+base {list} ms, Skip {skip} ms ({} wt), Cached {cached} ms ({} branches), status of {} {one_status} ms ({:?} lines)",
+                repos.len(), o.worktrees.len(), c.branches.len(), each.first().map(|e| e.1.as_str()).unwrap_or(""), s.map(|l| l.len())
+            );
+            println!("  slowest worktrees, one at a time: {:?}", &each[..each.len().min(6)]);
+            let t = Instant::now();
+            let g = github_side(&path, round == "cold").unwrap();
+            println!("  github_side {} ms ({} branches, error {:?})", ms(t), g.branches.len(), g.github_error);
+        }
     }
 
     #[test]

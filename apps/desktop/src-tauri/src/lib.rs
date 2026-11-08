@@ -312,6 +312,7 @@ pub fn run() {
             commands::tailscale_serve,
             commands::open_tailscale_login,
             commands::get_repo_overview,
+            commands::get_repo_github,
             commands::find_repos,
             commands::git_fetch,
             commands::git_push,

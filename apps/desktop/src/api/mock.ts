@@ -243,14 +243,21 @@ export function mockApi(): Api {
     },
     // Made-up repos for the busiest demo projects; GitHub data "fetched" a few minutes ago unless forced.
     getRepoOverview: async (path, force, github = true, cached = false) => {
-      // A full load waits for "gh" (?slowgh makes that 3 s, to see the panel draw before it).
-      const slow = github && !cached && new URLSearchParams(location.search).has("slowgh");
-      await new Promise((r) => setTimeout(r, slow ? 3000 : github && !cached ? 150 : 60));
+      await new Promise((r) => setTimeout(r, github && !cached ? 150 : 60));
       const o = demoRepoOverview(path);
       if (o && !github) return { ...o, github: null, githubError: null, branches: [], branchCount: 0 };
-      if (o && cached) return { ...o, github: null, githubError: null };
+      // As after a launch: nothing cached from gh yet.
+      if (o && cached) return { ...o, github: null, githubError: null, branches: o.branches.map((b) => ({ ...b, ci: null })) };
       if (o?.github && force) o.github.fetchedAt = Date.now();
       return o;
+    },
+    // ?slowgh makes "gh" take 3 s, to see the panel draw before it.
+    getRepoGitHub: async (path, force) => {
+      await new Promise((r) => setTimeout(r, new URLSearchParams(location.search).has("slowgh") ? 3000 : 150));
+      const o = demoRepoOverview(path);
+      if (!o) return null;
+      if (o.github && force) o.github.fetchedAt = Date.now();
+      return { root: o.root, branches: o.branches, branchCount: o.branchCount, github: o.github, githubError: o.githubError };
     },
     gitFetch: async (root) => {
       if (import.meta.env.PROD) throw "In the app this runs git fetch. The demo has no real repos.";
