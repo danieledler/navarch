@@ -92,6 +92,17 @@ pub struct PrCheck {
     pub state: CheckState,
 }
 
+/// GitHub's checks on a commit (`statusCheckRollup`): a branch's tip there.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct CommitChecks {
+    /// Full object name of the commit.
+    pub oid: String,
+    /// GitHub's rollup over all the checks (the list may be cut).
+    pub state: CheckState,
+    /// Failing first, at most `CHECKS_MAX`.
+    pub checks: Vec<PrCheck>,
+}
+
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Label {
     pub name: String,
@@ -260,6 +271,7 @@ pub struct GitHubHead {
     /// Unix ms of the tip commit; 0 when unknown.
     pub at: i64,
     pub subject: String,
+    pub ci: Option<CommitChecks>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -317,6 +329,8 @@ pub struct Branch {
     pub newer_on_github: bool,
     /// How many commits that is, when known (the base branch).
     pub github_new: Option<u32>,
+    /// The checks on GitHub's tip of this branch (last gh query); `None` without GitHub data or checks.
+    pub ci: Option<CommitChecks>,
 }
 
 const BRANCHES_MAX: usize = 80;
@@ -507,6 +521,7 @@ fn build_branches(
                 on_github: None,
                 newer_on_github: false,
                 github_new: None,
+                ci: None,
                 head: r.head,
                 subject: r.subject,
                 author: r.author,
@@ -528,6 +543,7 @@ fn build_branches(
         on_github: None,
         newer_on_github: false,
         github_new: None,
+        ci: None,
         head: r.head,
         subject: r.subject,
         author: r.author,
@@ -718,6 +734,7 @@ fn compare_github(
     for (i, b) in branches.iter_mut().enumerate() {
         b.github_new = None;
         b.newer_on_github = false;
+        b.ci = gh.get(b.name.as_str()).and_then(|h| h.ci.clone());
         let Some(h) = gh.get(b.name.as_str()) else {
             b.on_github = (tips.complete && current).then_some(false);
             continue;
@@ -765,6 +782,7 @@ fn compare_github(
             newer_on_github: true,
             // Never fetched: all of GitHub's commits are new.
             github_new: (is_default && h.name == base).then_some(tips.default_commits).flatten().map(|c| c as u32),
+            ci: h.ci.clone(),
         })
         .collect();
     if is_default {
@@ -1513,8 +1531,12 @@ fn flatten_nodes(v: Value) -> Value {
 }
 
 /// The repository fields asked along with the issues: GitHub's branch tips (`GitHubTips`).
-const TIPS_SELECTION: &str = "defaultBranchRef { name target { oid ... on Commit { history(first: 0) { totalCount } } } }
-  heads: refs(refPrefix: \"refs/heads/\", first: 100) { totalCount nodes { name target { oid ... on Commit { committedDate messageHeadline } } } }";
+/// With each tip's checks: on a busy repo (cli/cli, 100 branches) ~2 s instead of ~0.6 s.
+const TIPS_SELECTION: &str = "defaultBranchRef { name target { oid ... on Commit { history(first: 0) { totalCount } ...rollup } } }
+  heads: refs(refPrefix: \"refs/heads/\", first: 100) { totalCount nodes { name target { oid ... on Commit { committedDate messageHeadline ...rollup } } } }";
+/// The fragment `TIPS_SELECTION` uses: a commit's check rollup and its first `CHECKS_MAX` checks.
+const ROLLUP_FRAGMENT: &str = "fragment rollup on Commit { statusCheckRollup { state contexts(first: 20) { nodes {
+  __typename ... on CheckRun { name status conclusion } ... on StatusContext { context state } } } } }";
 
 /// One connection of `owner/name` (`selection` is e.g. `pullRequests(...) { nodes { ...pr } }`), its nodes, and
 /// the login gh is signed in as (asked along, free); `extra` repository fields come back in the third value (the
@@ -1547,7 +1569,13 @@ pub fn parse_tips(repo: &Value) -> Option<GitHubTips> {
         .iter()
         .map(|n| {
             let t = n.get("target").unwrap_or(&Value::Null);
-            GitHubHead { name: text(n, "name"), oid: text(t, "oid"), at: ms(t, "committedDate").unwrap_or(0), subject: text(t, "messageHeadline") }
+            GitHubHead {
+                name: text(n, "name"),
+                oid: text(t, "oid"),
+                at: ms(t, "committedDate").unwrap_or(0),
+                subject: text(t, "messageHeadline"),
+                ci: commit_checks(t),
+            }
         })
         .filter(|h| !h.name.is_empty())
         .collect();
@@ -1559,10 +1587,25 @@ pub fn parse_tips(repo: &Value) -> Option<GitHubTips> {
     // Past the cut, the default branch still counts.
     if let (Some(name), Some(t)) = (&default_branch, target) {
         if !heads.iter().any(|h| &h.name == name) {
-            heads.push(GitHubHead { name: name.clone(), oid: text(t, "oid"), ..Default::default() });
+            heads.push(GitHubHead { name: name.clone(), oid: text(t, "oid"), ci: commit_checks(t), ..Default::default() });
         }
     }
     Some(GitHubTips { heads, complete, default_branch, default_commits })
+}
+
+/// A commit's `statusCheckRollup` (nodes flattened) → its checks; `None` when it has none.
+fn commit_checks(commit: &Value) -> Option<CommitChecks> {
+    let r = commit.get("statusCheckRollup").filter(|r| !r.is_null())?;
+    let mut list = checks(r.get("contexts").and_then(Value::as_array).map_or(&[][..], Vec::as_slice));
+    let state = match text(r, "state").to_ascii_uppercase().as_str() {
+        "SUCCESS" => CheckState::Success,
+        "FAILURE" | "ERROR" => CheckState::Failure,
+        "PENDING" | "EXPECTED" => CheckState::Pending,
+        // Only neutral (skipped) checks count as passing, as on GitHub.
+        _ => list.iter().map(|c| c.state).min().map(|s| if s == CheckState::Neutral { CheckState::Success } else { s })?,
+    };
+    list.truncate(CHECKS_MAX);
+    Some(CommitChecks { oid: text(commit, "oid"), state, checks: list })
 }
 
 fn fetch_github(slug: &str) -> Result<GitHubInfo, String> {
@@ -1576,7 +1619,7 @@ fn fetch_github(slug: &str) -> Result<GitHubInfo, String> {
     let (open, closed, issues) = std::thread::scope(|s| {
         let a = s.spawn(|| gh_graphql(slug, &open, "", PR_FRAGMENT));
         let b = s.spawn(|| gh_graphql(slug, &closed, "", CLOSED_PR_FRAGMENT));
-        let c = s.spawn(|| gh_graphql(slug, &issues, TIPS_SELECTION, ""));
+        let c = s.spawn(|| gh_graphql(slug, &issues, TIPS_SELECTION, ROLLUP_FRAGMENT));
         (a.join().unwrap_or_else(|_| lost()), b.join().unwrap_or_else(|_| lost()), c.join().unwrap_or_else(|_| lost()))
     });
     let ((open, v1, _), (closed, v2, _), (issues, v3, repo)) = (open?, closed?, issues?);
@@ -2286,13 +2329,14 @@ mod tests {
             on_github: None,
             newer_on_github: false,
             github_new: None,
+            ci: None,
         }
     }
 
     #[test]
     fn branches_compared_with_github_tips() {
         let oid = |c: char| c.to_string().repeat(40);
-        let head = |n: &str, c: char| GitHubHead { name: n.into(), oid: oid(c), at: 5_000, subject: format!("{n} tip") };
+        let head = |n: &str, c: char| GitHubHead { name: n.into(), oid: oid(c), at: 5_000, subject: format!("{n} tip"), ci: None };
         // Local remote-tracking tips: main and stale at a; feat at b; ours (local newer) at c; gone (deleted on GitHub).
         let remote_oids: HashMap<String, String> =
             [("main", 'a'), ("stale", 'a'), ("feat", 'b'), ("ours", 'c'), ("gone", 'd')].map(|(n, c)| (n.to_string(), oid(c))).into();
@@ -2318,8 +2362,17 @@ mod tests {
             asked.borrow_mut().extend(pairs.iter().map(|p| p.0.chars().next().unwrap()));
             pairs.iter().map(|(gh, _)| gh.starts_with('3')).collect()
         };
+        let failed = CommitChecks { oid: oid('1'), state: CheckState::Failure, checks: vec![] };
+        tips.heads[0].ci = Some(failed.clone());
+        tips.heads[4].ci = Some(CommitChecks { state: CheckState::Pending, ..failed.clone() });
         let mut b = fresh();
+        b[0].ci = Some(CommitChecks { state: CheckState::Success, ..failed.clone() });
+        b[2].ci = Some(failed.clone());
         let added = compare_github(&mut b, &remote_oids, &tips, (100, Some(50)), "main", contained, |n| (n == "main").then_some(7));
+        let ci = |b: &[Branch], n: &str| b.iter().find(|x| x.name == n).and_then(|x| x.ci.as_ref()).map(|c| c.state);
+        assert_eq!(ci(&b, "main"), Some(CheckState::Failure), "GitHub's tip's checks, replacing older ones");
+        assert_eq!(ci(&b, "feat"), None, "no checks on GitHub's tip: none kept");
+        assert_eq!(added[0].ci.as_ref().map(|c| c.state), Some(CheckState::Pending), "a branch new on GitHub has its checks");
         let get = |b: &[Branch], n: &str| {
             let x = b.iter().find(|x| x.name == n).unwrap();
             (x.on_github, x.newer_on_github, x.github_new)
@@ -2374,7 +2427,11 @@ mod tests {
             "list": {"nodes": []},
             "defaultBranchRef": {"name": "trunk", "target": {"oid": "f".repeat(40), "history": {"totalCount": 12562}}},
             "heads": {"totalCount": 3, "nodes": [
-                {"name": "a", "target": {"oid": "a".repeat(40), "committedDate": "2026-11-01T10:00:00Z", "messageHeadline": "A"}},
+                {"name": "a", "target": {"oid": "a".repeat(40), "committedDate": "2026-11-01T10:00:00Z", "messageHeadline": "A",
+                    "statusCheckRollup": {"state": "FAILURE", "contexts": {"nodes": [
+                        {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                        {"__typename": "CheckRun", "name": "deploy", "status": "COMPLETED", "conclusion": "FAILURE"}
+                    ]}}}},
                 {"name": "b", "target": {"oid": "b".repeat(40)}}
             ]}
         }));
@@ -2384,6 +2441,13 @@ mod tests {
         let names: Vec<&str> = t.heads.iter().map(|h| h.name.as_str()).collect();
         assert_eq!(names, ["a", "b", "trunk"], "the default branch is kept past the cut");
         assert_eq!((t.heads[0].subject.as_str(), t.heads[0].at > 0, t.heads[1].at), ("A", true, 0));
+        let ci = t.heads[0].ci.as_ref().expect("a's checks");
+        assert_eq!((ci.oid.as_str(), ci.state, ci.checks[0].name.as_str()), ("a".repeat(40).as_str(), CheckState::Failure, "deploy"));
+        assert_eq!((t.heads[1].ci.as_ref(), t.heads[2].ci.as_ref()), (None, None), "no rollup: no checks");
+        // No rollup state (an older answer): the checks decide, skipped counting as passed.
+        let only_skipped = json!({"oid": "c".repeat(40), "statusCheckRollup": {"contexts": [
+            {"__typename": "CheckRun", "name": "s", "status": "COMPLETED", "conclusion": "SKIPPED"}]}});
+        assert_eq!(commit_checks(&only_skipped).map(|c| c.state), Some(CheckState::Success));
         assert!(parse_tips(&json!({})).is_none());
         // The tips stay out of the contract.
         let g = GitHubInfo {
@@ -2537,9 +2601,16 @@ mod tests {
     #[test]
     #[ignore = "live: compares ChessCabin/rchess's remote-tracking branches with GitHub through gh (no fetch)"]
     fn github_tips_live() {
-        let root = "/Users/daniel/dev/projects/romelandaschack/ChessCabin/rchess";
+        // NAVARCH_LIVE_REPO points it at another clone.
+        let root = std::env::var("NAVARCH_LIVE_REPO").unwrap_or("/Users/daniel/dev/projects/romelandaschack/ChessCabin/rchess".into());
+        let root = root.as_str();
         let t = Instant::now();
         let o = overview(root, true, true).expect("a git repo");
+        for b in o.branches.iter().filter(|b| b.ci.is_some()) {
+            let ci = b.ci.as_ref().unwrap();
+            let failed: Vec<&str> = ci.checks.iter().filter(|c| c.state == CheckState::Failure).map(|c| c.name.as_str()).collect();
+            println!("checks {} {:?} {failed:?}", b.name, ci.state);
+        }
         let at = o.fetched_at.and_then(chrono::DateTime::from_timestamp_millis).map(|d| d.to_rfc3339());
         let base = o.branches.iter().find(|b| b.name == o.base);
         let unfetched: Vec<&str> =

@@ -1008,3 +1008,6 @@ button.hc-title:hover { color: var(--accent); }
 .rm-slug.is-none { font-style: italic; }
 .rm-counts { margin-left: auto; flex-shrink: 0; font-variant-numeric: tabular-nums; }
 .repo-menu-item:hover .rm-sub { color: rgba(255, 255, 255, 0.8); }
+button.ci-mark { padding: 0; border: 0; background: none; font: inherit; cursor: pointer; align-items: center; }
+button.ci-mark:hover .rr-ab-label { text-decoration: underline; }
+.rr-ab.c-red { color: var(--red); }

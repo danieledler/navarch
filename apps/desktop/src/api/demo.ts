@@ -1,7 +1,7 @@
 // The demo dataset: one fictional developer, Robin, with work, open-source and personal projects.
 // Shared by the mock backend (`pnpm dev`), the landing page's live demo and the UI walkthrough/e2e tests.
 // Everything here is invented; dates are relative to today so deadlines, the week log and the OKR period stay current.
-import type { Branch, CheckState, Id, Issue, Label, Period, PullRequest, RepoOverview, RepoRef, Session, SessionStatus, Snapshot, Task, Worktree } from "./types";
+import type { Branch, CheckState, CommitChecks, Id, Issue, Label, Period, PullRequest, RepoOverview, RepoRef, Session, SessionStatus, Snapshot, Task, Worktree } from "./types";
 import { addDays, dayStr, isoWeek, parseDay, today, weekStart } from "../lib/dates";
 
 export const DEMO_HOME = "/Users/robin";
@@ -445,7 +445,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
     return {
       name, local: true, remoteRef, upstreamGone: false, head, subject, author: "Robin Vale", committedAt, ahead: 0, behind: 0,
       merged: false, unpushed: both ? 0 : null, unpulled: both ? 0 : null, checkedOut: null,
-      onGitHub: null, newerOnGitHub: false, githubNew: null, ...b,
+      onGitHub: null, newerOnGitHub: false, githubNew: null, ci: null, ...b,
     };
   };
   const fetchedAt = demoFetched.get(root);
@@ -612,7 +612,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
       // A build checkout detached at origin/main: idle, folded away.
       wt({ head: "6d0f2c8", subject: "Show the week number in the grid header", committedAt: h(2.5), branch: null, upstream: null, unpushed: null }, "release"),
     ];
-    return withBranches({
+    const o = withBranches({
       root, base: "main", branch: "main", worktrees, githubError: null,
       main: main({
         head: "b85e3f0", subject: "Bump vite to 7.1", committedAt: h(0.4), unpushed: 2,
@@ -634,6 +634,12 @@ export function demoRepoOverview(path: string): RepoOverview | null {
       br("grid-empty-states", "7f3a2d9", "Skeleton rows while the grid loads", d(3.1), { remoteRef: null, upstreamGone: true, ahead: 3, behind: 9 }),
       br("availability-table", "4d6e8b1", "Availability table and migrations", d(11.3), { merged: true, behind: 22 }),
     ]);
+    // GitHub's main (one commit behind the local main) failed its deploy.
+    const ci: CommitChecks = { oid: `5e81c4d${"0".repeat(33)}`, state: "failure", checks: [
+      { name: "deploy", state: "failure" }, { name: "build", state: "success" }, { name: "test", state: "success" },
+    ] };
+    o.branches = o.branches.map((b) => (b.name === "main" ? { ...b, ci } : b));
+    return o;
   }
 
   if (name === "knotfile") {

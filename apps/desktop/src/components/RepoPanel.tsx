@@ -7,7 +7,7 @@ import {
   GitBranch, GitCompare, GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft, Laptop, Lock, MessageSquare, Minus, RefreshCw, SquareTerminal,
   TriangleAlert, X, Zap,
 } from "lucide-react";
-import { api, type Branch, type CheckState, type GitHubInfo, type Issue, type Label, type PullRequest, type RepoOverview, type RepoRef, type Reviewer, type Session } from "../api";
+import { api, type Branch, type CheckState, type CommitChecks, type GitHubInfo, type Issue, type Label, type PrCheck, type PullRequest, type RepoOverview, type RepoRef, type Reviewer, type Session } from "../api";
 import { chosenRepo, pushKey, useModel, useStore } from "../store";
 import { baseName, plainText, relTime, shortPath } from "../lib/format";
 import { branchOf, deletedOnGitHub, doneAt, linkProject, newerOnGitHub, newOnGitHub, remoteNews, type LinkedBranch, type LinkedIssue, type LinkedPull, type LinkedRepo, type LinkedWorktree, type RepoEntry } from "../lib/repo";
@@ -936,6 +936,7 @@ function MainRow({ lw, multi, hc }: { lw: LinkedWorktree; multi: boolean; hc: HC
   const o = useStore((s) => s.repos[lw.root]?.data);
   const b = branchOf(o, wt.branch);
   const news = newerOnGitHub(b) ? b : null;
+  const ciBad = b?.ci && b.ci.state !== "success";
   return (
     <div
       className={`repo-row is-main ${hc.open?.key === key ? "is-hovered" : ""}`}
@@ -960,13 +961,14 @@ function MainRow({ lw, multi, hc }: { lw: LinkedWorktree; multi: boolean; hc: HC
           )}
           <UpstreamMarks lw={lw} />
           {news && <GitHubNewsMark b={news} remote={o?.remote ?? null} />}
+          <CiMark b={b} slug={o?.github?.repo ?? null} />
           {wt.dirty > 0 && <span className="c-amber" title={`${plural(wt.dirty, "uncommitted change")}`}>+{wt.dirty}</span>}
           {wt.procs.length > 0 && (
             <span className="mark c-blue" title={`Running: ${wt.procs.map((p) => p.name).join(", ")}`}>
               <SquareTerminal size={12} /> {wt.procs.length}
             </span>
           )}
-          {!offBase && !wt.dirty && !wt.unpushed && !wt.behindUpstream && wt.upstream && !news && (
+          {!offBase && !wt.dirty && !wt.unpushed && !wt.behindUpstream && wt.upstream && !news && !ciBad && (
             <span className="muted">· in sync with {wt.upstream}</span>
           )}
           <span className="rr-marks">
@@ -1167,6 +1169,7 @@ function BranchRow({ lb, ctx, hc }: { lb: LinkedBranch; ctx: BrCtx; hc: HC }) {
           {b.local && !b.remoteRef && !b.upstreamGone && ctx.remote && !newOnGitHub(b) && (
             <span className="tag tag-amber" title={`Never pushed to ${ctx.remote}`}>not pushed</span>
           )}
+          <CiMark b={b} slug={ctx.slug} />
           {!isBase && (b.ahead > 0 || b.behind > 0) && (
             <span className="rr-ab rr-ab-base" title={`${b.ahead} ahead of, ${b.behind} behind ${ctx.base}`}>
               {b.ahead > 0 && <span><ArrowUp size={10} />{b.ahead}</span>}
@@ -1279,14 +1282,7 @@ function PrCard({ pr, gh, wt }: { pr: PullRequest; gh: GitHubInfo; wt: LinkedWor
             <span className="hc-k">Checks</span>
             <span className="hc-v hc-col">
               <span>{checksSummary(pr.checks)}</span>
-              <span className="hc-checks">
-                {pr.checks.slice(0, 6).map((c, i) => (
-                  <span key={`${i}:${c.name}`} className="hc-check">
-                    <CheckMark state={c.state} /> <span className="hc-ellipsis">{c.name}</span>
-                  </span>
-                ))}
-                {pr.checks.length > 6 && <span className="muted">+{pr.checks.length - 6} more</span>}
-              </span>
+              <ChecksList checks={pr.checks} />
             </span>
           </>
         )}
@@ -1449,6 +1445,7 @@ function WorktreeCard({ lw, multi }: { lw: LinkedWorktree; multi: boolean }) {
   const { wt, pr, base, isMain } = lw;
   const behindUp = wt.behindUpstream ?? 0;
   const o = useStore((s) => s.repos[lw.root]?.data);
+  const ob = branchOf(o, wt.branch);
   // The main checkout keeps many idle sessions: the card lists the most recent ones.
   const sessions = isMain ? lw.sessions.slice(0, 5) : lw.sessions;
   const copy = (text: string, what: string) =>
@@ -1503,7 +1500,7 @@ function WorktreeCard({ lw, multi }: { lw: LinkedWorktree; multi: boolean }) {
                 )}
               </>
             ) : (
-              <span className="c-amber">not pushed</span>
+              <NoTrackingBranch b={ob} />
             ))}
         </span>
         {!(isMain && wt.branch === base) && (
@@ -1521,6 +1518,7 @@ function WorktreeCard({ lw, multi }: { lw: LinkedWorktree; multi: boolean }) {
         <span className="hc-v hc-nowrap">
           <code>{wt.head}</code> <span className="hc-ellipsis">{wt.subject}</span> <When ms={wt.committedAt} />
         </span>
+        {ob?.ci && <CommitChecksRows ci={ob.ci} head={wt.head} name={ob.name} slug={o?.github?.repo ?? null} />}
         {pr && (
           <>
             <span className="hc-k">PR</span>
@@ -1721,6 +1719,8 @@ function BranchCard({ lb, ctx }: { lb: LinkedBranch; ctx: BrCtx }) {
           )}
         </span>
 
+        {b.ci && <CommitChecksRows ci={b.ci} head={b.head} name={b.name} slug={slug} />}
+
         {!isBase && (
           <>
             <span className="hc-k">vs {ctx.base}</span>
@@ -1837,6 +1837,114 @@ function CheckMark({ state, title }: { state: CheckState; title?: string }) {
   );
 }
 const CHECK_LABEL: Record<CheckState, string> = { success: "Passed", failure: "Failed", pending: "Pending", neutral: "Skipped" };
+
+/** A hover card's list of checks: the first six, failing first. */
+function ChecksList({ checks }: { checks: PrCheck[] }) {
+  if (checks.length === 0) return null;
+  return (
+    <span className="hc-checks">
+      {checks.slice(0, 6).map((c, i) => (
+        <span key={`${i}:${c.name}`} className="hc-check">
+          <CheckMark state={c.state} /> <span className="hc-ellipsis">{c.name}</span>
+        </span>
+      ))}
+      {checks.length > 6 && <span className="muted">+{checks.length - 6} more</span>}
+    </span>
+  );
+}
+
+const checksUrl = (slug: string, oid: string) => `https://github.com/${slug}/commit/${oid}/checks`;
+
+/** What failed or still runs, e.g. "deploy failed", "2 checks failed", "checks running". */
+function ciLabel(ci: CommitChecks): string {
+  if (ci.state === "pending") return "checks running";
+  const failed = ci.checks.filter((c) => c.state === "failure");
+  return failed.length === 1 ? `${failed[0].name} failed` : failed.length > 1 ? `${failed.length} checks failed` : "checks failed";
+}
+
+/** GitHub's checks on a branch's tip there, on a card: a red ✗ when they failed, an amber dot while they run, nothing
+ *  once they pass. Opens the commit's checks on GitHub. */
+function CiMark({ b, slug }: { b: Branch | null; slug: string | null }) {
+  const act = useAct();
+  const ci = b?.ci;
+  if (!b || !ci || ci.state === "success" || ci.state === "neutral") return null;
+  const failed = ci.state === "failure";
+  const title = `${failed ? "Checks failed" : "Checks running"} on GitHub’s ${b.name} (${ci.oid.slice(0, 7)}): ${checksSummary(ci.checks)}${slug ? ". Click to open them on GitHub" : ""}`;
+  const body = (
+    <>
+      {failed ? <X size={11} /> : <span className="check-pending" />}
+      <span className="rr-ab-label">{ciLabel(ci)}</span>
+    </>
+  );
+  return slug ? (
+    <button
+      type="button"
+      className={`rr-ab ci-mark ${failed ? "c-red" : "c-amber"}`}
+      title={title}
+      onClick={(e) => {
+        e.stopPropagation();
+        act(api.openUrl(checksUrl(slug, ci.oid)));
+      }}
+    >
+      {body}
+    </button>
+  ) : (
+    <span className={`rr-ab ci-mark ${failed ? "c-red" : "c-amber"}`} title={title}>
+      {body}
+    </span>
+  );
+}
+
+/** A hover card's Checks rows for a branch's tip on GitHub (`head`: the local tip's short hash, to say when GitHub's
+ *  differs). */
+function CommitChecksRows({ ci, head, name, slug }: { ci: CommitChecks; head: string; name: string; slug: string | null }) {
+  const act = useAct();
+  const short = ci.oid.slice(0, 7);
+  const line = (
+    <>
+      <CheckMark state={ci.state} /> {checksSummary(ci.checks) || CHECK_LABEL[ci.state]} on <code>{short}</code>
+      {!ci.oid.startsWith(head) && <span className="muted">(GitHub’s {name}, not this commit)</span>}
+    </>
+  );
+  return (
+    <>
+      <span className="hc-k">Checks</span>
+      <span className="hc-v hc-col">
+        {slug ? (
+          <button type="button" className="hc-link" title="Open the checks on GitHub" onClick={() => act(api.openUrl(checksUrl(slug, ci.oid)))}>
+            {line}
+          </button>
+        ) : (
+          <span>{line}</span>
+        )}
+        <ChecksList checks={ci.checks} />
+      </span>
+    </>
+  );
+}
+
+/** A worktree hover's remote side when the branch has no upstream configured: compared with `<remote>/<name>` when
+ *  that exists (the branch list's remote side), else never pushed; just the label without the branch list. */
+function NoTrackingBranch({ b }: { b: Branch | null }) {
+  const up = b?.unpushed ?? 0;
+  const down = b?.unpulled ?? 0;
+  return (
+    <>
+      <span className="muted" title={b?.remoteRef ? `git branch -u ${b.remoteRef} sets it` : "No upstream configured for this branch"}>
+        no tracking branch
+      </span>
+      {!b ? null : b.remoteRef ? (
+        <>
+          · <code>{b.remoteRef}</code>
+          {up > 0 ? <span className="c-amber">{up} not pushed</span> : down === 0 && <span className="muted">in sync</span>}
+          {down > 0 && <span>{down} behind <span className="muted">(as of the last fetch)</span></span>}
+        </>
+      ) : (
+        <span className="c-amber">not pushed</span>
+      )}
+    </>
+  );
+}
 
 function ReviewMark({ pr }: { pr: PullRequest }) {
   if (pr.isDraft || !pr.review) return null;

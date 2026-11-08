@@ -313,6 +313,14 @@ export interface Branch {
   // there since the last fetch; false with a remoteRef: deleted there since (fetch --prune drops it)
   newerOnGitHub: boolean; // GitHub's tip isn't in the local remote-tracking branch yet: a fetch would bring commits
   githubNew: number | null; // how many commits that is, when known (the base branch); null otherwise
+  ci: CommitChecks | null; // the checks on GitHub's tip of this branch (last gh query); null without GitHub data or checks
+}
+
+/** GitHub's checks on a commit (its statusCheckRollup): a branch's tip there. */
+export interface CommitChecks {
+  oid: string; // full hash of the commit
+  state: CheckState; // GitHub's rollup over all its checks (failure, pending or success), even past the cut list
+  checks: PrCheck[]; // failing first, at most 20
 }
 
 export interface WorktreeCommit {
