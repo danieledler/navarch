@@ -69,6 +69,10 @@ const RECENT_PRS: usize = 30;
 const OPEN_ISSUES: u32 = 50;
 const BODY_MAX: usize = 600;
 const CHANGES_MAX: usize = 20;
+/// New files are read to count their lines (git's diff stat would): each up to this size, all of a worktree's
+/// together up to `UNTRACKED_BUDGET`.
+const UNTRACKED_BYTES: u64 = 1 << 20;
+const UNTRACKED_BUDGET: u64 = 8 << 20;
 const COMMITS_MAX: usize = 10;
 const PROCS_MAX: usize = 10;
 const CMD_MAX: usize = 160;
@@ -209,7 +213,12 @@ pub struct Worktree {
     pub ahead: u32,
     pub behind: u32,
     pub dirty: u32,
-    pub changes: Vec<String>,
+    /// Lines added and deleted by the uncommitted changes against HEAD, new files' lines included (as far as counted:
+    /// see `Change`).
+    pub additions: u32,
+    pub deletions: u32,
+    /// The first `CHANGES_MAX` uncommitted entries, in `git status` order (tracked first, then untracked).
+    pub changes: Vec<Change>,
     pub merged: bool,
     pub locked: bool,
     pub prunable: bool,
@@ -221,6 +230,23 @@ pub struct Worktree {
     /// The commits on HEAD not on upstream, newest first, at most `COMMITS_MAX`; empty without upstream.
     pub commits_unpushed: Vec<WorktreeCommit>,
     pub procs: Vec<WorktreeProc>,
+}
+
+/// One uncommitted entry: a line of `git status --porcelain=v1` with its line counts against HEAD.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Change {
+    /// The two status letters, e.g. " M", "A ", "R ", "??".
+    pub code: String,
+    /// Relative to the worktree, unquoted; an untracked folder ends with "/".
+    pub path: String,
+    /// The old path of a rename or copy.
+    pub from: Option<String>,
+    /// From `git diff HEAD --numstat`, or a new file's line count. `None` when binary, or not counted: a folder, a
+    /// symlink, a new file over `UNTRACKED_BYTES` or past the read budget.
+    pub additions: Option<u32>,
+    pub deletions: Option<u32>,
+    pub binary: bool,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -1335,6 +1361,8 @@ fn worktree(e: &WtEntry, base: &str, base_ref: Option<&str>, procs: &[Proc], exc
         ahead: 0,
         behind: 0,
         dirty: 0,
+        additions: 0,
+        deletions: 0,
         changes: Vec::new(),
         merged: false,
         locked: e.locked,
@@ -1358,7 +1386,10 @@ fn worktree(e: &WtEntry, base: &str, base_ref: Option<&str>, procs: &[Proc], exc
     // When status fails or times out the worktree may be dirty: it then never counts as merged.
     let status_ok = if let Some(lines) = status(dir, &canon, exclude) {
         w.dirty = lines.len() as u32;
-        w.changes = lines.into_iter().take(CHANGES_MAX).collect();
+        let changes = changes_counted(dir, &lines);
+        w.additions = changes.iter().filter_map(|c| c.additions).sum();
+        w.deletions = changes.iter().filter_map(|c| c.deletions).sum();
+        w.changes = changes.into_iter().take(CHANGES_MAX).collect();
         true
     } else {
         false
@@ -1450,6 +1481,134 @@ fn status(dir: &str, canon: &Path, exclude: &[PathBuf]) -> Option<Vec<String>> {
         }
     }
     Some(out)
+}
+
+/// The status `lines` as changes with their line counts: tracked ones from one `git diff HEAD --numstat` (renames
+/// under their new path), new files by reading them (see `count_lines`). Without a commit yet, or when the diff
+/// fails, tracked changes stay uncounted.
+fn changes_counted(dir: &str, lines: &[String]) -> Vec<Change> {
+    let mut changes: Vec<Change> = lines.iter().filter_map(|l| parse_change(l)).collect();
+    let stats = if changes.iter().any(|c| c.code != "??") {
+        git(dir, &["diff", "HEAD", "--numstat", "-z", "-M", "--no-ext-diff", "--no-textconv"])
+            .map(|o| parse_numstat(&o))
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let mut budget = UNTRACKED_BUDGET;
+    for c in &mut changes {
+        let counted = if c.code == "??" {
+            if c.path.ends_with('/') {
+                continue;
+            }
+            count_lines(&Path::new(dir).join(&c.path), &mut budget).map(|(n, bin)| (Some(n).filter(|_| !bin), Some(0)))
+        } else {
+            stats.get(&c.path).copied()
+        };
+        match counted {
+            Some((Some(a), Some(d))) => (c.additions, c.deletions) = (Some(a), Some(d)),
+            Some(_) => c.binary = true,
+            None => {}
+        }
+    }
+    changes
+}
+
+/// A `git status --porcelain=v1` line: "XY path", or "XY old -> new" for a rename or copy.
+fn parse_change(line: &str) -> Option<Change> {
+    let code = line.get(..2)?;
+    let rest = line.get(3..).filter(|r| !r.is_empty())?;
+    let (from, path) = match rest.split_once(" -> ") {
+        Some((a, b)) if code.contains(['R', 'C']) => (Some(unquote(a)), unquote(b)),
+        _ => (None, unquote(rest)),
+    };
+    Some(Change { code: code.to_string(), path, from, additions: None, deletions: None, binary: false })
+}
+
+/// A path as git prints it outside -z mode: as is, or in C quotes when it holds a space, quote, backslash or
+/// control character (escaped, octal for raw bytes).
+fn unquote(s: &str) -> String {
+    let Some(inner) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else { return s.to_string() };
+    let b = inner.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' || i + 1 == b.len() {
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+        let e = b[i + 1];
+        i += 2;
+        out.push(match e {
+            b'0'..=b'7' => {
+                let mut v = u32::from(e - b'0');
+                for _ in 0..2 {
+                    match b.get(i) {
+                        Some(&d @ b'0'..=b'7') => (v, i) = (v * 8 + u32::from(d - b'0'), i + 1),
+                        _ => break,
+                    }
+                }
+                v as u8
+            }
+            b'a' => 7,
+            b'b' => 8,
+            b't' => b'\t',
+            b'n' => b'\n',
+            b'v' => 11,
+            b'f' => 12,
+            b'r' => b'\r',
+            other => other,
+        });
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `git diff --numstat -z`: "<added>\t<deleted>\t<path>\0", or "<added>\t<deleted>\t\0<old>\0<new>\0" for a
+/// rename, keyed by the (new) path; a binary file's counts are "-" (`None`).
+fn parse_numstat(out: &str) -> HashMap<String, (Option<u32>, Option<u32>)> {
+    let mut m = HashMap::new();
+    let mut it = out.split('\0');
+    while let Some(rec) = it.next() {
+        let mut f = rec.splitn(3, '\t');
+        let (Some(a), Some(d), Some(p)) = (f.next(), f.next(), f.next()) else { continue };
+        let path = if p.is_empty() {
+            it.next();
+            match it.next() {
+                Some(new) => new,
+                None => break,
+            }
+        } else {
+            p
+        };
+        m.insert(path.to_string(), (a.parse().ok(), d.parse().ok()));
+    }
+    m
+}
+
+/// A new file's line count, as git's diff stat would give it, or `(0, true)` when binary (a NUL in its first 8000
+/// bytes, git's test). `None` for anything but a regular file, and for one over `UNTRACKED_BYTES` or over what is
+/// left of `budget`.
+fn count_lines(path: &Path, budget: &mut u64) -> Option<(u32, bool)> {
+    use std::io::Read;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    (&mut f).take(8000).read_to_end(&mut buf).ok()?;
+    if buf.contains(&0) {
+        return Some((0, true));
+    }
+    let len = meta.len();
+    if len > UNTRACKED_BYTES || len > *budget {
+        return None;
+    }
+    *budget -= len;
+    f.read_to_end(&mut buf).ok()?;
+    let newlines = buf.iter().filter(|&&c| c == b'\n').count();
+    Some(((newlines + usize::from(buf.last().is_some_and(|&c| c != b'\n'))) as u32, false))
 }
 
 // ── Processes working inside a worktree ──
@@ -2146,6 +2305,61 @@ mod tests {
     }
 
     #[test]
+    fn uncommitted_changes_with_line_counts() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("navarch-changes-test-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.to_str().unwrap();
+        let write = |p: &str, s: &[u8]| std::fs::write(dir.join(p), s).unwrap();
+        sh(&dir, &["init", "-q", "-b", "main"]);
+        write("a.txt", b"1\n2\n3\n");
+        write("old name.txt", b"r1\nr2\nr3\n");
+        write("gone.txt", b"g\ng\n");
+        sh(&dir, &["add", "."]);
+        sh(&dir, &["commit", "-q", "-m", "one"]);
+        write("a.txt", b"1\nTWO\n3\n4\n");
+        sh(&dir, &["mv", "old name.txt", "new name.txt"]);
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        write("notes é.md", b"a\nb\nc");
+        write("blob.dat", &[1, 0, 2]);
+        std::fs::create_dir(dir.join("newdir")).unwrap();
+        write("newdir/x.txt", b"x\n");
+
+        let lines = status(root, &canonical(root), &[]).unwrap();
+        let ch = changes_counted(root, &lines);
+        std::fs::remove_dir_all(&dir).ok();
+        let got: Vec<_> = ch
+            .iter()
+            .map(|c| (c.code.as_str(), c.path.as_str(), c.from.as_deref(), c.additions, c.deletions, c.binary))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (" M", "a.txt", None, Some(2), Some(1), false),
+                (" D", "gone.txt", None, Some(0), Some(2), false),
+                ("R ", "new name.txt", Some("old name.txt"), Some(0), Some(0), false),
+                ("??", "blob.dat", None, None, None, true),
+                ("??", "newdir/", None, None, None, false),
+                ("??", "notes é.md", None, Some(3), Some(0), false),
+            ],
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn git_paths_and_numstat() {
+        assert_eq!(unquote("plain.txt"), "plain.txt");
+        assert_eq!(unquote(r#""a \"q\" \\ \303\251\t.txt""#), "a \"q\" \\ é\t.txt");
+        let m = parse_numstat("2\t1\ta.txt\0-\t-\tlogo.png\0\x30\t3\t\0old.rs\0new.rs\0");
+        assert_eq!(m.get("a.txt"), Some(&(Some(2), Some(1))));
+        assert_eq!(m.get("logo.png"), Some(&(None, None)));
+        assert_eq!(m.get("new.rs"), Some(&(Some(0), Some(3))));
+        assert_eq!(m.len(), 3);
+        let c = parse_change(r#"R  "a b" -> c"#).unwrap();
+        assert_eq!((c.code.as_str(), c.path.as_str(), c.from.as_deref()), ("R ", "c", Some("a b")));
+    }
+
+    #[test]
     fn worktrees_of_a_real_repo() {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("navarch-repo-test-{}-{nanos}", std::process::id()));
@@ -2181,7 +2395,9 @@ mod tests {
         assert_eq!(o.worktrees.len(), 2);
         let f = o.worktrees.iter().find(|w| w.branch.as_deref() == Some("feat")).unwrap();
         assert_eq!((f.ahead, f.behind, f.dirty, f.merged), (1, 1, 1, false));
-        assert_eq!(f.changes, vec!["?? c.txt"]);
+        let paths = |w: &Worktree| w.changes.iter().map(|c| format!("{}{}", c.code, c.path)).collect::<Vec<_>>();
+        assert_eq!(paths(f), vec!["??c.txt"]);
+        assert_eq!((f.changes[0].additions, f.changes[0].deletions, f.additions, f.deletions), (Some(1), Some(0), 1, 0));
         assert_eq!(f.subject, "feat one");
         assert!(f.committed_at > 0 && f.head.len() >= 7);
         assert_eq!(f.commits_ahead.iter().map(|c| c.subject.as_str()).collect::<Vec<_>>(), vec!["feat one"]);
@@ -2259,7 +2475,7 @@ mod tests {
         let x = &o.worktrees[0];
         assert_eq!((x.branch.as_deref(), x.upstream.as_deref(), x.behind_upstream), (Some("x"), None, None));
         let m = with_other.expect("a git repo").main.expect("main checkout");
-        assert_eq!((m.dirty, m.changes), (1, vec!["?? .claude/other.txt".to_string()]));
+        assert_eq!((m.dirty, m.changes.len(), m.changes[0].path.as_str(), m.additions), (1, 1, ".claude/other.txt", 1));
     }
 
     #[test]

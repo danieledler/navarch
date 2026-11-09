@@ -794,6 +794,8 @@ button.repo-name:hover { color: var(--accent); text-decoration: underline; }
 .repo-day + .repo-day .repo-day-head { padding-top: 9px; }
 .rr-author { color: var(--text-2); }
 .rr-diff { font-size: 11px; }
+.rr-dirty { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; }
+.rr-dirty > .c-amber { display: inline-flex; align-items: center; gap: 2px; }
 .rr-repo {
   display: inline-block; margin-right: 6px; padding: 0 5px; border-radius: 4px; vertical-align: 1px; line-height: 15px;
   font-size: 10.5px; font-weight: 600; color: var(--muted); background: var(--hover);
@@ -919,7 +921,7 @@ button.hc-title:hover { color: var(--accent); }
 .hc-path:hover { color: var(--accent); }
 .hc-meta { font-size: 12px; color: var(--text-2); font-variant-numeric: tabular-nums; }
 .hc-meta strong { color: var(--text); font-weight: 600; }
-.hc code, .hc-changes, .hc-commits code { font: 11px var(--mono); }
+.hc code, .hc-commits code { font: 11px var(--mono); }
 .hc code { background: var(--hover); padding: 0 4px; border-radius: 4px; color: var(--text-2); }
 .diff-bar { display: inline-flex; gap: 1px; vertical-align: -1px; margin-left: 2px; }
 .diff-bar span { width: 7px; height: 7px; border-radius: 1.5px; }
@@ -970,10 +972,16 @@ button.hc-title:hover { color: var(--accent); }
 .hc-commits li .muted { flex-shrink: 0; font-size: 11px; }
 .hc-procs li strong { color: var(--text); font-weight: 600; flex-shrink: 0; }
 .hc-procs li code { flex: 1; }
-.hc-changes {
-  margin: 0; padding: 6px 8px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--border);
-  color: var(--text-2); white-space: pre; overflow-x: auto; line-height: 1.5;
-}
+.diff-stat { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.hc-sec-diff { margin-left: auto; padding-left: 8px; display: inline-flex; align-items: center; font-size: 11px; font-weight: 400; }
+/* Uncommitted files, like a PR's file list: status letter, folder (dimmed, cut first) and name, line counts. */
+.hc-files { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; font: 11px var(--mono); }
+.hc-files li { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.hc-file-code { width: 1.2ch; flex-shrink: 0; font-weight: 700; text-align: center; }
+.hc-file-path { display: flex; flex: 1; min-width: 0; color: var(--text); }
+.hc-file-dir { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.hc-file-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; max-width: 100%; }
+.hc-file-n { flex-shrink: 0; padding-left: 6px; }
 .hc-hint { font-size: 11px; color: var(--muted); }
 .hc-sessions { display: flex; flex-direction: column; gap: 1px; margin: 0 -6px; }
 .hc-session {

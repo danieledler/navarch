@@ -3,11 +3,11 @@
 // row shows a hover card with the details.
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
-  ArrowDown, ArrowUp, BadgeCheck, Check, ChevronDown, ChevronRight, CircleDot, Cloud, CloudDownload, CloudUpload, Copy, Eye, ExternalLink, FileDiff, FolderGit2, FolderOpen,
+  ArrowDown, ArrowUp, BadgeCheck, Check, ChevronDown, ChevronRight, CircleDot, Cloud, CloudDownload, CloudUpload, Copy, Eye, ExternalLink, FileDiff, FilePen, FolderGit2, FolderOpen,
   GitBranch, GitCompare, GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft, Laptop, Lock, MessageSquare, Minus, RefreshCw, SquareTerminal,
   TriangleAlert, X, Zap,
 } from "lucide-react";
-import { api, type Branch, type CheckState, type CommitChecks, type GitHubInfo, type Issue, type Label, type PrCheck, type PullRequest, type RepoOverview, type RepoRef, type Reviewer, type Session } from "../api";
+import { api, type Branch, type Change, type CheckState, type CommitChecks, type GitHubInfo, type Issue, type Label, type PrCheck, type PullRequest, type RepoOverview, type RepoRef, type Reviewer, type Session, type Worktree } from "../api";
 import { chosenRepo, pushKey, useModel, useStore } from "../store";
 import { baseName, plainText, relTime, shortPath } from "../lib/format";
 import { branchOf, deletedOnGitHub, doneAt, linkProject, newerOnGitHub, newOnGitHub, remoteNews, type LinkedBranch, type LinkedIssue, type LinkedPull, type LinkedRepo, type LinkedWorktree, type RepoEntry } from "../lib/repo";
@@ -755,7 +755,7 @@ function MergedRow({ pr, viewer, worktree, hc }: { pr: PullRequest; viewer: stri
           {pr.author !== viewer && <span className="rr-author">{pr.author}</span>}
           {pr.additions + pr.deletions > 0 && (
             <span className="rr-diff" title={`${plural(pr.changedFiles, "file")} changed`}>
-              <span className="c-green">+{pr.additions.toLocaleString()}</span> <span className="c-red">−{pr.deletions.toLocaleString()}</span>
+              <DiffStat a={pr.additions} d={pr.deletions} />
             </span>
           )}
           {worktree && (
@@ -963,7 +963,7 @@ function MainRow({ lw, multi, hc }: { lw: LinkedWorktree; multi: boolean; hc: HC
           <UpstreamMarks lw={lw} />
           {news && <GitHubNewsMark b={news} remote={o?.remote ?? null} />}
           <CiMark b={b} slug={o?.github?.repo ?? null} />
-          {wt.dirty > 0 && <span className="c-amber" title={`${plural(wt.dirty, "uncommitted change")}`}>+{wt.dirty}</span>}
+          <DirtyMark wt={wt} />
           {wt.procs.length > 0 && (
             <span className="mark c-blue" title={`Running: ${wt.procs.map((p) => p.name).join(", ")}`}>
               <SquareTerminal size={12} /> {wt.procs.length}
@@ -1006,7 +1006,7 @@ function WorktreeRow({ lw, multi, hc }: { lw: LinkedWorktree; multi: boolean; hc
             <span className="muted">folder missing</span>
           ) : (
             <>
-              {wt.dirty > 0 && <span className="c-amber" title={`${plural(wt.dirty, "uncommitted change")}`}>+{wt.dirty}</span>}
+              <DirtyMark wt={wt} />
               {(wt.ahead > 0 || wt.behind > 0) && (
                 <span className="rr-ab" title={`${wt.ahead} ahead of, ${wt.behind} behind ${base}`}>
                   {wt.ahead > 0 && <span><ArrowUp size={10} />{wt.ahead}</span>}
@@ -1255,8 +1255,7 @@ function PrCard({ pr, gh, wt }: { pr: PullRequest; gh: GitHubInfo; wt: LinkedWor
         {pr.state !== "merged" && ` ${plural(pr.commits, "commit")}`} into <code>{pr.baseRef}</code> from <code>{pr.headRef}</code>
       </div>
       <div className="hc-meta">
-        opened <When ms={pr.createdAt} /> · <span className="c-green">+{pr.additions.toLocaleString()}</span>{" "}
-        <span className="c-red">−{pr.deletions.toLocaleString()}</span> <DiffBar a={pr.additions} d={pr.deletions} /> · {plural(pr.changedFiles, "file")} ·{" "}
+        opened <When ms={pr.createdAt} /> · <DiffStat a={pr.additions} d={pr.deletions} /> <DiffBar a={pr.additions} d={pr.deletions} /> · {plural(pr.changedFiles, "file")} ·{" "}
         {plural(pr.comments, "comment")}
       </div>
 
@@ -1568,11 +1567,13 @@ function WorktreeCard({ lw, multi }: { lw: LinkedWorktree; multi: boolean }) {
         <div className="hc-sec">
           <div className="hc-sec-head">
             Uncommitted changes <span className="count">{wt.dirty}</span>
+            {wt.additions + wt.deletions > 0 && (
+              <span className="hc-sec-diff">
+                <DiffStat a={wt.additions} d={wt.deletions} /> <DiffBar a={wt.additions} d={wt.deletions} />
+              </span>
+            )}
           </div>
-          <pre className="hc-changes">
-            {wt.changes.slice(0, 10).join("\n")}
-            {wt.dirty > 10 && `\n+${wt.dirty - 10} more`}
-          </pre>
+          <ChangeList wt={wt} />
         </div>
       )}
 
@@ -2012,6 +2013,76 @@ function LabelChip({ l }: { l: Label }) {
     <span className="label-chip" style={{ "--lc": l.color } as React.CSSProperties} title={l.name}>
       {l.name}
     </span>
+  );
+}
+
+/** Lines added and deleted, as GitHub shows a diff: green +a, red −d. */
+function DiffStat({ a, d }: { a: number; d: number }) {
+  return (
+    <span className="diff-stat">
+      <span className="c-green">+{a.toLocaleString()}</span> <span className="c-red">−{d.toLocaleString()}</span>
+    </span>
+  );
+}
+
+/** Uncommitted changes on a worktree row: how many entries, and their lines like a PR's diff stat. */
+function DirtyMark({ wt }: { wt: Worktree }) {
+  if (wt.dirty === 0) return null;
+  const lines = wt.additions + wt.deletions > 0;
+  const title = plural(wt.dirty, "uncommitted change") + (lines ? `: ${plural(wt.additions, "line")} added, ${wt.deletions.toLocaleString()} deleted` : "");
+  return (
+    <span className="rr-dirty" title={title}>
+      <span className="c-amber"><FilePen size={11} /> {wt.dirty}</span>
+      {lines && <DiffStat a={wt.additions} d={wt.deletions} />}
+    </span>
+  );
+}
+
+/** A `git status` code as one letter, its color and words: the worktree side when it has one, else the index's. */
+function changeKind(code: string): { letter: string; cls: string; words: string } {
+  if (code === "??") return { letter: "U", cls: "c-green", words: "new, untracked" };
+  const [x, y] = [code[0], code[1]];
+  if (x === "U" || y === "U" || code === "AA" || code === "DD") return { letter: "!", cls: "c-red", words: "merge conflict" };
+  const k = y !== " " ? y : x;
+  const staged = x !== " " ? (y !== " " ? ", partly staged" : ", staged") : "";
+  const [cls, word] =
+    ({ M: ["c-amber", "modified"], A: ["c-green", "added"], D: ["c-red", "deleted"], R: ["c-blue", "renamed"], C: ["c-blue", "copied"], T: ["c-amber", "type changed"] } as Record<string, [string, string]>)[k] ??
+    ["muted", "changed"];
+  return { letter: k, cls, words: word + staged };
+}
+
+const CHANGES_SHOWN = 12;
+
+/** A worktree's uncommitted entries, like a PR's file list: status letter, path (folder dimmed), line counts. */
+function ChangeList({ wt }: { wt: Worktree }) {
+  const shown = wt.changes.slice(0, CHANGES_SHOWN);
+  return (
+    <ul className="hc-files">
+      {shown.map((c) => <ChangeItem key={c.code + c.path} c={c} />)}
+      {wt.dirty > shown.length && <li className="muted">+{wt.dirty - shown.length} more</li>}
+    </ul>
+  );
+}
+
+function ChangeItem({ c }: { c: Change }) {
+  const k = changeKind(c.code);
+  const folder = c.path.endsWith("/");
+  const p = folder ? c.path.slice(0, -1) : c.path;
+  const cut = p.lastIndexOf("/") + 1;
+  return (
+    <li title={`${c.from ? `${c.from} → ` : ""}${c.path}: ${k.words}${folder ? " folder" : ""}`}>
+      <span className={`hc-file-code ${k.cls}`}>{k.letter}</span>
+      <span className="hc-file-path">
+        {cut > 0 && <span className="hc-file-dir">{p.slice(0, cut)}</span>}
+        <span className="hc-file-name">{p.slice(cut) + (folder ? "/" : "")}</span>
+      </span>
+      <span className="hc-file-n">
+        {c.binary ? <span className="muted">binary</span>
+          : folder ? <span className="muted">folder</span>
+          : c.additions != null && c.deletions != null ? <DiffStat a={c.additions} d={c.deletions} />
+          : null}
+      </span>
+    </li>
   );
 }
 

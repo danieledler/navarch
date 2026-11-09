@@ -1,7 +1,7 @@
 // The demo dataset: one fictional developer, Robin, with work, open-source and personal projects.
 // Shared by the mock backend (`pnpm dev`), the landing page's live demo and the UI walkthrough/e2e tests.
 // Everything here is invented; dates are relative to today so deadlines, the week log and the OKR period stay current.
-import type { Branch, CheckState, CommitChecks, Id, Issue, Label, Period, PullRequest, RepoOverview, RepoRef, Session, SessionStatus, Snapshot, Task, Worktree } from "./types";
+import type { Branch, Change, CheckState, CommitChecks, Id, Issue, Label, Period, PullRequest, RepoOverview, RepoRef, Session, SessionStatus, Snapshot, Task, Worktree } from "./types";
 import { addDays, dayStr, isoWeek, parseDay, today, weekStart } from "../lib/dates";
 
 export const DEMO_HOME = "/Users/robin";
@@ -430,9 +430,22 @@ export function demoRepoOverview(path: string): RepoOverview | null {
   });
   const wt = (w: Partial<Worktree> & Pick<Worktree, "head" | "subject" | "committedAt">, folder: string): Worktree => ({
     path: `${root}/.claude/worktrees/${folder}`, branch: folder, ahead: 0, behind: 0, dirty: w.changes?.length ?? 0, changes: [],
+    additions: (w.changes ?? []).reduce((n, c) => n + (c.additions ?? 0), 0),
+    deletions: (w.changes ?? []).reduce((n, c) => n + (c.deletions ?? 0), 0),
     merged: false, locked: false, prunable: false, commitsAhead: [], upstream: `origin/${folder}`, unpushed: 0,
     behindUpstream: w.upstream === null ? null : 0, commitsUnpushed: [], procs: [], ...w,
   });
+  /** `git status` lines as changes, with made-up line counts that stay put (from the path); a folder has none. */
+  const chgs = (...lines: string[]): Change[] =>
+    lines.map((l) => {
+      const code = l.slice(0, 2), path = l.slice(3), h = [...path].reduce((n, c) => (n * 31 + c.charCodeAt(0)) % 997, 7);
+      const counted = !path.endsWith("/");
+      return {
+        code, path, from: null, binary: false,
+        additions: counted ? (code === "??" ? 24 + (h % 140) : 2 + (h % 70)) : null,
+        deletions: counted ? (code === "??" ? 0 : h % 23) : null,
+      };
+    });
   /** The repo's main checkout, on main and in sync with origin/main unless `w` says otherwise. */
   const main = (w: Partial<Worktree> = {}): Worktree =>
     wt({ head: "9e4b1a7", subject: "Update dependencies", committedAt: now - known[2] * 36e5, path: root, branch: "main", upstream: "origin/main", ...w }, "main");
@@ -577,7 +590,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
         {
           head: "a3f9c21", subject: "Roll back optimistic toggles on 409", committedAt: m(25), ahead: 3, behind: 1, unpushed: 1,
           commitsUnpushed: [{ hash: "a3f9c21", subject: "Roll back optimistic toggles on 409", at: m(25) }],
-          changes: [" M src/features/availability/AvailabilityGrid.tsx", " M src/features/availability/useAvailability.ts", "?? src/features/availability/concurrentEdit.test.ts", " M src/api/availability.ts"],
+          changes: chgs(" M src/features/availability/AvailabilityGrid.tsx", " M src/features/availability/useAvailability.ts", "?? src/features/availability/concurrentEdit.test.ts", " M src/api/availability.ts"),
           commitsAhead: [
             { hash: "a3f9c21", subject: "Roll back optimistic toggles on 409", at: m(25) },
             { hash: "5be0d47", subject: "Build grid dates in the team's time zone", at: h(5) },
@@ -593,7 +606,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
       wt(
         {
           head: "7d2e9b4", subject: "Turn on the compiler for /settings", committedAt: d(3), ahead: 2, behind: 6, upstream: null, unpushed: null,
-          changes: [" M babel.config.js"],
+          changes: chgs(" M babel.config.js"),
           commitsAhead: [
             { hash: "7d2e9b4", subject: "Turn on the compiler for /settings", at: d(3) },
             { hash: "c04f8e1", subject: "Add babel-plugin-react-compiler", at: d(3.1) },
@@ -620,7 +633,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
           { hash: "b85e3f0", subject: "Bump vite to 7.1", at: h(0.4) },
           { hash: "1f6a9c2", subject: "Note the availability_v2 flag in the README", at: h(1.2) },
         ],
-        changes: [" M .env.example"],
+        changes: chgs(" M .env.example"),
       }),
       github: { repo: slug, url: gh, pulls, recentPulls, viewer: ME, issues, fetchedAt: m(1) },
     }, [
@@ -724,7 +737,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
       wt(
         {
           head: "4be1d09", subject: "Coalesce events in a 50 ms window", committedAt: m(14), ahead: 3, behind: 0, upstream: null, unpushed: null,
-          changes: [" M src/watch/debounce.rs", " M benches/watch.rs", "?? benches/fixtures/two_k_files/"],
+          changes: chgs(" M src/watch/debounce.rs", " M benches/watch.rs", "?? benches/fixtures/two_k_files/"),
           commitsAhead: [
             { hash: "4be1d09", subject: "Coalesce events in a 50 ms window", at: m(14) },
             { hash: "aa31c7e", subject: "Track pending rebuilds per target", at: h(3) },
@@ -804,7 +817,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
         wt(
           {
             head: "5be71d2", subject: "Pause the socket while offline", committedAt: h(1.6), ahead: 3,
-            changes: [" M src/Toolbar.tsx"],
+            changes: chgs(" M src/Toolbar.tsx"),
             commitsAhead: [
               { hash: "5be71d2", subject: "Pause the socket while offline", at: h(1.6) },
               { hash: "0c93e4a", subject: "Queue local ops while offline", at: h(5) },
@@ -826,7 +839,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
     const diagram = wt(
       {
         head: "b2c7e40", subject: "Draw the three sync strategies side by side", committedAt: h(27), ahead: 2, upstream: null, unpushed: null,
-        changes: [" M slides.md", "?? assets/sync-strategies.svg"],
+        changes: chgs(" M slides.md", "?? assets/sync-strategies.svg"),
         commitsAhead: [
           { hash: "b2c7e40", subject: "Draw the three sync strategies side by side", at: h(27) },
           { hash: "6f1a9d3", subject: "Slide-by-slide plan, 24 slides", at: h(28) },
@@ -863,7 +876,7 @@ export function demoRepoOverview(path: string): RepoOverview | null {
       wt(
         {
           head: "2f8a6c3", subject: "Tint the orchard per season", committedAt: d(2), ahead: 2, upstream: null, unpushed: null,
-          changes: [" M src/seasons.ts", " M assets/palette.json"],
+          changes: chgs(" M src/seasons.ts", " M assets/palette.json"),
           commitsAhead: [
             { hash: "2f8a6c3", subject: "Tint the orchard per season", at: d(2) },
             { hash: "8e0b7d1", subject: "Season clock with a 4-minute day", at: d(2.2) },

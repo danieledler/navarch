@@ -277,7 +277,9 @@ export interface Worktree {
   ahead: number; // commits on HEAD not on the base branch
   behind: number; // commits on the base branch not on HEAD
   dirty: number; // uncommitted entries (lines of `git status --porcelain`, untracked included)
-  changes: string[]; // the first 20 of those lines, e.g. " M apps/desktop/src/App.tsx"
+  additions: number; // lines added by them against HEAD, new files' lines included (as far as counted, see Change)
+  deletions: number;
+  changes: Change[]; // the first 20 of them, in `git status` order (tracked first, then untracked)
   merged: boolean; // a branch other than base whose commits are all on base (ahead == 0)
   locked: boolean;
   prunable: boolean; // its folder is gone
@@ -288,6 +290,16 @@ export interface Worktree {
   commitsUnpushed: WorktreeCommit[]; // the commits on HEAD not on upstream, newest first, at most 10; [] without upstream
   procs: WorktreeProc[]; // processes whose working folder is inside it (dev servers, watchers), at most 10;
   // never Claude's own `claude` processes (those are sessions)
+}
+
+/** One uncommitted entry of a worktree: a `git status --porcelain` line with its line counts against HEAD. */
+export interface Change {
+  code: string; // the two status letters, e.g. " M", "A ", "R ", "??"
+  path: string; // relative to the worktree; an untracked folder ends with "/"
+  from: string | null; // the old path of a rename or copy
+  additions: number | null; // null when binary, or not counted: a folder, a symlink, a new file over 1 MB
+  deletions: number | null;
+  binary: boolean;
 }
 
 /** A branch name with its local and remote side (`remote` = RepoOverview.remote). */
