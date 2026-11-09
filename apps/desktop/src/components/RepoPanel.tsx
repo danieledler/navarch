@@ -115,7 +115,10 @@ export function RepoPanel({ path }: { path: string }) {
   );
   const linked = useMemo(() => (data ? linkProject(data, entries, sessions) : null), [data, entries, sessions]);
   const multi = repos.length > 1;
+  const fetching = useStore((s) => (root ? !!s.fetching[root] : false));
+  const fetchRepo = useStore((s) => s.fetchRepo);
 
+  // No hooks below the early returns: a render that returns early would run fewer hooks than one that didn't.
   // Loaded, and the folder neither is in a git repo nor holds one (or the chosen one is gone).
   if (list && repos.length === 0) return null;
   if (st && st.at > 0 && data === null && repos.length <= 1) return null;
@@ -165,8 +168,6 @@ export function RepoPanel({ path }: { path: string }) {
   const unpushed = data?.main?.unpushed ?? 0;
   const staleN = linked?.branches.stale.length ?? 0;
   const ctx: BrCtx | null = data ? { root: data.root, slug: gh?.repo ?? chosen?.github ?? null, remote: data.remote, base: data.base } : null;
-  const fetching = useStore((s) => (root ? !!s.fetching[root] : false));
-  const fetchRepo = useStore((s) => s.fetchRepo);
   // The base branch moved on GitHub since this clone last fetched: git status still says "up to date".
   const baseB = branchOf(data, data?.base ?? null);
   const baseNews = newerOnGitHub(baseB) ? baseB : null;
