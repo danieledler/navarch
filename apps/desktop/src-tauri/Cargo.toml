@@ -33,6 +33,8 @@ tokio = { version = "1", features = ["net", "sync", "time"] }
 getrandom = "0.3"
 # The phone UI (apps/mobile/dist), embedded in release builds (http.rs).
 rust-embed = "8.13"
+# Snappy blocks in Claude's Local Storage tables, for its unread list (claude_unread.rs).
+snap = "1"
 
 # Already in the tree through sysinfo and Tauri.
 [target.'cfg(target_os = "macos")'.dependencies]

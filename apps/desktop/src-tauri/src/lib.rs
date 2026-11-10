@@ -1,3 +1,4 @@
+pub mod claude_unread;
 mod commands;
 pub mod db;
 pub mod http;

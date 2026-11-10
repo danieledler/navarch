@@ -2,12 +2,13 @@
 //! (cursor + totals persisted in SQLite), joins live process info, derives status and auto-links
 //! sessions to Navarch tasks.
 
+use crate::claude_unread::UnreadWatch;
 use crate::db::{err, now_ms, Res};
 use crate::procs::{ProcInfo, ProcTracker};
 use chrono::{Local, TimeZone};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -370,14 +371,18 @@ pub fn turn_state(st: &FileState) -> Turn {
     }
 }
 
-pub fn derive_status(turn: Turn, running: bool, last_turn_edge: Option<i64>, last_focused: Option<i64>) -> &'static str {
-    let ended = || {
-        if last_turn_edge.unwrap_or(0) > last_focused.unwrap_or(0) {
-            "unread"
-        } else {
-            "idle"
-        }
-    };
+/// Whether a session's last reply is unread: Claude's own unread list when it could be read,
+/// otherwise whether the last turn ended after the session was last focused. That fallback is wrong
+/// for a reply that lands while the session is open: Claude only stamps `lastFocusedAt` on a switch.
+pub fn is_unread(claude: Option<&HashSet<String>>, id: &str, last_turn_edge: Option<i64>, last_focused: Option<i64>) -> bool {
+    match claude {
+        Some(ids) => ids.contains(id),
+        None => last_turn_edge.unwrap_or(0) > last_focused.unwrap_or(0),
+    }
+}
+
+pub fn derive_status(turn: Turn, running: bool, unread: bool) -> &'static str {
+    let ended = || if unread { "unread" } else { "idle" };
     match (turn, running) {
         (Turn::Waiting, true) => "needs_input",
         (Turn::Mid, true) => "working",
@@ -450,6 +455,7 @@ pub struct Scanner {
     index_at: Option<Instant>,
     files: HashMap<PathBuf, FileState>,
     pub procs: ProcTracker,
+    unread: UnreadWatch,
 }
 
 impl Scanner {
@@ -477,6 +483,7 @@ impl Scanner {
             index_at: None,
             files,
             procs: ProcTracker::new(),
+            unread: UnreadWatch::new(home.join("Library/Application Support/Claude/Local Storage/leveldb")),
         })
     }
 
@@ -771,7 +778,8 @@ impl Scanner {
                 pi.procs += d.procs;
                 pi.cpu += d.cpu;
             }
-            let status = derive_status(turn_state(main), running, m.last_turn_edge_at, m.last_focused_at);
+            let unread = is_unread(self.unread.ids(), &m.session_id, m.last_turn_edge_at, m.last_focused_at);
+            let status = derive_status(turn_state(main), running, unread);
             let temp_folder = is_temp_folder(&m.cwd);
             out.push(Session {
                 id: m.session_id.clone(),
@@ -813,6 +821,7 @@ impl Scanner {
         self.refresh_meta();
         self.refresh_index();
         self.procs.refresh();
+        self.unread.refresh();
         self.build()
     }
 
@@ -821,6 +830,7 @@ impl Scanner {
         self.refresh_meta();
         self.refresh_index();
         self.procs.refresh();
+        self.unread.refresh();
         self.parse_transcripts();
         if let Err(e) = self.auto_link() {
             eprintln!("navarch: auto-link failed: {e}");
@@ -950,10 +960,17 @@ mod tests {
         let active: i64 = st.days.values().map(|v| v[0]).sum();
         assert_eq!(active, 60_000 + 30_000); // 10:00:00→10:01:00 and 11:00:00→11:00:30
         assert_eq!(turn_state(&st), Turn::Ended);
-        assert_eq!(derive_status(Turn::Ended, true, Some(5), Some(3)), "unread");
-        assert_eq!(derive_status(Turn::Ended, false, Some(3), Some(5)), "idle");
-        assert_eq!(derive_status(Turn::Mid, false, None, None), "stopped");
-        assert_eq!(derive_status(Turn::Mid, true, None, None), "working");
+        assert_eq!(derive_status(Turn::Ended, true, true), "unread");
+        assert_eq!(derive_status(Turn::Ended, false, false), "idle");
+        assert_eq!(derive_status(Turn::Mid, false, true), "stopped");
+        assert_eq!(derive_status(Turn::Mid, true, true), "working");
+        // Without Claude's list: a turn that ended after the last focus is unread.
+        assert!(is_unread(None, "local_a", Some(5), Some(3)));
+        assert!(!is_unread(None, "local_a", Some(3), Some(5)));
+        // With it, the list decides: a reply that landed while the session was open is read.
+        let claude: HashSet<String> = ["local_b".to_string()].into();
+        assert!(!is_unread(Some(&claude), "local_a", Some(5), Some(3)));
+        assert!(is_unread(Some(&claude), "local_b", Some(3), Some(5)));
 
         // waiting state after AskUserQuestion
         let mut st2 = FileState::default();
@@ -979,7 +996,7 @@ mod tests {
         let tail = tail_state(&path, bytes.len() as u64).unwrap();
         assert_eq!((tail.last_reply.as_deref(), tail.asking), (Some("done"), None));
         let _ = fs::remove_file(&path);
-        assert_eq!(derive_status(Turn::Waiting, true, None, None), "needs_input");
+        assert_eq!(derive_status(Turn::Waiting, true, false), "needs_input");
 
         // subagent: tokens only
         let mut sub = FileState::default();
